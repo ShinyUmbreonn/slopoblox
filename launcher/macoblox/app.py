@@ -33,10 +33,21 @@ PRESETS = [
      "flag": ["FIntFRMMinGrassDistance", "FIntFRMMaxGrassDistance"], "kind": "fixed", "value": 0},
     {"title": "Low quality terrain", "subtitle": "FIntTerrainArraySliceSize = 0",
      "flag": "FIntTerrainArraySliceSize", "kind": "fixed", "value": 0},
-    {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 0–3",
+    {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 3, 16x AF, No mip skipping",
      "flag": "DFIntTextureQualityOverride", "kind": "number", "default": 3, "min": 0, "max": 3,
      # The override is ignored unless this is set too.
-     "also": {"DFFlagTextureQualityOverrideEnabled": True}},
+     "also": {
+         "DFFlagTextureQualityOverrideEnabled": True,
+         "FIntDebugTextureManagerSkipMips": -1,
+         "DFIntTextureCompositorLowResFactor": 1,
+         "DFFlagTextureCompositorHighQualityEnabled": True,
+         "FIntDebugForceAnisotropy": 16,
+         "DFFlagDisableDPIScale": True,
+     }},
+    {"title": "Anisotropic filtering (16x)", "subtitle": "FIntDebugForceAnisotropy: 16 (sharp textures at angles)",
+     "flag": "FIntDebugForceAnisotropy", "kind": "number", "default": 16, "min": 1, "max": 16},
+    {"title": "Force maximum texture resolution", "subtitle": "FIntDebugTextureManagerSkipMips: -1 (never downscale mips)",
+     "flag": "FIntDebugTextureManagerSkipMips", "kind": "number", "default": -1, "min": -1, "max": 0},
 ]
 
 DNS_CHOICES = [
@@ -137,11 +148,7 @@ class GameLogsView(Gtk.Box):
         copy_btn.connect("clicked", self._on_copy_clicked)
         bar.append(copy_btn)
 
-        open_content = Adw.ButtonContent(
-            icon_name="document-open-symbolic",
-            label=_("Open in editor"),
-        )
-        self.open_btn = Gtk.Button(child=open_content)
+        self.open_btn = Gtk.Button(icon_name="document-edit-symbolic")
         self.open_btn.add_css_class("flat")
         self.open_btn.set_tooltip_text(_("Open in text editor"))
         self.open_btn.connect("clicked", lambda *_args: window.open_external_log(self.current_log_path))
@@ -1025,12 +1032,14 @@ class SettingsPage(Adw.Bin):
             "scroll_sensitivity", round(row.get_value(), 2)))
         game.add(scroll_sens)
 
-        raw_mouse = Adw.SwitchRow(title=_("Raw mouse input"),
-                                  subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
-                                  active=settings.get("raw_mouse", True))
-        raw_mouse.connect("notify::active", lambda row, _pspec: window.set_setting(
+        self.raw_mouse_row = Adw.SwitchRow(
+            title=_("Raw mouse input"),
+            subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
+            active=settings.get("raw_mouse", True),
+        )
+        self.raw_mouse_row.connect("notify::active", lambda row, _pspec: window.set_setting(
             "raw_mouse", row.get_active()))
-        game.add(raw_mouse)
+        game.add(self.raw_mouse_row)
 
         menu_bar = Adw.SwitchRow(title=_("Hide the macOS menu bar"),
                                  subtitle=_("The Roblox, Edit, Window… strip at the top of the game window"),
@@ -1226,6 +1235,10 @@ class SettingsPage(Adw.Bin):
 
     def flush(self):
         self.flags_page.flush()
+
+    def refresh_raw_mouse(self):
+        if hasattr(self, "raw_mouse_row"):
+            self.raw_mouse_row.set_active(self.window.settings.get("raw_mouse", True))
 
     def open_logs(self):
         try:
@@ -2264,11 +2277,43 @@ class LauncherWindow(Adw.ApplicationWindow):
         else:
             self.get_application().quit()
         if failed:
-            if core.exit_reason(self.last_log) == "captcha":
+            reason = core.exit_reason(self.last_log)
+            if reason == "captcha":
                 self._captcha_dialog()
+            elif reason == "x11_broken":
+                self._x11_broken_dialog()
             else:
                 _toast(self.toasts, _("Roblox exited with code {status}", status=status))
         return False
+
+    def _x11_broken_dialog(self):
+        has_raw = self.settings.get("raw_mouse", True)
+        if has_raw:
+            dialog = Adw.AlertDialog(
+                heading=_("X11 Connection Lost"),
+                body=_("The game crashed because the X11 connection was broken. "
+                       "This usually happens when raw mouse input overloads the display server with events. "
+                       "Would you like to disable raw mouse input?")
+            )
+            dialog.add_response("cancel", _("Keep Enabled"))
+            dialog.add_response("disable", _("Disable Raw Mouse"))
+            dialog.set_response_appearance("disable", Adw.ResponseAppearance.SUGGESTED)
+
+            def on_response(_d, result):
+                if result == "disable":
+                    self.set_setting("raw_mouse", False)
+                    if hasattr(self, "settings_page"):
+                        self.settings_page.refresh_raw_mouse()
+                    _toast(self.toasts, _("Raw mouse input disabled"))
+
+            dialog.connect("response", on_response)
+            dialog.present(self)
+        else:
+            _error_dialog(
+                self,
+                _("X11 Connection Lost"),
+                _("The game crashed because the X11 connection was broken (explicit kill or server shutdown).")
+            )
 
     def stop(self):
         threading.Thread(target=core.stop_roblox, daemon=True).start()
