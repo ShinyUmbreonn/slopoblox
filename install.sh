@@ -3,19 +3,23 @@
 # launcher itself with its app menu entry. Run it again to update, or to
 # uninstall.
 #
-#   curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
+#   ./install.sh --install
 #
-# In a terminal it shows a small menu; without one it installs. The choices
-# also work as options (with curl: ... | bash -s -- --uninstall), see --help.
+# Run it from the checkout whose files you want to test. In a terminal it
+# shows a small menu; without one it installs. The choices also work as
+# options, see --help.
 #
-# Everything runs inside main(), called on the last line, so a download cut
-# off halfway does nothing. The exit on that same line matters: main points
-# stdin at the terminal (curl | bash), and bash would then read and run
-# whatever is typed there as the rest of the script.
+# Everything runs inside main(), called on the last line, so setup only starts
+# after the complete script has been read. The exit keeps an interactive
+# terminal from being interpreted as more shell input after main returns.
 
 set -euo pipefail
 
-REPO=https://github.com/aubree-lat/MacOBlox.git
+# This installer is intentionally run from a checkout for PR testing.  Keep
+# the source path separate from the user's installed copy: the latter may
+# contain Roblox, logs and settings that must survive an update.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+SOURCE_DIR=$SCRIPT_DIR
 DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 DIR=$DATA_HOME/MacOBlox
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -107,6 +111,8 @@ install_fedora() {
 
 do_install() {
   [[ $(uname -m) == x86_64 ]] || die "Darling runs only on x86_64."
+  [[ -f $SOURCE_DIR/build_debug_shim.sh && -f $SOURCE_DIR/launcher/install.sh ]] ||
+    die "Run install.sh from the Mac O' Blox checkout. The current source folder was not found."
   [[ -r /etc/os-release ]] && . /etc/os-release
   local family=" ${ID:-} ${ID_LIKE:-} "
   case "$family" in
@@ -128,18 +134,28 @@ do_install() {
   command -v darling >/dev/null ||
     die "Darling is not installed. Build it with https://docs.darlinghq.org/build-instructions.html and run this again."
 
-  if [[ -d $DIR/.git ]]; then
-    say "Updating Mac O' Blox"
-    # Checkouts from before the move to this fork still point at the original
-    # repository, which does not have its fixes.
-    case $(git -C "$DIR" remote get-url origin 2>/dev/null) in
-      https://github.com/narezy/MacOBlox | https://github.com/narezy/MacOBlox.git)
-        git -C "$DIR" remote set-url origin "$REPO" ;;
-    esac
-    git -C "$DIR" pull --ff-only
+  if [[ $SOURCE_DIR != "$DIR" ]]; then
+    [[ ! -e $DIR || -d $DIR ]] || die "$DIR exists and is not a directory."
+    say "Installing the current checkout"
+    local staging
+    staging=$(mktemp -d)
+    # Copy source and local, uncommitted fixes without copying the checkout's
+    # Git metadata or generated runtime data. Existing installed runtime data
+    # remains in $DIR and is updated in place.
+    tar -C "$SOURCE_DIR" \
+      --exclude='./.git' --exclude='./RobloxPlayer.app' --exclude='./build' \
+      --exclude='./logs' --exclude='./backups' --exclude='./downloads' \
+      --exclude='./studio' --exclude='./__pycache__' \
+      --exclude='*/__pycache__' --exclude='*.pyc' -cf - . |
+      tar -C "$staging" -xf -
+    install -d "$DIR"
+    # A previous installer may have left a Git checkout here. The installed
+    # copy must stay tied to this source folder and must not pull another one.
+    rm -rf -- "$DIR/.git"
+    cp -a "$staging"/. "$DIR"/
+    rm -rf -- "$staging"
   else
-    say "Downloading Mac O' Blox"
-    git clone --depth 1 "$REPO" "$DIR"
+    say "Using the current checkout"
   fi
   say "Building the Roblox shim"
   local output
@@ -180,7 +196,8 @@ do_uninstall() {
   say "Removing the app menu entries, icons and the macoblox command"
   local apps=$DATA_HOME/applications
   # The xyz.narez.* names are the app ID before 0.15.
-  rm -f -- "$apps/wtf.aubree.MacOBlox.desktop" "$apps/wtf.aubree.MacOBlox.Studio.desktop" \
+  rm -f -- "$apps/wtf.aubree.MacOBlox.desktop" "$apps/wtf.aubree.MacOBlox.URI.desktop" \
+    "$apps/wtf.aubree.MacOBlox.Studio.desktop" \
     "$apps/xyz.narez.MacOBlox.desktop" "$apps/xyz.narez.MacOBlox.Studio.desktop" \
     "$apps/macoblox-roblox-window.desktop" "$apps/org.macoblox.Launcher.desktop" \
     "$DATA_HOME"/icons/hicolor/*/apps/macoblox.png "$DATA_HOME/mime/packages/wtf.aubree.MacOBlox.xml" \
@@ -192,6 +209,7 @@ do_uninstall() {
   # Studio as the handler of roblox-studio: links and place files.
   if [[ -f $CONFIG_HOME/mimeapps.list ]]; then
     sed -i -e 's/wtf\.aubree\.MacOBlox\.Studio\.desktop;\{0,1\}//g' \
+      -e 's/wtf\.aubree\.MacOBlox\.URI\.desktop;\{0,1\}//g' \
       -e 's/xyz\.narez\.MacOBlox\.Studio\.desktop;\{0,1\}//g' -e '/^[^=[]*=$/d' "$CONFIG_HOME/mimeapps.list"
   fi
   update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
@@ -332,8 +350,9 @@ Mac O' Blox installer
   install.sh --uninstall --purge
                            also delete Darling's prefix, ${PREFIX/#$HOME/\~} (your Roblox sign-in)
 
-With curl, options go after "bash -s --":
-  curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
+Run this script from the checkout whose files you want to install. It does not
+download or update the repository; it copies that checkout into the user's
+MacOBlox data directory.
 USAGE
 }
 

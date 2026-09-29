@@ -55,6 +55,8 @@ modules:
       - install -d /app/share/applications
       - sed 's/^Icon=.*/Icon=wtf.aubree.MacOBlox/' packaging/wtf.aubree.MacOBlox.desktop
         > /app/share/applications/wtf.aubree.MacOBlox.desktop
+      - sed 's/^Icon=.*/Icon=wtf.aubree.MacOBlox/' packaging/wtf.aubree.MacOBlox.URI.desktop
+        > /app/share/applications/wtf.aubree.MacOBlox.URI.desktop
       # The Roblox window's own entry, so docks show its icon.
       - sed 's/^Icon=.*/Icon=wtf.aubree.MacOBlox/' packaging/macoblox-roblox-window.desktop
         > /app/share/applications/wtf.aubree.MacOBlox.RobloxWindow.desktop

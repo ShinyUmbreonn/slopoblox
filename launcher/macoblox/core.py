@@ -888,7 +888,7 @@ def icon_argb_file():
 
 
 LAUNCH_SCRIPT = r'''
-project=$1 shim_dir=$2; shift 2
+project=$1 shim_dir=$2 launch_uri=$3; shift 3
 for kv in "$@"; do export "$kv"; done
 # Roblox's own frame rate limit (FramerateCap, its Maximum Frame Rate
 # setting), from the launcher's FPS limit. Set here, inside Darling, right
@@ -922,6 +922,14 @@ cd "$app" || exit 1
 export DYLD_FORCE_FLAT_NAMESPACE=1
 export DYLD_INSERT_LIBRARIES="$shim_dir/libMacOBloxShims.dylib"
 export DYLD_LIBRARY_PATH="$shim_dir:$app"
+if [ -n "$launch_uri" ]; then
+  # Roblox's native macOS browser handoff is the -protocolString argument.
+  # Keep the value as one opaque argument; the client owns the protocol
+  # format. The shim logs this argument and suppresses Cocoa reinjection when
+  # it is present, so one launch has one URL delivery path.
+  export MACOBLOX_PENDING_URI="$launch_uri"
+  exec ./RobloxPlayer -protocolString "$launch_uri"
+fi
 exec ./RobloxPlayer
 '''
 
@@ -1092,8 +1100,11 @@ class HostAudio:
 class RobloxSession:
     """One run of the client. poll() returns None while it is running."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, launch_uri=None):
         self.settings = settings
+        # This is intentionally opaque.  Do not split, decode, normalize or
+        # otherwise inspect a browser handoff before giving it to Roblox.
+        self.launch_uri = launch_uri
         self.log_path = None
         self.process = None
         self.seen_roblox = False
@@ -1139,6 +1150,18 @@ class RobloxSession:
         for key, name in TRACE_ENV.items():
             if self.settings.get(key):
                 variables.append(f"{name}=1")
+        # Cocoa URL delivery diagnostics are opt-in and stay outside URI
+        # handling. They are copied verbatim into the Darling process so a
+        # live run can compare selector order and launch timing.
+        for name in ("MACOBLOX_URI_DELAY_MS", "MACOBLOX_URI_SELECTOR_ORDER"):
+            value = os.environ.get(name)
+            if value:
+                variables.append(f"{name}={value}")
+        # The shim normally receives the exact launch value above.  Keep the
+        # host-side pending file available as a fallback for launches that did
+        # not carry the value as an argument (for example a retry after the
+        # launcher was already open).
+        variables.append(f"MACOBLOX_PENDING_URI_FILE=/Volumes/SystemRoot{CACHE_DIR / 'pending-uri'}")
         try:
             variables.append(f"MACOBLOX_ICON_ARGB=/Volumes/SystemRoot{icon_argb_file()}")
         except Exception:
@@ -1204,6 +1227,7 @@ class RobloxSession:
             log.flush()
             command = ["darling", "shell", "/bin/bash", "-c", LAUNCH_SCRIPT, "macoblox",
                        f"/Volumes/SystemRoot{DATA_DIR}", f"/Volumes/SystemRoot{SHIM.parent}",
+                       self.launch_uri if self.launch_uri is not None else "",
                        *self.shim_variables()]
             self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=subprocess.STDOUT,

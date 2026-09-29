@@ -12,7 +12,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import __version__, author, core, discord, dns, i18n, mods, studio  # noqa: E402
+from . import __version__, author, core, discord, dns, i18n, mods, studio, uri as uri_handoff  # noqa: E402
 from .i18n import _  # noqa: E402
 
 APP_ID = "wtf.aubree.MacOBlox"
@@ -1397,6 +1397,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.busy = None
         self.quit_when_idle = False  # the window was closed during an operation
         self.last_log = None
+        self.pending_uri = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
         threading.Thread(target=self._check_startup_update, daemon=True).start()
@@ -1537,6 +1538,9 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.get_application().quit()
             return
         self.play_page.refresh()
+        if self.pending_uri and core.installed_version():
+            pending = self.pending_uri
+            GLib.idle_add(self.handle_uri, pending)
 
     def set_setting(self, key, value):
         self.settings[key] = value
@@ -1568,6 +1572,26 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("settings")
             self.settings_page.set_tab("roblox")
             self.settings_page.check_updates(install=True)
+
+    def handle_uri(self, browser_uri):
+        """Start Roblox with an opaque browser handoff when it is ready."""
+        # The activation callback may have been queued just before another
+        # browser click arrived.  Prefer the still-pending complete argument
+        # so the newest handoff is the one that starts the client.
+        browser_uri = uri_handoff.peek_pending() or browser_uri
+        self.pending_uri = browser_uri
+        if self.session or self.busy:
+            # The pending file remains in place.  A later activation or the
+            # end of the current operation will retry this exact argument.
+            return
+        if not core.installed_version():
+            self.stack.set_visible_child_name("settings")
+            self.settings_page.set_tab("roblox")
+            self.settings_page.check_updates(install=True)
+            return
+        # Keep the file until RobloxSession has started successfully.  If
+        # Darling or the shim fails, the browser handoff can still be retried.
+        self.launch(browser_uri)
 
     def studio_clicked(self):
         if studio.running():
@@ -1625,11 +1649,11 @@ class LauncherWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def launch(self):
+    def launch(self, launch_uri=None):
         if not self.begin("starting"):
             return
         self.settings_page.flush()
-        session = core.RobloxSession(dict(self.settings))
+        session = core.RobloxSession(dict(self.settings), launch_uri=launch_uri)
         self.web = self._web_bridge()
         if self.web:
             session.web_socket = self.web.guest_path
@@ -1640,7 +1664,7 @@ class LauncherWindow(Adw.ApplicationWindow):
                 session.start()  # cleans up after itself when it fails
                 GLib.idle_add(self._started, session, None)
             except Exception as error:
-                GLib.idle_add(self._started, None, error)
+                GLib.idle_add(self._started, session, error)
 
         threading.Thread(target=start, daemon=True).start()
 
@@ -1691,11 +1715,18 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.quit_when_idle = False  # a game or an error to show: stay
         if error:
             self._stop_web()
+            if session and session.launch_uri:
+                self.pending_uri = session.launch_uri
             self.set_visible(True)
             self.play_page.refresh()
             _error_dialog(self, _("Could not start Roblox"), str(error) or repr(error))
             return
         self.session = session
+        if session.launch_uri:
+            # A newer click may have replaced pending-uri while Darling was
+            # starting; clear only the argument this session consumed.
+            uri_handoff.clear_pending(session.launch_uri)
+            self.pending_uri = uri_handoff.peek_pending()
         self.last_log = session.log_path
         self.game_started_at = time.time()
         self.last_playtime_save = time.time()
@@ -1733,6 +1764,10 @@ class LauncherWindow(Adw.ApplicationWindow):
         self._stop_rpc()
         core.save_settings(self.settings)
         self.play_page.refresh()
+        pending = self.pending_uri or uri_handoff.peek_pending()
+        if pending:
+            self.pending_uri = pending
+            GLib.idle_add(self.handle_uri, pending)
         failed = status not in (0, -1)
         # A failure is always shown, even with the launcher set to stay closed.
         if failed or self.settings.get("show_launcher_after_exit", True):
@@ -1764,6 +1799,7 @@ class LauncherApp(Adw.Application):
         self.window = None
 
     def do_activate(self):
+        pending = uri_handoff.peek_pending()
         if not self.window:
             Gtk.Window.set_default_icon_name("macoblox")
             Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
@@ -1777,6 +1813,8 @@ class LauncherApp(Adw.Application):
         if os.environ.get("MACOBLOX_PAGE"):
             # Screenshots: no focused field.
             GLib.timeout_add(300, lambda: self.window.set_focus(None) and False)
+        if pending:
+            GLib.idle_add(self.window.handle_uri, pending)
 
     def _close(self, window):
         window.settings_page.flush()

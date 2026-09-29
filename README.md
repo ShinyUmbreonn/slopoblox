@@ -23,16 +23,22 @@ its Windows version through Wine. English and Russian.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
+git clone https://github.com/aubree-lat/MacOBlox.git
+cd MacOBlox
+./install.sh --install
 ```
 
+The installer uses the checkout it is run from, so local changes can be tested
+without downloading a second copy of the repository. Run it again after
+changing the checkout to rebuild and reinstall those files.
+
 It installs Darling and everything else, then puts **Mac O’ Blox** in the app
-menu. Open it, press **Install Roblox**, then **Play**. Run the same command
-again for a small menu to update or uninstall. Without a terminal, or for
-scripts, the choices are options too:
+menu. Open it, press **Install Roblox**, then **Play**. Run `./install.sh`
+without an option for the update or uninstall menu. For scripts, the choices
+are options too:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
+./install.sh --uninstall
 ```
 
 Uninstalling keeps Darling and its prefix, `~/.darling`, which holds your Roblox
