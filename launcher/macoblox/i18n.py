@@ -139,12 +139,24 @@ RU = {
         "Камера следует за движением самой мыши, без ускорения указателя (XInput 2)",
     "Hide the launcher window while the game is running": "Скрывать окно лаунчера, пока запущена игра",
     "Discord Rich Presence": "Discord Rich Presence",
+    "Enable Discord Rich Presence": "Включить Discord Rich Presence",
     "Show current game and playtime in your Discord status": "Показывать статус игры и время в Discord",
+    "Show experience name in Discord": "Показывать название игры в Discord",
+    "Display the title and creator of the place you are playing":
+        "Отображать название и создателя плейса, в который вы играете",
+    "Show experience thumbnail in Discord": "Показывать иконку плейса в Discord",
+    "Replace the Mac O’ Blox icon with the game's icon":
+        "Заменять иконку Mac O’ Blox на обложку игры",
+    "Show elapsed time in Discord": "Показывать прошедшее время в Discord",
+    "Display how long you have been playing in your status":
+        "Отображать время, прошедшее с момента запуска игры",
     "Show playtime": "Показывать время в игре",
     "Show accumulated playtime on the Play page": "Отображать наигранное время на вкладке «Играть»",
     "Total playtime": "Всего наиграно",
     "Playing Roblox": "Играет в Roblox",
     "In Game": "В игре",
+    "In Main Menu": "В главном меню",
+    "by {creator}": "от {creator}",
     "Hide the macOS menu bar": "Скрывать полоску меню macOS",
     "The Roblox, Edit, Window… strip at the top of the game window":
         "Полоска Roblox, Edit, Window… сверху окна игры",
@@ -277,9 +289,43 @@ RU = {
     "The shim comes built with this package": "Шим в этом пакете уже собран",
     "Could not build the shim": "Не удалось собрать шим",
     "Could not build the shim:\n{output}": "Не удалось собрать шим:\n{output}",
+    "Cannot connect to X11 display {display}. Make sure an X server or Xwayland is running.":
+        "Не удалось подключиться к X11-дисплею {display}. Убедитесь, что запущен X-сервер или Xwayland.",
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
+    # Live logs view
+    "Logs": "Логи",
+    "Game Logs": "Логи игры",
+    "Auto-scroll": "Автопрокрутка",
+    "Copy logs": "Скопировать логи",
+    "Logs copied to clipboard": "Логи скопированы в буфер обмена",
+    "Clear view": "Очистить экран",
+    "Open log file": "Открыть файл лога",
+    "Open in editor": "Открыть в редакторе",
+    "Open in text editor": "Открыть в текстовом редакторе",
+    "Search in logs (Ctrl+F)…": "Поиск по логам (Ctrl+F)…",
+    "Search in logs (Ctrl+F)": "Поиск по логам (Ctrl+F)",
+    "Previous match": "Предыдущее совпадение",
+    "Next match": "Следующее совпадение",
+    "Close search": "Закрыть поиск",
+    "No matches": "Нет совпадений",
+    "No log found": "Файл лога не найден",
+    "Could not open the log: {error}": "Не удалось открыть лог: {error}",
+    "Game is not running": "Игра не запущена",
+    "View game logs": "Просмотр логов игры",
+    # Crash / X11 handling
+    "X11 Connection Lost": "Потеряно соединение с X11",
+    "The game crashed because the X11 connection was broken. This usually happens when raw mouse input overloads the display server with events. Would you like to disable raw mouse input?":
+        "Игра аварийно закрылась из-за разрыва соединения с X11. Обычно это происходит, когда сырой ввод мыши (XInput 2) перегружает сервер Xwayland событиями движения. Отключить сырой ввод мыши?",
+    "Keep Enabled": "Оставить включённым",
+    "Disable Raw Mouse": "Отключить сырой ввод",
+    "Raw mouse input disabled": "Сырой ввод мыши отключён",
+    "The game crashed because the X11 connection was broken (explicit kill or server shutdown).":
+        "Игра аварийно закрылась из-за разрыва соединения с X11 (сервер X11 был принудительно остановлен).",
+    # Fast flags
+    "Anisotropic filtering (16x)": "Анизотропная фильтрация (16x)",
+    "Force maximum texture resolution": "Принудительное максимальное разрешение текстур",
     # Info
     "Mac O’ Blox runs the real Roblox client for macOS on Linux through Darling. "
     "It is not made by Roblox and is not affiliated with it.":

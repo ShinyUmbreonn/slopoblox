@@ -1417,6 +1417,20 @@ int my_NSApplicationMain(int argc, const char *argv[]) {
         // into the Cocoa URL object at delivery time.
         (void)macoblox_pending_uri();
     }
+
+    void* (*open_display)(const char*) = (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
+    int (*close_display)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XCloseDisplay");
+    if (open_display) {
+        void* test_dpy = open_display(0);
+        if (!test_dpy) {
+            write_str("[MacOBlox] FATAL: Cannot connect to X11 display! XOpenDisplay returned NULL.\n");
+            write_str("[MacOBlox] Make sure an X server or Xwayland is running.\n");
+            extern void macoblox_immediate_exit(int);
+            macoblox_immediate_exit(1);
+        } else if (close_display) {
+            close_display(test_dpy);
+        }
+    }
     int (*real_main)(int, const char*[]) = (int (*)(int, const char*[]))dlsym(RTLD_NEXT, "NSApplicationMain");
     int res = real_main ? real_main(argc, argv) : 0;
     write_str("\n[MacOBlox Hook] NSApplicationMain returned: ");

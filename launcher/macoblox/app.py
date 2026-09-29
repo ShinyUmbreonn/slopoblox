@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -9,7 +10,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from . import __version__, author, core, discord, dns, i18n, mods, studio, uri as uri_handoff  # noqa: E402
@@ -32,10 +33,21 @@ PRESETS = [
      "flag": ["FIntFRMMinGrassDistance", "FIntFRMMaxGrassDistance"], "kind": "fixed", "value": 0},
     {"title": "Low quality terrain", "subtitle": "FIntTerrainArraySliceSize = 0",
      "flag": "FIntTerrainArraySliceSize", "kind": "fixed", "value": 0},
-    {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 0–3",
+    {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 3, 16x AF, No mip skipping",
      "flag": "DFIntTextureQualityOverride", "kind": "number", "default": 3, "min": 0, "max": 3,
      # The override is ignored unless this is set too.
-     "also": {"DFFlagTextureQualityOverrideEnabled": True}},
+     "also": {
+         "DFFlagTextureQualityOverrideEnabled": True,
+         "FIntDebugTextureManagerSkipMips": -1,
+         "DFIntTextureCompositorLowResFactor": 1,
+         "DFFlagTextureCompositorHighQualityEnabled": True,
+         "FIntDebugForceAnisotropy": 16,
+         "DFFlagDisableDPIScale": True,
+     }},
+    {"title": "Anisotropic filtering (16x)", "subtitle": "FIntDebugForceAnisotropy: 16 (sharp textures at angles)",
+     "flag": "FIntDebugForceAnisotropy", "kind": "number", "default": 16, "min": 1, "max": 16},
+    {"title": "Force maximum texture resolution", "subtitle": "FIntDebugTextureManagerSkipMips: -1 (never downscale mips)",
+     "flag": "FIntDebugTextureManagerSkipMips", "kind": "number", "default": -1, "min": -1, "max": 0},
 ]
 
 DNS_CHOICES = [
@@ -90,11 +102,341 @@ def _error_dialog(window, heading, details):
     dialog.present(window)
 
 
+class GameLogsView(Gtk.Box):
+    """Live streaming log viewer for Roblox Player with syntax highlighting and search."""
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.window = window
+        self.last_pos = 0
+        self.line_count = 0
+        self.current_log_path = None
+        self.auto_scroll = True
+        self.matches = []
+        self.current_match_idx = -1
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_margin_start(16)
+        bar.set_margin_end(16)
+        bar.set_margin_top(8)
+
+        self.title_label = Gtk.Label(label=_("Game Logs"), css_classes=["heading"])
+        bar.append(self.title_label)
+
+        self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=8)
+        bar.append(self.status_label)
+
+        spacer = Gtk.Box(hexpand=True)
+        bar.append(spacer)
+
+        search_btn = Gtk.Button(icon_name="edit-find-symbolic")
+        search_btn.add_css_class("flat")
+        search_btn.set_tooltip_text(_("Search in logs (Ctrl+F)"))
+        search_btn.connect("clicked", lambda *_args: self.toggle_search())
+        bar.append(search_btn)
+
+        self.scroll_btn = Gtk.ToggleButton(icon_name="go-bottom-symbolic")
+        self.scroll_btn.add_css_class("flat")
+        self.scroll_btn.set_tooltip_text(_("Auto-scroll"))
+        self.scroll_btn.set_active(True)
+        self.scroll_btn.connect("toggled", self._on_scroll_toggled)
+        bar.append(self.scroll_btn)
+
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic")
+        copy_btn.add_css_class("flat")
+        copy_btn.set_tooltip_text(_("Copy logs"))
+        copy_btn.connect("clicked", self._on_copy_clicked)
+        bar.append(copy_btn)
+
+        self.open_btn = Gtk.Button(icon_name="document-edit-symbolic")
+        self.open_btn.add_css_class("flat")
+        self.open_btn.set_tooltip_text(_("Open in text editor"))
+        self.open_btn.connect("clicked", lambda *_args: window.open_external_log(self.current_log_path))
+        bar.append(self.open_btn)
+
+        clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
+        clear_btn.add_css_class("flat")
+        clear_btn.set_tooltip_text(_("Clear view"))
+        clear_btn.connect("clicked", self._on_clear_clicked)
+        bar.append(clear_btn)
+
+        self.append(bar)
+
+        # Search revealer bar
+        self.search_revealer = Gtk.Revealer(
+            reveal_child=False,
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN
+        )
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        search_box.set_margin_start(16)
+        search_box.set_margin_end(16)
+        search_box.set_margin_top(2)
+        search_box.set_margin_bottom(2)
+
+        self.search_entry = Gtk.SearchEntry(hexpand=True)
+        self.search_entry.set_placeholder_text(_("Search in logs (Ctrl+F)…"))
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("activate", lambda *_args: self._find_next())
+        self.search_entry.connect("stop-search", lambda *_args: self.close_search())
+
+        self.search_count_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=6, margin_end=6)
+
+        prev_btn = Gtk.Button(icon_name="go-up-symbolic", tooltip_text=_("Previous match"))
+        prev_btn.add_css_class("flat")
+        prev_btn.connect("clicked", lambda *_args: self._find_prev())
+
+        next_btn = Gtk.Button(icon_name="go-down-symbolic", tooltip_text=_("Next match"))
+        next_btn.add_css_class("flat")
+        next_btn.connect("clicked", lambda *_args: self._find_next())
+
+        close_btn = Gtk.Button(icon_name="window-close-symbolic", tooltip_text=_("Close search"))
+        close_btn.add_css_class("flat")
+        close_btn.connect("clicked", lambda *_args: self.close_search())
+
+        search_box.append(self.search_entry)
+        search_box.append(self.search_count_label)
+        search_box.append(prev_btn)
+        search_box.append(next_btn)
+        search_box.append(close_btn)
+
+        self.search_revealer.set_child(search_box)
+        self.append(self.search_revealer)
+
+        self.scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        self.scrolled.set_margin_start(16)
+        self.scrolled.set_margin_end(16)
+        self.scrolled.set_margin_bottom(12)
+        self.scrolled.add_css_class("card")
+
+        self.text_view = Gtk.TextView()
+        self.text_view.set_monospace(True)
+        self.text_view.set_editable(False)
+        self.text_view.set_cursor_visible(False)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.text_view.set_left_margin(12)
+        self.text_view.set_right_margin(12)
+        self.text_view.set_top_margin(12)
+        self.text_view.set_bottom_margin(12)
+        self.buffer = self.text_view.get_buffer()
+
+        self.tag_ln = self.buffer.create_tag("log_ln", foreground="#6e6e73")
+        self.tag_time = self.buffer.create_tag("log_time", foreground="#77767b")
+        self.tag_err = self.buffer.create_tag("log_err", foreground="#ed333b", weight=Pango.Weight.BOLD)
+        self.tag_warn = self.buffer.create_tag("log_warn", foreground="#e5a50a", weight=Pango.Weight.SEMIBOLD)
+        self.tag_info = self.buffer.create_tag("log_info", foreground="#3584e4")
+        self.tag_success = self.buffer.create_tag("log_success", foreground="#33d17a", weight=Pango.Weight.BOLD)
+        self.tag_debug = self.buffer.create_tag("log_debug", foreground="#7f848e")
+        self.tag_macoblox = self.buffer.create_tag("log_macoblox", foreground="#c061cb", weight=Pango.Weight.BOLD)
+        self.tag_match = self.buffer.create_tag("search_match", background="#2a5c9a", foreground="#ffffff")
+        self.tag_current = self.buffer.create_tag("search_current", background="#f6d32d", foreground="#000000")
+        self._ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s,]*)(.*)$")
+
+        self.scrolled.set_child(self.text_view)
+        self.append(self.scrolled)
+
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_controller)
+
+    def _on_key_pressed(self, _controller, keyval, _keycode, state):
+        if (state & Gdk.ModifierType.CONTROL_MASK) and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.toggle_search()
+            return True
+        if keyval == Gdk.KEY_Escape and self.search_revealer.get_reveal_child():
+            self.close_search()
+            return True
+        return False
+
+    def toggle_search(self):
+        if self.search_revealer.get_reveal_child():
+            self.close_search()
+        else:
+            self.open_search()
+
+    def open_search(self):
+        self.search_revealer.set_reveal_child(True)
+        self.search_entry.grab_focus()
+        if self.search_entry.get_text():
+            self._on_search_changed(self.search_entry)
+
+    def close_search(self):
+        self.search_revealer.set_reveal_child(False)
+        self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.search_count_label.set_text("")
+        self.matches = []
+        self.current_match_idx = -1
+        self.text_view.grab_focus()
+
+    def _on_search_changed(self, entry):
+        query = entry.get_text().strip()
+        self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        if not query:
+            self.search_count_label.set_text("")
+            self.matches = []
+            self.current_match_idx = -1
+            return
+
+        matches = []
+        it = self.buffer.get_start_iter()
+        while True:
+            res = it.forward_search(query, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+            if not res:
+                break
+            s, e = res
+            self.buffer.apply_tag(self.tag_match, s, e)
+            matches.append(s.get_offset())
+            it = e
+
+        self.matches = matches
+        if matches:
+            self.current_match_idx = 0
+            self._highlight_current_match(query)
+        else:
+            self.current_match_idx = -1
+            self.search_count_label.set_text(_("No matches"))
+
+    def _highlight_current_match(self, query=None):
+        if not self.matches or self.current_match_idx < 0:
+            return
+        if query is None:
+            query = self.search_entry.get_text().strip()
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        offset = self.matches[self.current_match_idx]
+        s = self.buffer.get_iter_at_offset(offset)
+        e = self.buffer.get_iter_at_offset(offset + len(query))
+        self.buffer.apply_tag(self.tag_current, s, e)
+        self.text_view.scroll_to_iter(s, 0.2, False, 0.0, 0.5)
+        self.search_count_label.set_text(f"{self.current_match_idx + 1} / {len(self.matches)}")
+
+    def _find_next(self):
+        if not self.matches:
+            return
+        self.current_match_idx = (self.current_match_idx + 1) % len(self.matches)
+        self._highlight_current_match()
+
+    def _find_prev(self):
+        if not self.matches:
+            return
+        self.current_match_idx = (self.current_match_idx - 1) % len(self.matches)
+        self._highlight_current_match()
+
+    def _insert_highlighted_text(self, text: str):
+        lines = text.splitlines()
+        for line in lines:
+            self.line_count += 1
+            ll = line.lower()
+            if "[macoblox]" in ll:
+                tag = self.tag_macoblox
+            elif any(k in ll for k in ("error", "crash", "fatal", "sigsegv", "exception", "abort")):
+                tag = self.tag_err
+            elif any(k in ll for k in ("warning", "warn")):
+                tag = self.tag_warn
+            elif any(k in ll for k in ("! joining game", "game join succeeded", "entered play session")):
+                tag = self.tag_success
+            elif "info" in ll:
+                tag = self.tag_info
+            elif any(k in ll for k in ("debug", "flog", "dflog")):
+                tag = self.tag_debug
+            else:
+                tag = None
+
+            end = self.buffer.get_end_iter()
+            # Gutter line number prefix
+            self.buffer.insert_with_tags(end, f"{self.line_count:5d} │ ", self.tag_ln)
+
+            m = self._ts_re.match(line)
+            end = self.buffer.get_end_iter()
+            if m:
+                self.buffer.insert_with_tags(end, m.group(1), self.tag_time)
+                end = self.buffer.get_end_iter()
+                rest = m.group(2) + "\n"
+                if tag:
+                    self.buffer.insert_with_tags(end, rest, tag)
+                else:
+                    self.buffer.insert(end, rest)
+            else:
+                if tag:
+                    self.buffer.insert_with_tags(end, line + "\n", tag)
+                else:
+                    self.buffer.insert(end, line + "\n")
+
+    def reset(self, log_path=None):
+        self.current_log_path = log_path
+        self.last_pos = 0
+        self.line_count = 0
+        self.buffer.set_text("")
+        self.close_search()
+        if log_path:
+            self.status_label.set_text(log_path.name)
+        else:
+            self.status_label.set_text("")
+
+    def update(self):
+        log_path = None
+        if self.window.session and self.window.session.log_path:
+            log_path = self.window.session.log_path
+        elif self.window.last_log:
+            log_path = self.window.last_log
+
+        if not log_path or not log_path.exists():
+            return
+
+        if self.current_log_path != log_path:
+            self.reset(log_path)
+
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(self.last_pos)
+                chunk = f.read()
+                if chunk:
+                    self.last_pos = f.tell()
+                    text = chunk.decode("utf-8", errors="replace")
+                    self._insert_highlighted_text(text)
+
+                    if self.current_log_path:
+                        self.status_label.set_text(f"{self.current_log_path.name} ({self.line_count} l.)")
+
+                    line_count = self.buffer.get_line_count()
+                    if line_count > 5000:
+                        start_iter = self.buffer.get_start_iter()
+                        trim_iter = self.buffer.get_iter_at_line(line_count - 4000)
+                        self.buffer.delete(start_iter, trim_iter)
+
+                    if self.auto_scroll:
+                        end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
+                        self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+        except Exception:
+            pass
+
+    def _on_scroll_toggled(self, btn):
+        self.auto_scroll = btn.get_active()
+        if self.auto_scroll:
+            end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
+            self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+
+    def _on_copy_clicked(self, _btn):
+        raw = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
+        clean = re.sub(r"^\s*\d+\s*│\s*", "", raw, flags=re.MULTILINE)
+        if clean:
+            Gdk.Display.get_default().get_clipboard().set(clean)
+            _toast(self.window.toasts, _("Logs copied to clipboard"))
+
+    def _on_clear_clicked(self, _btn):
+        self.buffer.set_text("")
+        self.line_count = 0
+        self.close_search()
+
+
 class PlayPage(Adw.Bin):
     def __init__(self, window):
         super().__init__()
         self.window = window
         toolbar_view = Adw.ToolbarView()
+
+        self.stack = Adw.ViewStack()
+        self.top_box = None
 
         status = Adw.StatusPage()
         status.set_icon_name("macoblox")
@@ -120,7 +462,22 @@ class PlayPage(Adw.Bin):
         center_box.append(links)
 
         status.set_child(center_box)
-        toolbar_view.set_content(status)
+        self.stack.add_titled_with_icon(status, "play", _("Play"), "media-playback-start-symbolic")
+
+        self.logs_view = GameLogsView(window)
+        self.stack.add_titled_with_icon(self.logs_view, "logs", _("Logs"), "utilities-terminal-symbolic")
+
+        self.top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.top_box.set_margin_top(10)
+        self.top_box.set_margin_bottom(10)
+        self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.switcher.set_halign(Gtk.Align.CENTER)
+        self.top_box.append(self.switcher)
+        self.top_box.set_visible(False)
+
+        toolbar_view.add_top_bar(self.top_box)
+        toolbar_view.set_content(self.stack)
+        self.stack.connect("notify::visible-child-name", self._on_tab_changed)
 
         action_bar = Gtk.ActionBar()
 
@@ -157,6 +514,38 @@ class PlayPage(Adw.Bin):
         self.set_child(toolbar_view)
         self.refresh()
 
+    def _on_tab_changed(self, stack, _pspec):
+        if getattr(self, "top_box", None) is None:
+            return
+        tab = stack.get_visible_child_name()
+        if tab == "logs":
+            self.logs_view.update()
+        elif tab == "play":
+            running = self.window.session is not None
+            busy = self.window.busy
+            active = running or busy == "starting"
+            if not active:
+                self.top_box.set_visible(False)
+
+    def show_logs(self, log_path=None):
+        if not log_path:
+            log_path = (self.window.session.log_path if self.window.session else None) or self.window.last_log
+        if not log_path or not log_path.exists():
+            _toast(self.window.toasts, _("No log found"))
+            return
+        self.top_box.set_visible(True)
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(True)
+                child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+        self.logs_view.reset(log_path)
+        self.logs_view.update()
+        self.stack.set_visible_child_name("logs")
+
     def _on_play_clicked(self):
         if self.window.session is not None:
             self.window.stop()
@@ -173,6 +562,27 @@ class PlayPage(Adw.Bin):
     def refresh(self):
         running = self.window.session is not None
         busy = self.window.busy
+        active = running or busy == "starting"
+        viewing_logs = self.stack.get_visible_child_name() == "logs"
+
+        # Show switcher when game is active or currently viewing logs
+        self.top_box.set_visible(active or viewing_logs)
+
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(active or bool(self.window.last_log))
+                if not active and not self.window.last_log:
+                    child.set_tooltip_text(_("Game is not running"))
+                else:
+                    child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+
+        if not active and not self.window.last_log and viewing_logs:
+            self.stack.set_visible_child_name("play")
+
         version = core.installed_version()
         parts = [_("Roblox {version}", version=version) if version else _("Roblox not found")]
         parts.append(_("Darling running") if core.darlingserver_running()
@@ -197,7 +607,7 @@ class PlayPage(Adw.Bin):
             self.play.add_css_class("suggested-action")
             self.play.set_sensitive(not busy)
 
-        self.log_button.set_visible(self.window.last_log is not None and not running)
+        self.log_button.set_visible(bool(self.window.last_log) and not running)
         self.refresh_playtime()
 
 
@@ -622,12 +1032,14 @@ class SettingsPage(Adw.Bin):
             "scroll_sensitivity", round(row.get_value(), 2)))
         game.add(scroll_sens)
 
-        raw_mouse = Adw.SwitchRow(title=_("Raw mouse input"),
-                                  subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
-                                  active=settings.get("raw_mouse", True))
-        raw_mouse.connect("notify::active", lambda row, _pspec: window.set_setting(
+        self.raw_mouse_row = Adw.SwitchRow(
+            title=_("Raw mouse input"),
+            subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
+            active=settings.get("raw_mouse", True),
+        )
+        self.raw_mouse_row.connect("notify::active", lambda row, _pspec: window.set_setting(
             "raw_mouse", row.get_active()))
-        game.add(raw_mouse)
+        game.add(self.raw_mouse_row)
 
         menu_bar = Adw.SwitchRow(title=_("Hide the macOS menu bar"),
                                  subtitle=_("The Roblox, Edit, Window… strip at the top of the game window"),
@@ -649,12 +1061,6 @@ class SettingsPage(Adw.Bin):
             "show_launcher_after_exit", row.get_active()))
         game.add(reopen)
 
-        discord_rpc = Adw.SwitchRow(title=_("Discord Rich Presence"),
-                                    subtitle=_("Show current game and playtime in your Discord status"),
-                                    active=settings.get("discord_rpc", True))
-        discord_rpc.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
-        game.add(discord_rpc)
-
         playtime_switch = Adw.SwitchRow(title=_("Show playtime"),
                                         subtitle=_("Show accumulated playtime on the Play page"),
                                         active=settings.get("show_playtime", True))
@@ -662,6 +1068,49 @@ class SettingsPage(Adw.Bin):
         game.add(playtime_switch)
 
         self.env_page.add(game)
+
+        # 3. Discord Rich Presence
+        discord_group = Adw.PreferencesGroup(title=_("Discord Rich Presence"))
+
+        self.discord_rpc_switch = Adw.SwitchRow(
+            title=_("Enable Discord Rich Presence"),
+            subtitle=_("Show current game and playtime in your Discord status"),
+            active=settings.get("discord_rpc", True),
+        )
+        self.discord_rpc_switch.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
+        discord_group.add(self.discord_rpc_switch)
+
+        self.discord_game = Adw.SwitchRow(
+            title=_("Show experience name in Discord"),
+            subtitle=_("Display the title and creator of the place you are playing"),
+            active=settings.get("discord_rpc_game", True),
+        )
+        self.discord_game.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_game.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_game", row.get_active()))
+        discord_group.add(self.discord_game)
+
+        self.discord_icon = Adw.SwitchRow(
+            title=_("Show experience thumbnail in Discord"),
+            subtitle=_("Replace the Mac O’ Blox icon with the game's icon"),
+            active=settings.get("discord_rpc_icon", False),
+        )
+        self.discord_icon.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_icon.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_icon", row.get_active()))
+        discord_group.add(self.discord_icon)
+
+        self.discord_time = Adw.SwitchRow(
+            title=_("Show elapsed time in Discord"),
+            subtitle=_("Display how long you have been playing in your status"),
+            active=settings.get("discord_rpc_time", True),
+        )
+        self.discord_time.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_time.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_time", row.get_active()))
+        discord_group.add(self.discord_time)
+
+        self.env_page.add(discord_group)
 
         dns_group = Adw.PreferencesGroup(
             title=_("DNS for Roblox"),
@@ -786,6 +1235,10 @@ class SettingsPage(Adw.Bin):
 
     def flush(self):
         self.flags_page.flush()
+
+    def refresh_raw_mouse(self):
+        if hasattr(self, "raw_mouse_row"):
+            self.raw_mouse_row.set_active(self.window.settings.get("raw_mouse", True))
 
     def open_logs(self):
         try:
@@ -1392,11 +1845,14 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.settings = core.load_settings()
         i18n.set_language(self.settings.get("language", "en"))
         self.session = None
+        self.rpc = None
+        self.game_tracker = None
+        self.current_game_info = None
         # One long operation at a time: starting, updating, building,
         # restarting Darling or signing out. They share the client and Darling.
         self.busy = None
         self.quit_when_idle = False  # the window was closed during an operation
-        self.last_log = None
+        self.last_log = self._find_last_log()
         self.pending_uri = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
@@ -1413,7 +1869,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.settings_page = SettingsPage(self)
         self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
         self.mods_page = ModsPage(self)
-        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "extension-symbolic")
+        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "application-x-addon-symbolic")
         self.info_page = InfoPage(self)
         self.stack.add_titled_with_icon(self.info_page, "info", _("Info"), "help-about-symbolic")
         self.flags_page = self.settings_page.flags_page
@@ -1685,26 +2141,89 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def set_discord_rpc(self, enabled):
         self.set_setting("discord_rpc", enabled)
+        if hasattr(self, "settings_page"):
+            if hasattr(self.settings_page, "discord_game"):
+                self.settings_page.discord_game.set_sensitive(enabled)
+            if hasattr(self.settings_page, "discord_icon"):
+                self.settings_page.discord_icon.set_sensitive(enabled)
+            if hasattr(self.settings_page, "discord_time"):
+                self.settings_page.discord_time.set_sensitive(enabled)
         if not enabled:
             self._stop_rpc()
         elif self.session:
             self._start_rpc()
 
+    def set_discord_rpc_option(self, key, value):
+        self.set_setting(key, value)
+        if self.session and self.settings.get("discord_rpc", True):
+            self._refresh_rpc_presence()
+
     def set_show_playtime(self, enabled):
         self.set_setting("show_playtime", enabled)
         self.play_page.refresh_playtime()
 
-    def _start_rpc(self):
+    def _on_game_activity_change(self, info: dict | None):
+        self.current_game_info = info
+        GLib.idle_add(self._refresh_rpc_presence)
+
+    def _refresh_rpc_presence(self):
+        if not self.settings.get("discord_rpc", True):
+            return
         if getattr(self, "rpc", None) is None:
             self.rpc = discord.DiscordRPC()
-        start = getattr(self, "game_started_at", time.time())
-        threading.Thread(target=lambda: self.rpc.update_presence(
-            details=_("Playing Roblox"),
-            state=_("In Game"),
+        rpc = self.rpc
+        start = (
+            getattr(self, "game_started_at", time.time())
+            if self.settings.get("discord_rpc_time", True)
+            else None
+        )
+        info = getattr(self, "current_game_info", None)
+
+        if info and not info.get("loading") and self.settings.get("discord_rpc_game", True):
+            details = info.get("name", _("Playing Roblox"))
+            creator = info.get("creator")
+            state = _("by {creator}", creator=creator) if creator else _("In Game")
+            icon_url = info.get("icon_url")
+            use_icon = self.settings.get("discord_rpc_icon", False) and bool(icon_url)
+            large_image = icon_url if use_icon else "macoblox"
+            large_text = details
+            small_image = "macoblox" if use_icon else None
+            small_text = "Mac O’ Blox" if use_icon else None
+        elif info:
+            # Game is active (either fetching details or user hid experience name in settings)
+            details = _("Playing Roblox")
+            state = _("In Game")
+            large_image = "macoblox"
+            large_text = "Mac O’ Blox"
+            small_image = None
+            small_text = None
+        else:
+            # Menu (not in an experience)
+            details = _("In Main Menu")
+            state = None
+            large_image = "macoblox"
+            large_text = "Mac O’ Blox"
+            small_image = None
+            small_text = None
+
+        threading.Thread(target=lambda: rpc.update_presence(
+            details=details,
+            state=state,
             start_time=start,
+            large_image=large_image,
+            large_text=large_text,
+            small_image=small_image,
+            small_text=small_text,
         ), daemon=True).start()
 
+    def _start_rpc(self):
+        self._refresh_rpc_presence()
+
     def _stop_rpc(self):
+        if getattr(self, "game_tracker", None):
+            self.game_tracker.stop()
+            self.game_tracker = None
+        self.current_game_info = None
         if getattr(self, "rpc", None):
             rpc = self.rpc
             self.rpc = None
@@ -1730,9 +2249,18 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.last_log = session.log_path
         self.game_started_at = time.time()
         self.last_playtime_save = time.time()
+        self.current_game_info = None
+        if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+            self.play_page.logs_view.reset(session.log_path)
+            self.play_page.logs_view.update()
         self.play_page.refresh()
         if self.settings.get("discord_rpc", True):
             self._start_rpc()
+        if self.session and self.session.log_path:
+            self.game_tracker = discord.GameActivityTracker(
+                self.session.log_path,
+                self._on_game_activity_change
+            )
         # Hide once the game window has had time to appear.
         GLib.timeout_add_seconds(3, self._hide_while_playing)
         GLib.timeout_add(1000, self._watch)
@@ -1755,9 +2283,17 @@ class LauncherWindow(Adw.ApplicationWindow):
             # Active game: track playtime
             self.settings["playtime_seconds"] = self.settings.get("playtime_seconds", 0) + 1
             self.play_page.refresh_playtime()
+            if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+                if self.play_page.stack.get_visible_child_name() == "logs":
+                    self.play_page.logs_view.update()
             if time.time() - getattr(self, "last_playtime_save", 0) > 15:
                 self.last_playtime_save = time.time()
                 core.save_settings(self.settings)
+            # Retry RPC connection if Discord was launched after the game
+            if self.settings.get("discord_rpc", True):
+                rpc = getattr(self, "rpc", None)
+                if rpc and not rpc._connected and int(self.settings["playtime_seconds"]) % 5 == 0:
+                    self._start_rpc()
             return True
         self.session = None
         self._stop_web()
@@ -1776,21 +2312,71 @@ class LauncherWindow(Adw.ApplicationWindow):
         else:
             self.get_application().quit()
         if failed:
-            if core.exit_reason(self.last_log) == "captcha":
+            reason = core.exit_reason(self.last_log)
+            if reason == "captcha":
                 self._captcha_dialog()
+            elif reason == "x11_broken":
+                self._x11_broken_dialog()
             else:
                 _toast(self.toasts, _("Roblox exited with code {status}", status=status))
         return False
 
+    def _x11_broken_dialog(self):
+        has_raw = self.settings.get("raw_mouse", True)
+        if has_raw:
+            dialog = Adw.AlertDialog(
+                heading=_("X11 Connection Lost"),
+                body=_("The game crashed because the X11 connection was broken. "
+                       "This usually happens when raw mouse input overloads the display server with events. "
+                       "Would you like to disable raw mouse input?")
+            )
+            dialog.add_response("cancel", _("Keep Enabled"))
+            dialog.add_response("disable", _("Disable Raw Mouse"))
+            dialog.set_response_appearance("disable", Adw.ResponseAppearance.SUGGESTED)
+
+            def on_response(_d, result):
+                if result == "disable":
+                    self.set_setting("raw_mouse", False)
+                    if hasattr(self, "settings_page"):
+                        self.settings_page.refresh_raw_mouse()
+                    _toast(self.toasts, _("Raw mouse input disabled"))
+
+            dialog.connect("response", on_response)
+            dialog.present(self)
+        else:
+            _error_dialog(
+                self,
+                _("X11 Connection Lost"),
+                _("The game crashed because the X11 connection was broken (explicit kill or server shutdown).")
+            )
+
     def stop(self):
         threading.Thread(target=core.stop_roblox, daemon=True).start()
 
+    def _find_last_log(self):
+        if not core.LOGS.exists():
+            return None
+        logs = sorted(core.LOGS.glob("launch-*.log"), key=lambda p: p.stat().st_mtime)
+        return logs[-1] if logs else None
+
     def open_last_log(self):
-        if self.last_log:
-            try:
-                Gio.AppInfo.launch_default_for_uri(self.last_log.as_uri(), None)
-            except GLib.Error as error:
-                _toast(self.toasts, str(error))
+        log_path = (self.session.log_path if self.session else None) or self.last_log or self._find_last_log()
+        if log_path:
+            self.last_log = log_path
+            if hasattr(self, "play_page") and hasattr(self.play_page, "show_logs"):
+                self.play_page.show_logs(log_path)
+                return
+        self.open_external_log(log_path)
+
+    def open_external_log(self, log_path=None):
+        path = log_path or (self.session.log_path if self.session else None) or self.last_log or self._find_last_log()
+        if not path or not path.exists():
+            _toast(self.toasts, _("No log found"))
+            return
+        try:
+            Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+        except (GLib.Error, OSError) as error:
+            _toast(self.toasts, _("Could not open the log: {error}", error=error))
 
 
 class LauncherApp(Adw.Application):

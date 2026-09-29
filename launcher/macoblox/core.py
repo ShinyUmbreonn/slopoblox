@@ -10,6 +10,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import tempfile
@@ -96,6 +97,9 @@ DEFAULT_SETTINGS = {
     "show_playtime": True,
     "playtime_seconds": 0,
     "discord_rpc": True,
+    "discord_rpc_game": True,
+    "discord_rpc_icon": False,
+    "discord_rpc_time": True,
     "auto_check_roblox_updates": True,
     "mod_death_sound": "default",
     "mod_custom_death_sound": "",
@@ -540,6 +544,88 @@ def darling_environment():
     return env
 
 
+def _is_x11_reachable(display: str) -> bool:
+    """Test whether an X11 server is reachable on the given DISPLAY string."""
+    if not display:
+        return False
+    if display.startswith(":"):
+        num = display[1:].split(".")[0]
+        sock_path = f"/tmp/.X11-unix/X{num}"
+        if not os.path.exists(sock_path):
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(sock_path)
+                return True
+        except OSError:
+            return False
+    try:
+        host, port_str = display.split(":")
+        port = 6000 + int(port_str.split(".")[0])
+        with socket.create_connection((host or "127.0.0.1", port), timeout=0.5):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _find_working_x11_display() -> str | None:
+    """Find any active local X11 display socket under /tmp/.X11-unix/."""
+    socket_dir = Path("/tmp/.X11-unix")
+    if not socket_dir.is_dir():
+        return None
+    for entry in socket_dir.glob("X*"):
+        num = entry.name[1:]
+        if num.isdigit():
+            cand = f":{num}"
+            if _is_x11_reachable(cand):
+                return cand
+    return None
+
+
+def ensure_x11(env: dict[str, str]) -> None:
+    """Ensure an X11 display is reachable, attempting to start Xwayland or recover if needed."""
+    display = env.get("DISPLAY", ":0")
+    if _is_x11_reachable(display):
+        return
+
+    # Check for another active X11 display socket
+    alt = _find_working_x11_display()
+    if alt:
+        env["DISPLAY"] = alt
+        return
+
+    # In Wayland, try reviving user's Xwayland service (e.g. xwayland-satellite)
+    if env.get("WAYLAND_DISPLAY"):
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "start", "xwayland-satellite.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3
+            )
+            if res.returncode == 0:
+                for _i in range(25):
+                    time.sleep(0.1)
+                    if _is_x11_reachable(display):
+                        return
+                    alt = _find_working_x11_display()
+                    if alt:
+                        env["DISPLAY"] = alt
+                        return
+        except Exception:
+            pass
+
+    # Final check
+    alt = _find_working_x11_display()
+    if alt:
+        env["DISPLAY"] = alt
+        return
+
+    raise RuntimeError(
+        _("Cannot connect to X11 display {display}. Make sure an X server or Xwayland is running.",
+          display=display)
+    )
+
+
 def stop_roblox():
     _terminate(roblox_pids(), wait=3)
 
@@ -561,18 +647,18 @@ def signed_in():
 
 
 def exit_reason(log_path):
-    """A known cause for a game that quit, from its log, or None.
-    "captcha": Roblox tried to show its web view (captcha on sign-up or
-    password sign-in), which Darling does not have."""
+    """A known cause for a game that quit, from its log, or None."""
     try:
         with open(log_path, "rb") as file:
             file.seek(0, os.SEEK_END)
-            file.seek(max(0, file.tell() - 16384))
+            file.seek(max(0, file.tell() - 32768))
             tail = file.read().decode(errors="replace")
     except (OSError, TypeError):
         return None
     if "class WKWebView" in tail or "Selector setDetachesHiddenViews:" in tail:
         return "captcha"
+    if "X connection to " in tail and "broken (explicit kill or server shutdown)" in tail:
+        return "x11_broken"
     return None
 
 
@@ -935,14 +1021,26 @@ exec ./RobloxPlayer
 
 
 def host_vram_bytes():
-    """Largest dedicated VRAM among the host GPUs (amdgpu exposes it in sysfs)."""
+    """Largest dedicated VRAM among the host GPUs (amdgpu sysfs, nvidia-smi)."""
     best = 0
     for path in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
         try:
             best = max(best, int(path.read_text().strip()))
         except (OSError, ValueError):
             pass
-    return best
+    if best:
+        return best
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, text=True, timeout=1
+        )
+        for line in out.strip().splitlines():
+            mb = int(line.strip())
+            best = max(best, mb * 1024 * 1024)
+    except Exception:
+        pass
+    return best if best else 8 * 1024 * 1024 * 1024
 
 
 class HostAudio:
@@ -1185,6 +1283,7 @@ class RobloxSession:
             if not ok:
                 raise RuntimeError(_("Could not build the shim:\n{output}", output=output))
         env = self.environment()
+        ensure_x11(env)
         # A game closed a moment ago may still be shutting down. A new one next
         # to it shared its darlingserver, and when that went both died. Give it
         # time, then end it; crash handlers of earlier games are just ended.
