@@ -92,14 +92,17 @@ def _error_dialog(window, heading, details):
 
 
 class GameLogsView(Gtk.Box):
-    """Live streaming log viewer for Roblox Player during the active game."""
+    """Live streaming log viewer for Roblox Player with syntax highlighting and search."""
 
     def __init__(self, window):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.window = window
         self.last_pos = 0
+        self.line_count = 0
         self.current_log_path = None
         self.auto_scroll = True
+        self.matches = []
+        self.current_match_idx = -1
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.set_margin_start(16)
@@ -115,6 +118,12 @@ class GameLogsView(Gtk.Box):
         spacer = Gtk.Box(hexpand=True)
         bar.append(spacer)
 
+        search_btn = Gtk.Button(icon_name="edit-find-symbolic")
+        search_btn.add_css_class("flat")
+        search_btn.set_tooltip_text(_("Search in logs (Ctrl+F)"))
+        search_btn.connect("clicked", lambda *_args: self.toggle_search())
+        bar.append(search_btn)
+
         self.scroll_btn = Gtk.ToggleButton(icon_name="go-bottom-symbolic")
         self.scroll_btn.add_css_class("flat")
         self.scroll_btn.set_tooltip_text(_("Auto-scroll"))
@@ -128,11 +137,15 @@ class GameLogsView(Gtk.Box):
         copy_btn.connect("clicked", self._on_copy_clicked)
         bar.append(copy_btn)
 
-        open_btn = Gtk.Button(label=_("Open in editor"), icon_name="document-open-symbolic")
-        open_btn.add_css_class("flat")
-        open_btn.set_tooltip_text(_("Open in text editor"))
-        open_btn.connect("clicked", lambda *_args: window.open_external_log(self.current_log_path))
-        bar.append(open_btn)
+        open_content = Adw.ButtonContent(
+            icon_name="document-open-symbolic",
+            label=_("Open in editor"),
+        )
+        self.open_btn = Gtk.Button(child=open_content)
+        self.open_btn.add_css_class("flat")
+        self.open_btn.set_tooltip_text(_("Open in text editor"))
+        self.open_btn.connect("clicked", lambda *_args: window.open_external_log(self.current_log_path))
+        bar.append(self.open_btn)
 
         clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
         clear_btn.add_css_class("flat")
@@ -141,6 +154,46 @@ class GameLogsView(Gtk.Box):
         bar.append(clear_btn)
 
         self.append(bar)
+
+        # Search revealer bar
+        self.search_revealer = Gtk.Revealer(
+            reveal_child=False,
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN
+        )
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        search_box.set_margin_start(16)
+        search_box.set_margin_end(16)
+        search_box.set_margin_top(2)
+        search_box.set_margin_bottom(2)
+
+        self.search_entry = Gtk.SearchEntry(hexpand=True)
+        self.search_entry.set_placeholder_text(_("Search in logs (Ctrl+F)…"))
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("activate", lambda *_args: self._find_next())
+        self.search_entry.connect("stop-search", lambda *_args: self.close_search())
+
+        self.search_count_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=6, margin_end=6)
+
+        prev_btn = Gtk.Button(icon_name="go-up-symbolic", tooltip_text=_("Previous match"))
+        prev_btn.add_css_class("flat")
+        prev_btn.connect("clicked", lambda *_args: self._find_prev())
+
+        next_btn = Gtk.Button(icon_name="go-down-symbolic", tooltip_text=_("Next match"))
+        next_btn.add_css_class("flat")
+        next_btn.connect("clicked", lambda *_args: self._find_next())
+
+        close_btn = Gtk.Button(icon_name="window-close-symbolic", tooltip_text=_("Close search"))
+        close_btn.add_css_class("flat")
+        close_btn.connect("clicked", lambda *_args: self.close_search())
+
+        search_box.append(self.search_entry)
+        search_box.append(self.search_count_label)
+        search_box.append(prev_btn)
+        search_box.append(next_btn)
+        search_box.append(close_btn)
+
+        self.search_revealer.set_child(search_box)
+        self.append(self.search_revealer)
 
         self.scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
         self.scrolled.set_margin_start(16)
@@ -159,6 +212,7 @@ class GameLogsView(Gtk.Box):
         self.text_view.set_bottom_margin(12)
         self.buffer = self.text_view.get_buffer()
 
+        self.tag_ln = self.buffer.create_tag("log_ln", foreground="#6e6e73")
         self.tag_time = self.buffer.create_tag("log_time", foreground="#77767b")
         self.tag_err = self.buffer.create_tag("log_err", foreground="#ed333b", weight=Pango.Weight.BOLD)
         self.tag_warn = self.buffer.create_tag("log_warn", foreground="#e5a50a", weight=Pango.Weight.SEMIBOLD)
@@ -166,14 +220,105 @@ class GameLogsView(Gtk.Box):
         self.tag_success = self.buffer.create_tag("log_success", foreground="#33d17a", weight=Pango.Weight.BOLD)
         self.tag_debug = self.buffer.create_tag("log_debug", foreground="#7f848e")
         self.tag_macoblox = self.buffer.create_tag("log_macoblox", foreground="#c061cb", weight=Pango.Weight.BOLD)
+        self.tag_match = self.buffer.create_tag("search_match", background="#2a5c9a", foreground="#ffffff")
+        self.tag_current = self.buffer.create_tag("search_current", background="#f6d32d", foreground="#000000")
         self._ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s,]*)(.*)$")
 
         self.scrolled.set_child(self.text_view)
         self.append(self.scrolled)
 
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_controller)
+
+    def _on_key_pressed(self, _controller, keyval, _keycode, state):
+        if (state & Gdk.ModifierType.CONTROL_MASK) and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.toggle_search()
+            return True
+        if keyval == Gdk.KEY_Escape and self.search_revealer.get_reveal_child():
+            self.close_search()
+            return True
+        return False
+
+    def toggle_search(self):
+        if self.search_revealer.get_reveal_child():
+            self.close_search()
+        else:
+            self.open_search()
+
+    def open_search(self):
+        self.search_revealer.set_reveal_child(True)
+        self.search_entry.grab_focus()
+        if self.search_entry.get_text():
+            self._on_search_changed(self.search_entry)
+
+    def close_search(self):
+        self.search_revealer.set_reveal_child(False)
+        self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.search_count_label.set_text("")
+        self.matches = []
+        self.current_match_idx = -1
+        self.text_view.grab_focus()
+
+    def _on_search_changed(self, entry):
+        query = entry.get_text().strip()
+        self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        if not query:
+            self.search_count_label.set_text("")
+            self.matches = []
+            self.current_match_idx = -1
+            return
+
+        matches = []
+        it = self.buffer.get_start_iter()
+        while True:
+            res = it.forward_search(query, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+            if not res:
+                break
+            s, e = res
+            self.buffer.apply_tag(self.tag_match, s, e)
+            matches.append(s.get_offset())
+            it = e
+
+        self.matches = matches
+        if matches:
+            self.current_match_idx = 0
+            self._highlight_current_match(query)
+        else:
+            self.current_match_idx = -1
+            self.search_count_label.set_text(_("No matches"))
+
+    def _highlight_current_match(self, query=None):
+        if not self.matches or self.current_match_idx < 0:
+            return
+        if query is None:
+            query = self.search_entry.get_text().strip()
+        self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        offset = self.matches[self.current_match_idx]
+        s = self.buffer.get_iter_at_offset(offset)
+        e = self.buffer.get_iter_at_offset(offset + len(query))
+        self.buffer.apply_tag(self.tag_current, s, e)
+        self.text_view.scroll_to_iter(s, 0.2, False, 0.0, 0.5)
+        self.search_count_label.set_text(f"{self.current_match_idx + 1} / {len(self.matches)}")
+
+    def _find_next(self):
+        if not self.matches:
+            return
+        self.current_match_idx = (self.current_match_idx + 1) % len(self.matches)
+        self._highlight_current_match()
+
+    def _find_prev(self):
+        if not self.matches:
+            return
+        self.current_match_idx = (self.current_match_idx - 1) % len(self.matches)
+        self._highlight_current_match()
+
     def _insert_highlighted_text(self, text: str):
         lines = text.splitlines()
         for line in lines:
+            self.line_count += 1
             ll = line.lower()
             if "[macoblox]" in ll:
                 tag = self.tag_macoblox
@@ -189,6 +334,10 @@ class GameLogsView(Gtk.Box):
                 tag = self.tag_debug
             else:
                 tag = None
+
+            end = self.buffer.get_end_iter()
+            # Gutter line number prefix
+            self.buffer.insert_with_tags(end, f"{self.line_count:5d} │ ", self.tag_ln)
 
             m = self._ts_re.match(line)
             end = self.buffer.get_end_iter()
@@ -209,7 +358,9 @@ class GameLogsView(Gtk.Box):
     def reset(self, log_path=None):
         self.current_log_path = log_path
         self.last_pos = 0
+        self.line_count = 0
         self.buffer.set_text("")
+        self.close_search()
         if log_path:
             self.status_label.set_text(log_path.name)
         else:
@@ -237,10 +388,10 @@ class GameLogsView(Gtk.Box):
                     text = chunk.decode("utf-8", errors="replace")
                     self._insert_highlighted_text(text)
 
-                    line_count = self.buffer.get_line_count()
                     if self.current_log_path:
-                        self.status_label.set_text(f"{self.current_log_path.name} ({line_count} l.)")
+                        self.status_label.set_text(f"{self.current_log_path.name} ({self.line_count} l.)")
 
+                    line_count = self.buffer.get_line_count()
                     if line_count > 5000:
                         start_iter = self.buffer.get_start_iter()
                         trim_iter = self.buffer.get_iter_at_line(line_count - 4000)
@@ -259,13 +410,16 @@ class GameLogsView(Gtk.Box):
             self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
 
     def _on_copy_clicked(self, _btn):
-        text = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
-        if text:
-            Gdk.Display.get_default().get_clipboard().set(text)
+        raw = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
+        clean = re.sub(r"^\s*\d+\s*│\s*", "", raw, flags=re.MULTILINE)
+        if clean:
+            Gdk.Display.get_default().get_clipboard().set(clean)
             _toast(self.window.toasts, _("Logs copied to clipboard"))
 
     def _on_clear_clicked(self, _btn):
         self.buffer.set_text("")
+        self.line_count = 0
+        self.close_search()
 
 
 class PlayPage(Adw.Bin):
