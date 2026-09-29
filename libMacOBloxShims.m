@@ -11,6 +11,7 @@ extern Method class_getInstanceMethod(Class cls, SEL name);
 extern Method class_getClassMethod(Class cls, SEL name);
 extern IMP method_getImplementation(Method m);
 extern IMP method_setImplementation(Method m, IMP imp);
+extern const char* method_getTypeEncoding(Method m);
 extern Class object_getClass(id obj);
 extern const char* object_getClassName(id obj);
 extern id objc_msgSend(id self, SEL op, ...);
@@ -1367,8 +1368,56 @@ void my_cxa_rethrow(void) {
 }
 DYLD_INTERPOSE(my_cxa_rethrow, __cxa_rethrow);
 
+static id macoblox_pending_uri(void);
+static int ascii_strings_equal(const char* left, const char* right);
+static volatile int macoblox_protocol_string_present;
+static volatile int macoblox_pending_uri_injection_logged;
+
+static int macoblox_has_protocol_string(int argc, const char *argv[]) {
+    if (!argv)
+        return 0;
+    for (int index = 0; index < argc; index++) {
+        if (argv[index] && ascii_strings_equal(argv[index], "-protocolString"))
+            return 1;
+    }
+    return 0;
+}
+
+static void macoblox_log_startup_argv(int argc, const char *argv[]) {
+    write_str("[MacOBlox Argv] argc=");
+    print_num(argc);
+    write_str("\n");
+    for (int index = 0; index < argc; index++) {
+        write_str("[MacOBlox Argv] argv[");
+        print_num(index);
+        write_str("]=");
+        write_str(argv && argv[index] ? argv[index] : "(null)");
+        write_str("\n");
+    }
+    macoblox_protocol_string_present = macoblox_has_protocol_string(argc, argv);
+    const char* pending = getenv("MACOBLOX_PENDING_URI");
+    write_str("[MacOBlox URL] Startup sources: -protocolString=");
+    print_num(macoblox_protocol_string_present != 0);
+    write_str(" MACOBLOX_PENDING_URI=");
+    print_num(pending && pending[0] ? 1 : 0);
+    write_str("\n");
+    if (macoblox_protocol_string_present && pending && pending[0])
+        write_str("[MacOBlox URL] Both protocolString and pending URI are present; protocolString wins\n");
+}
+
 int my_NSApplicationMain(int argc, const char *argv[]) {
     write_str("\n[MacOBlox Hook] NSApplicationMain entered!\n");
+    macoblox_log_startup_argv(argc, argv);
+    if (macoblox_protocol_string_present) {
+        write_str("[MacOBlox URL] Pending URI injection: disabled (native -protocolString present)\n");
+    } else {
+        write_str("[MacOBlox URL] Pending URI injection: enabled (no -protocolString)\n");
+        // Capture the process-bound copy before the launcher can clear its
+        // host-side pending file. The value remains opaque until it is turned
+        // into the Cocoa URL object at delivery time.
+        (void)macoblox_pending_uri();
+    }
+
     void* (*open_display)(const char*) = (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
     int (*close_display)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XCloseDisplay");
     if (open_display) {
@@ -1555,8 +1604,13 @@ static id hooked_concrete_initWithString(id self, SEL _cmd, id str) {
 
 // Swizzle NSApplication run
 static void (*orig_app_run)(id self, SEL _cmd) = 0;
+static void macoblox_queue_pending_uri(id app);
 static void hooked_app_run(id self, SEL _cmd) {
     write_str("\n[MacOBlox Hook] -[NSApplication run] entered!\n");
+    // If Darling does not call finishLaunching through the swizzled entry
+    // point, the main-queue turn below still runs after AppKit has started its
+    // event loop and the delegate has been installed.
+    macoblox_queue_pending_uri(self);
     orig_app_run(self, _cmd);
     write_str("\n[MacOBlox Hook] -[NSApplication run] returned!\n");
 }
@@ -1572,6 +1626,299 @@ static int ascii_strings_equal(const char* left, const char* right) {
 }
 
 static void (*orig_app_finish_launching)(id self, SEL cmd) = 0;
+
+// Browser protocol handoff -------------------------------------------------
+//
+// A direct executable launch has no LaunchServices/Apple Event envelope.  The
+// launcher therefore passes the original opaque browser value in
+// MACOBLOX_PENDING_URI and leaves the pending-uri file path available as a
+// fallback.  Once AppKit has finished launching, deliver it through the
+// delegate's normal Cocoa URL entry point.  No URI fields are inspected or
+// rebuilt here.
+extern MacOBloxFILE* fopen(const char*, const char*);
+extern unsigned long fread(void*, unsigned long, unsigned long, MacOBloxFILE*);
+extern int fclose(MacOBloxFILE*);
+extern void dispatch_async(void*, void (^)(void));
+extern unsigned long long dispatch_time(unsigned long long, long long);
+extern void dispatch_after(unsigned long long, void*, void (^)(void));
+extern struct dispatch_queue_s _dispatch_main_q;
+
+static id macoblox_captured_delegate;
+static volatile int macoblox_pending_uri_checked;
+static volatile int macoblox_pending_uri_delivered;
+static id macoblox_pending_uri_string;
+
+static unsigned long macoblox_fourcc(char a, char b, char c, char d) {
+    return ((unsigned long)(unsigned char)a << 24) |
+           ((unsigned long)(unsigned char)b << 16) |
+           ((unsigned long)(unsigned char)c << 8) |
+           (unsigned long)(unsigned char)d;
+}
+
+static id macoblox_ns_string_from_bytes(const char* bytes, unsigned long length) {
+    if (!bytes || !length)
+        return 0;
+    char* copy = (char*)malloc(length + 1);
+    if (!copy)
+        return 0;
+    for (unsigned long index = 0; index < length; index++)
+        copy[index] = bytes[index];
+    copy[length] = 0;
+    id string_class = (id)objc_getClass("NSString");
+    id value = string_class
+        ? ((id (*)(id, SEL, const char*))objc_msgSend)(
+              string_class, sel_registerName("stringWithUTF8String:"), copy)
+        : 0;
+    free(copy);
+    if (value)
+        value = ((id (*)(id, SEL))objc_msgSend)(value, sel_registerName("retain"));
+    return value;
+}
+
+static id macoblox_pending_uri(void) {
+    if (macoblox_pending_uri_checked)
+        return macoblox_pending_uri_string;
+    macoblox_pending_uri_checked = 1;
+
+    const char* value = getenv("MACOBLOX_PENDING_URI");
+    unsigned long length = value ? macoblox_cstr_length(value) : 0;
+    if (value && length)
+        macoblox_pending_uri_string = macoblox_ns_string_from_bytes(value, length);
+
+    // A launch without the command-line copy can still consume the pending
+    // file.  It is read through SystemRoot because Darling's /tmp and home are
+    // private while the launcher cache is on the host filesystem.
+    if (!macoblox_pending_uri_string) {
+        const char* path = getenv("MACOBLOX_PENDING_URI_FILE");
+        MacOBloxFILE* file = path && path[0] ? fopen(path, "rb") : 0;
+        if (file) {
+            unsigned long capacity = 64 * 1024;
+            char* bytes = (char*)malloc(capacity);
+            unsigned long count = bytes ? fread(bytes, 1, capacity, file) : 0;
+            fclose(file);
+            if (count)
+                macoblox_pending_uri_string = macoblox_ns_string_from_bytes(bytes, count);
+            free(bytes);
+        }
+    }
+
+    if (macoblox_pending_uri_string) {
+        write_str("[MacOBlox URL] Pending URI detected\n");
+    }
+    return macoblox_pending_uri_string;
+}
+
+static signed char macoblox_log_uri_selector(id delegate, const char* name) {
+    SEL selector = sel_registerName(name);
+    Class delegate_class = object_getClass(delegate);
+    Method method = delegate_class ? class_getInstanceMethod(delegate_class, selector) : 0;
+    signed char responds = ((signed char (*)(id, SEL, SEL))objc_msgSend)(
+        delegate, sel_registerName("respondsToSelector:"), selector);
+    write_str("[MacOBlox URL] Selector ");
+    write_str(name);
+    write_str(" responds=");
+    print_num(responds != 0);
+    write_str(" encoding=");
+    const char* encoding = method ? method_getTypeEncoding(method) : 0;
+    write_str(encoding ? encoding : "(unavailable)");
+    if (ascii_strings_equal(name, "application:openURLs:")) {
+        write_str(" expected=v32@0:8@16@24 matches=");
+        print_num(ascii_strings_equal(encoding, "v32@0:8@16@24"));
+    }
+    write_str("\n");
+    return responds;
+}
+
+static unsigned long macoblox_uri_delay_ms(void) {
+    const char* value = getenv("MACOBLOX_URI_DELAY_MS");
+    if (!value || !value[0])
+        return 0;
+    unsigned long delay = 0;
+    for (const char* digit = value; *digit; digit++) {
+        if (*digit < '0' || *digit > '9' || delay > 1000) {
+            write_str("[MacOBlox URL] Invalid delay; using 0 ms\n");
+            return 0;
+        }
+        delay = delay * 10 + (unsigned long)(*digit - '0');
+    }
+    if (delay > 10000) {
+        write_str("[MacOBlox URL] Delay exceeds 10000 ms; using 0 ms\n");
+        return 0;
+    }
+    return delay;
+}
+
+static id macoblox_make_url_event(id url_string) {
+    Class descriptor_class = objc_getClass("NSAppleEventDescriptor");
+    if (!descriptor_class)
+        return 0;
+    SEL descriptor_with_string = sel_registerName("descriptorWithString:");
+    SEL apple_event = sel_registerName(
+        "appleEventWithEventClass:eventID:targetDescriptor:returnID:transactionID:");
+    if (!class_getClassMethod(descriptor_class, descriptor_with_string) ||
+        !class_getClassMethod(descriptor_class, apple_event))
+        return 0;
+    id url_descriptor = ((id (*)(id, SEL, id))objc_msgSend)(
+        (id)descriptor_class, descriptor_with_string, url_string);
+    id event = ((id (*)(id, SEL, unsigned long, unsigned long, id, short, long))objc_msgSend)(
+        (id)descriptor_class, apple_event,
+        macoblox_fourcc('G', 'U', 'R', 'L'), // kInternetEventClass
+        macoblox_fourcc('G', 'U', 'R', 'L'), // kAEGetURL
+        0, -1, 0);                            // auto return ID, any transaction
+    SEL set_parameter = sel_registerName("setParamDescriptor:forKeyword:");
+    if (!event || !url_descriptor || !class_getInstanceMethod(descriptor_class, set_parameter))
+        return 0;
+    ((void (*)(id, SEL, id, unsigned long))objc_msgSend)(
+        event, set_parameter, url_descriptor, macoblox_fourcc('-', '-', '-', '-'));
+    return event;
+}
+
+static void macoblox_deliver_pending_uri(id app) {
+    if (macoblox_protocol_string_present) {
+        if (!macoblox_pending_uri_injection_logged) {
+            macoblox_pending_uri_injection_logged = 1;
+            write_str("[MacOBlox URL] Pending URI injection skipped; -protocolString already supplied the URI\n");
+        }
+        return;
+    }
+    if (macoblox_pending_uri_delivered)
+        return;
+    id value = macoblox_pending_uri();
+    if (!value)
+        return;
+    id delegate = macoblox_captured_delegate;
+    if (!delegate && app)
+        delegate = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("delegate"));
+    if (!delegate) {
+        write_str("[MacOBlox URL] Delegate not available yet\n");
+        return;
+    }
+    macoblox_captured_delegate = delegate;
+    write_str("[MacOBlox URL] Delegate: ");
+    write_str(object_getClassName(delegate));
+    write_str("\n");
+
+    const char* open_urls_name = "application:openURLs:";
+    const char* open_file_name = "application:openFile:";
+    const char* handle_get_url_name = "application:handleGetURLEvent:withReplyEvent:";
+    signed char has_open_urls = macoblox_log_uri_selector(delegate, open_urls_name);
+    signed char has_open_file = macoblox_log_uri_selector(delegate, open_file_name);
+    signed char has_get_url = macoblox_log_uri_selector(delegate, handle_get_url_name);
+    id url = ((id (*)(id, SEL, id))objc_msgSend)(
+        (id)objc_getClass("NSURL"), sel_registerName("URLWithString:"), value);
+    if (!url) {
+        write_str("[MacOBlox URL] NSURL rejected the pending URI; trying legacy handlers\n");
+    } else {
+        id absolute = ((id (*)(id, SEL))objc_msgSend)(url, sel_registerName("absoluteString"));
+        signed char unchanged = absolute && ((signed char (*)(id, SEL, id))objc_msgSend)(
+            absolute, sel_registerName("isEqualToString:"), value);
+        write_str("[MacOBlox URL] NSURL absoluteString matches pending=");
+        print_num(unchanged != 0);
+        write_str("\n");
+    }
+
+    const char* order = getenv("MACOBLOX_URI_SELECTOR_ORDER");
+    int apple_first = ascii_strings_equal(order, "B");
+    write_str(apple_first ? "[MacOBlox URL] Selector order=B\n" :
+                            "[MacOBlox URL] Selector order=A\n");
+    for (int choice = 0; choice < 3; choice++) {
+        int kind = apple_first ? (choice == 0 ? 2 : choice == 1 ? 0 : 1) : choice;
+        if (kind == 0 && url && has_open_urls) {
+        SEL open_urls = sel_registerName(open_urls_name);
+        id urls = ((id (*)(id, SEL, const id*, unsigned long))objc_msgSend)(
+            (id)objc_getClass("NSArray"), sel_registerName("arrayWithObjects:count:"), &url, 1);
+        if (!urls) {
+            write_str("[MacOBlox URL] Delivered failed\n");
+            return;
+        }
+        write_str("[MacOBlox URL] Using: application:openURLs:\n");
+        write_str("[MacOBlox URL] Before application:openURLs:\n");
+        @try {
+            // -[RobloxPlayerAppDelegate application:openURLs:] is void with
+            // NSApplication* and NSArray<NSURL*>* object arguments.
+            ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, open_urls, app, urls);
+            write_str("[MacOBlox URL] After application:openURLs:\n");
+            macoblox_pending_uri_delivered = 1;
+            write_str("[MacOBlox URL] Delivered successfully\n");
+        } @catch (id exception) {
+            (void)exception;
+            write_str("[MacOBlox URL] Delivered failed\n");
+        }
+        return;
+        }
+
+        if (kind == 1 && has_open_file) {
+        SEL open_file = sel_registerName(open_file_name);
+        write_str("[MacOBlox URL] Using: application:openFile:\n");
+        signed char accepted = 0;
+        write_str("[MacOBlox URL] Before application:openFile:\n");
+        @try {
+            accepted = ((signed char (*)(id, SEL, id, id))objc_msgSend)(delegate, open_file, app, value);
+            write_str("[MacOBlox URL] After application:openFile: accepted=");
+            print_num(accepted != 0);
+            write_str("\n");
+        } @catch (id exception) {
+            (void)exception;
+            write_str("[MacOBlox URL] Delivered failed\n");
+            return;
+        }
+        if (accepted) {
+            macoblox_pending_uri_delivered = 1;
+            write_str("[MacOBlox URL] Delivered successfully\n");
+        } else {
+            write_str("[MacOBlox URL] Delivered failed\n");
+        }
+        return;
+        }
+
+        if (kind == 2 && has_get_url) {
+        SEL handle_get_url = sel_registerName(handle_get_url_name);
+        write_str("[MacOBlox URL] Using: application:handleGetURLEvent:withReplyEvent:\n");
+        id event = macoblox_make_url_event(value);
+        if (!event) {
+            write_str("[MacOBlox URL] Delivered failed\n");
+            return;
+        }
+        write_str("[MacOBlox URL] Before application:handleGetURLEvent:withReplyEvent:\n");
+        @try {
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(delegate, handle_get_url, app, event, 0);
+            write_str("[MacOBlox URL] After application:handleGetURLEvent:withReplyEvent:\n");
+            macoblox_pending_uri_delivered = 1;
+            write_str("[MacOBlox URL] Delivered successfully\n");
+        } @catch (id exception) {
+            (void)exception;
+            write_str("[MacOBlox URL] Delivered failed\n");
+        }
+        return;
+        }
+    }
+
+    write_str("[MacOBlox URL] Delivered failed\n");
+}
+
+static void macoblox_queue_pending_uri(id app) {
+    if (macoblox_protocol_string_present) {
+        if (!macoblox_pending_uri_injection_logged) {
+            macoblox_pending_uri_injection_logged = 1;
+            write_str("[MacOBlox URL] Pending URI injection skipped; -protocolString already supplied the URI\n");
+        }
+        return;
+    }
+    if (!macoblox_pending_uri())
+        return;
+    write_str("[MacOBlox URL] Pending URI injection running\n");
+    unsigned long delay_ms = macoblox_uri_delay_ms();
+    write_str("[MacOBlox URL] Queued delivery after ");
+    print_num(delay_ms);
+    write_str(" ms\n");
+    if (delay_ms) {
+        dispatch_after(dispatch_time(0, (long long)delay_ms * 1000000LL),
+                       &_dispatch_main_q, ^{ macoblox_deliver_pending_uri(app); });
+    } else {
+        dispatch_async(&_dispatch_main_q, ^{ macoblox_deliver_pending_uri(app); });
+    }
+}
+
 // Window icon: MACOBLOX_ICON_ARGB names a file of 32-bit little-endian words
 // in _NET_WM_ICON layout (width, height, ARGB pixels, repeated per size),
 // written by the launcher. It is set on the Roblox X window from a separate
@@ -1687,6 +2034,8 @@ static void hooked_app_finish_launching(id self, SEL cmd) {
     macoblox_install_late_hooks();
     macoblox_start_xfixes_worker(); // ready before the first mouse lock
     orig_app_finish_launching(self, cmd);
+    write_str("[MacOBlox Hook] -[NSApplication finishLaunching] returned\n");
+    macoblox_queue_pending_uri(self);
 
     id windows = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("windows"));
     unsigned long count = windows
@@ -1723,6 +2072,7 @@ static void hooked_app_setDelegate(id self, SEL _cmd, id del) {
     write_str(del ? object_getClassName(del) : "(nil)");
     write_str("\n");
     orig_app_setDelegate(self, _cmd, del);
+    macoblox_captured_delegate = del;
 }
 
 // Swizzle NSBundle loadNibNamed:owner:

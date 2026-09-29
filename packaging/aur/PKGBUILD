@@ -36,6 +36,7 @@ package() {
       "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/macoblox.png"
   done
   install -Dm644 packaging/wtf.aubree.MacOBlox.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 packaging/wtf.aubree.MacOBlox.URI.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 packaging/macoblox-roblox-window.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 packaging/wtf.aubree.MacOBlox.Studio.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 packaging/wtf.aubree.MacOBlox.xml -t "$pkgdir/usr/share/mime/packages"

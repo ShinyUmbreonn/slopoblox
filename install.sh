@@ -180,7 +180,8 @@ do_uninstall() {
   say "Removing the app menu entries, icons and the macoblox command"
   local apps=$DATA_HOME/applications
   # The xyz.narez.* names are the app ID before 0.15.
-  rm -f -- "$apps/wtf.aubree.MacOBlox.desktop" "$apps/wtf.aubree.MacOBlox.Studio.desktop" \
+  rm -f -- "$apps/wtf.aubree.MacOBlox.desktop" "$apps/wtf.aubree.MacOBlox.URI.desktop" \
+    "$apps/wtf.aubree.MacOBlox.Studio.desktop" \
     "$apps/xyz.narez.MacOBlox.desktop" "$apps/xyz.narez.MacOBlox.Studio.desktop" \
     "$apps/macoblox-roblox-window.desktop" "$apps/org.macoblox.Launcher.desktop" \
     "$DATA_HOME"/icons/hicolor/*/apps/macoblox.png "$DATA_HOME/mime/packages/wtf.aubree.MacOBlox.xml" \
@@ -192,6 +193,7 @@ do_uninstall() {
   # Studio as the handler of roblox-studio: links and place files.
   if [[ -f $CONFIG_HOME/mimeapps.list ]]; then
     sed -i -e 's/wtf\.aubree\.MacOBlox\.Studio\.desktop;\{0,1\}//g' \
+      -e 's/wtf\.aubree\.MacOBlox\.URI\.desktop;\{0,1\}//g' \
       -e 's/xyz\.narez\.MacOBlox\.Studio\.desktop;\{0,1\}//g' -e '/^[^=[]*=$/d' "$CONFIG_HOME/mimeapps.list"
   fi
   update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true

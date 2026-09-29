@@ -40,6 +40,21 @@ Keywords=roblox;darling;
 StartupNotify=true
 DESKTOP
 
+# Roblox links are LaunchServices protocol handoffs on macOS.  Keep a
+# separate hidden entry for Linux so the complete URI is substituted into one
+# launcher argument and can reach RobloxPlayer unchanged.
+cat > "$data_home/applications/wtf.aubree.MacOBlox.URI.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Mac O’ Blox Roblox Link Handler
+Comment=Open Roblox links in Mac O’ Blox
+Exec=$exec_path %u
+Icon=macoblox
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/roblox;x-scheme-handler/roblox-player;
+DESKTOP
+
 # Roblox Studio (Windows version through Wine), also the handler of the
 # roblox-studio: links and of roblox-studio-auth: that signs Studio in.
 cat > "$data_home/applications/wtf.aubree.MacOBlox.Studio.desktop" <<DESKTOP
@@ -62,6 +77,9 @@ update-mime-database "$data_home/mime" 2>/dev/null || true
 if command -v xdg-mime >/dev/null; then
   for type in x-scheme-handler/roblox-studio x-scheme-handler/roblox-studio-auth application/x-roblox-place; do
     xdg-mime default wtf.aubree.MacOBlox.Studio.desktop "$type"
+  done
+  for type in x-scheme-handler/roblox x-scheme-handler/roblox-player; do
+    xdg-mime default wtf.aubree.MacOBlox.URI.desktop "$type"
   done
 fi
 
