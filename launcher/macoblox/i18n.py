@@ -294,6 +294,16 @@ RU = {
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
+    # Live logs view
+    "Logs": "Логи",
+    "Game Logs": "Логи игры",
+    "Auto-scroll": "Автопрокрутка",
+    "Copy logs": "Скопировать логи",
+    "Logs copied to clipboard": "Логи скопированы в буфер обмена",
+    "Clear view": "Очистить экран",
+    "Open log file": "Открыть файл лога",
+    "Game is not running": "Игра не запущена",
+    "View game logs": "Просмотр логов игры",
     # Info
     "Mac O’ Blox runs the real Roblox client for macOS on Linux through Darling. "
     "It is not made by Roblox and is not affiliated with it.":

@@ -90,11 +90,145 @@ def _error_dialog(window, heading, details):
     dialog.present(window)
 
 
+class GameLogsView(Gtk.Box):
+    """Live streaming log viewer for Roblox Player during the active game."""
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.window = window
+        self.last_pos = 0
+        self.current_log_path = None
+        self.auto_scroll = True
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_margin_start(16)
+        bar.set_margin_end(16)
+        bar.set_margin_top(8)
+
+        self.title_label = Gtk.Label(label=_("Game Logs"), css_classes=["heading"])
+        bar.append(self.title_label)
+
+        self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=8)
+        bar.append(self.status_label)
+
+        spacer = Gtk.Box(hexpand=True)
+        bar.append(spacer)
+
+        self.scroll_btn = Gtk.ToggleButton(icon_name="go-bottom-symbolic")
+        self.scroll_btn.add_css_class("flat")
+        self.scroll_btn.set_tooltip_text(_("Auto-scroll"))
+        self.scroll_btn.set_active(True)
+        self.scroll_btn.connect("toggled", self._on_scroll_toggled)
+        bar.append(self.scroll_btn)
+
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic")
+        copy_btn.add_css_class("flat")
+        copy_btn.set_tooltip_text(_("Copy logs"))
+        copy_btn.connect("clicked", self._on_copy_clicked)
+        bar.append(copy_btn)
+
+        open_btn = Gtk.Button(icon_name="document-open-symbolic")
+        open_btn.add_css_class("flat")
+        open_btn.set_tooltip_text(_("Open log file"))
+        open_btn.connect("clicked", lambda *_args: window.open_last_log())
+        bar.append(open_btn)
+
+        clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
+        clear_btn.add_css_class("flat")
+        clear_btn.set_tooltip_text(_("Clear view"))
+        clear_btn.connect("clicked", self._on_clear_clicked)
+        bar.append(clear_btn)
+
+        self.append(bar)
+
+        self.scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        self.scrolled.set_margin_start(16)
+        self.scrolled.set_margin_end(16)
+        self.scrolled.set_margin_bottom(12)
+        self.scrolled.add_css_class("card")
+
+        self.text_view = Gtk.TextView()
+        self.text_view.set_monospace(True)
+        self.text_view.set_editable(False)
+        self.text_view.set_cursor_visible(False)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.text_view.set_left_margin(12)
+        self.text_view.set_right_margin(12)
+        self.text_view.set_top_margin(12)
+        self.text_view.set_bottom_margin(12)
+        self.buffer = self.text_view.get_buffer()
+
+        self.scrolled.set_child(self.text_view)
+        self.append(self.scrolled)
+
+    def reset(self, log_path=None):
+        self.current_log_path = log_path
+        self.last_pos = 0
+        self.buffer.set_text("")
+        if log_path:
+            self.status_label.set_text(log_path.name)
+        else:
+            self.status_label.set_text("")
+
+    def update(self):
+        log_path = None
+        if self.window.session and self.window.session.log_path:
+            log_path = self.window.session.log_path
+        elif self.window.last_log:
+            log_path = self.window.last_log
+
+        if not log_path or not log_path.exists():
+            return
+
+        if self.current_log_path != log_path:
+            self.reset(log_path)
+
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(self.last_pos)
+                chunk = f.read()
+                if chunk:
+                    self.last_pos = f.tell()
+                    text = chunk.decode("utf-8", errors="replace")
+                    end_iter = self.buffer.get_end_iter()
+                    self.buffer.insert(end_iter, text)
+
+                    line_count = self.buffer.get_line_count()
+                    if line_count > 5000:
+                        start_iter = self.buffer.get_start_iter()
+                        trim_iter = self.buffer.get_iter_at_line(line_count - 4000)
+                        self.buffer.delete(start_iter, trim_iter)
+
+                    if self.auto_scroll:
+                        end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
+                        self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+        except Exception:
+            pass
+
+    def _on_scroll_toggled(self, btn):
+        self.auto_scroll = btn.get_active()
+        if self.auto_scroll:
+            end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
+            self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+
+    def _on_copy_clicked(self, _btn):
+        text = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
+        if text:
+            Gdk.Display.get_default().get_clipboard().set(text)
+            _toast(self.window.toasts, _("Logs copied to clipboard"))
+
+    def _on_clear_clicked(self, _btn):
+        self.buffer.set_text("")
+
+
 class PlayPage(Adw.Bin):
     def __init__(self, window):
         super().__init__()
         self.window = window
         toolbar_view = Adw.ToolbarView()
+
+        self.stack = Adw.ViewStack()
+        self.stack.connect("notify::visible-child-name", self._on_tab_changed)
 
         status = Adw.StatusPage()
         status.set_icon_name("macoblox")
@@ -120,7 +254,21 @@ class PlayPage(Adw.Bin):
         center_box.append(links)
 
         status.set_child(center_box)
-        toolbar_view.set_content(status)
+        self.stack.add_titled_with_icon(status, "play", _("Play"), "media-playback-start-symbolic")
+
+        self.logs_view = GameLogsView(window)
+        self.stack.add_titled_with_icon(self.logs_view, "logs", _("Logs"), "utilities-terminal-symbolic")
+
+        self.top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.top_box.set_margin_top(10)
+        self.top_box.set_margin_bottom(10)
+        self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.switcher.set_halign(Gtk.Align.CENTER)
+        self.top_box.append(self.switcher)
+        self.top_box.set_visible(False)
+
+        toolbar_view.add_top_bar(self.top_box)
+        toolbar_view.set_content(self.stack)
 
         action_bar = Gtk.ActionBar()
 
@@ -157,6 +305,10 @@ class PlayPage(Adw.Bin):
         self.set_child(toolbar_view)
         self.refresh()
 
+    def _on_tab_changed(self, stack, _pspec):
+        if stack.get_visible_child_name() == "logs":
+            self.logs_view.update()
+
     def _on_play_clicked(self):
         if self.window.session is not None:
             self.window.stop()
@@ -173,6 +325,26 @@ class PlayPage(Adw.Bin):
     def refresh(self):
         running = self.window.session is not None
         busy = self.window.busy
+        active = running or busy == "starting"
+
+        # Show switcher only when game is running or starting
+        self.top_box.set_visible(active)
+
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(active)
+                if not active:
+                    child.set_tooltip_text(_("Game is not running"))
+                else:
+                    child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+
+        if not active and self.stack.get_visible_child_name() == "logs":
+            self.stack.set_visible_child_name("play")
+
         version = core.installed_version()
         parts = [_("Roblox {version}", version=version) if version else _("Roblox not found")]
         parts.append(_("Darling running") if core.darlingserver_running()
@@ -1803,6 +1975,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.game_started_at = time.time()
         self.last_playtime_save = time.time()
         self.current_game_info = None
+        if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+            self.play_page.logs_view.reset(session.log_path)
+            self.play_page.logs_view.update()
         self.play_page.refresh()
         if self.settings.get("discord_rpc", True):
             self._start_rpc()
@@ -1833,6 +2008,9 @@ class LauncherWindow(Adw.ApplicationWindow):
             # Active game: track playtime
             self.settings["playtime_seconds"] = self.settings.get("playtime_seconds", 0) + 1
             self.play_page.refresh_playtime()
+            if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+                if self.play_page.stack.get_visible_child_name() == "logs":
+                    self.play_page.logs_view.update()
             if time.time() - getattr(self, "last_playtime_save", 0) > 15:
                 self.last_playtime_save = time.time()
                 core.save_settings(self.settings)
