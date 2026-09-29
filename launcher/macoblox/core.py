@@ -647,18 +647,18 @@ def signed_in():
 
 
 def exit_reason(log_path):
-    """A known cause for a game that quit, from its log, or None.
-    "captcha": Roblox tried to show its web view (captcha on sign-up or
-    password sign-in), which Darling does not have."""
+    """A known cause for a game that quit, from its log, or None."""
     try:
         with open(log_path, "rb") as file:
             file.seek(0, os.SEEK_END)
-            file.seek(max(0, file.tell() - 16384))
+            file.seek(max(0, file.tell() - 32768))
             tail = file.read().decode(errors="replace")
     except (OSError, TypeError):
         return None
     if "class WKWebView" in tail or "Selector setDetachesHiddenViews:" in tail:
         return "captcha"
+    if "X connection to " in tail and "broken (explicit kill or server shutdown)" in tail:
+        return "x11_broken"
     return None
 
 
@@ -1013,14 +1013,26 @@ exec ./RobloxPlayer
 
 
 def host_vram_bytes():
-    """Largest dedicated VRAM among the host GPUs (amdgpu exposes it in sysfs)."""
+    """Largest dedicated VRAM among the host GPUs (amdgpu sysfs, nvidia-smi)."""
     best = 0
     for path in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
         try:
             best = max(best, int(path.read_text().strip()))
         except (OSError, ValueError):
             pass
-    return best
+    if best:
+        return best
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, text=True, timeout=1
+        )
+        for line in out.strip().splitlines():
+            mb = int(line.strip())
+            best = max(best, mb * 1024 * 1024)
+    except Exception:
+        pass
+    return best if best else 8 * 1024 * 1024 * 1024
 
 
 class HostAudio:

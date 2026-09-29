@@ -294,6 +294,38 @@ RU = {
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
+    # Live logs view
+    "Logs": "Логи",
+    "Game Logs": "Логи игры",
+    "Auto-scroll": "Автопрокрутка",
+    "Copy logs": "Скопировать логи",
+    "Logs copied to clipboard": "Логи скопированы в буфер обмена",
+    "Clear view": "Очистить экран",
+    "Open log file": "Открыть файл лога",
+    "Open in editor": "Открыть в редакторе",
+    "Open in text editor": "Открыть в текстовом редакторе",
+    "Search in logs (Ctrl+F)…": "Поиск по логам (Ctrl+F)…",
+    "Search in logs (Ctrl+F)": "Поиск по логам (Ctrl+F)",
+    "Previous match": "Предыдущее совпадение",
+    "Next match": "Следующее совпадение",
+    "Close search": "Закрыть поиск",
+    "No matches": "Нет совпадений",
+    "No log found": "Файл лога не найден",
+    "Could not open the log: {error}": "Не удалось открыть лог: {error}",
+    "Game is not running": "Игра не запущена",
+    "View game logs": "Просмотр логов игры",
+    # Crash / X11 handling
+    "X11 Connection Lost": "Потеряно соединение с X11",
+    "The game crashed because the X11 connection was broken. This usually happens when raw mouse input overloads the display server with events. Would you like to disable raw mouse input?":
+        "Игра аварийно закрылась из-за разрыва соединения с X11. Обычно это происходит, когда сырой ввод мыши (XInput 2) перегружает сервер Xwayland событиями движения. Отключить сырой ввод мыши?",
+    "Keep Enabled": "Оставить включённым",
+    "Disable Raw Mouse": "Отключить сырой ввод",
+    "Raw mouse input disabled": "Сырой ввод мыши отключён",
+    "The game crashed because the X11 connection was broken (explicit kill or server shutdown).":
+        "Игра аварийно закрылась из-за разрыва соединения с X11 (сервер X11 был принудительно остановлен).",
+    # Fast flags
+    "Anisotropic filtering (16x)": "Анизотропная фильтрация (16x)",
+    "Force maximum texture resolution": "Принудительное максимальное разрешение текстур",
     # Info
     "Mac O’ Blox runs the real Roblox client for macOS on Linux through Darling. "
     "It is not made by Roblox and is not affiliated with it.":
