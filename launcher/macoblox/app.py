@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -9,7 +10,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from . import __version__, author, core, discord, dns, i18n, mods, studio  # noqa: E402
@@ -127,10 +128,10 @@ class GameLogsView(Gtk.Box):
         copy_btn.connect("clicked", self._on_copy_clicked)
         bar.append(copy_btn)
 
-        open_btn = Gtk.Button(icon_name="document-open-symbolic")
+        open_btn = Gtk.Button(label=_("Open in editor"), icon_name="document-open-symbolic")
         open_btn.add_css_class("flat")
-        open_btn.set_tooltip_text(_("Open log file"))
-        open_btn.connect("clicked", lambda *_args: window.open_last_log())
+        open_btn.set_tooltip_text(_("Open in text editor"))
+        open_btn.connect("clicked", lambda *_args: window.open_external_log(self.current_log_path))
         bar.append(open_btn)
 
         clear_btn = Gtk.Button(icon_name="edit-clear-symbolic")
@@ -158,8 +159,52 @@ class GameLogsView(Gtk.Box):
         self.text_view.set_bottom_margin(12)
         self.buffer = self.text_view.get_buffer()
 
+        self.tag_time = self.buffer.create_tag("log_time", foreground="#77767b")
+        self.tag_err = self.buffer.create_tag("log_err", foreground="#ed333b", weight=Pango.Weight.BOLD)
+        self.tag_warn = self.buffer.create_tag("log_warn", foreground="#e5a50a", weight=Pango.Weight.SEMIBOLD)
+        self.tag_info = self.buffer.create_tag("log_info", foreground="#3584e4")
+        self.tag_success = self.buffer.create_tag("log_success", foreground="#33d17a", weight=Pango.Weight.BOLD)
+        self.tag_debug = self.buffer.create_tag("log_debug", foreground="#7f848e")
+        self.tag_macoblox = self.buffer.create_tag("log_macoblox", foreground="#c061cb", weight=Pango.Weight.BOLD)
+        self._ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s,]*)(.*)$")
+
         self.scrolled.set_child(self.text_view)
         self.append(self.scrolled)
+
+    def _insert_highlighted_text(self, text: str):
+        lines = text.splitlines()
+        for line in lines:
+            ll = line.lower()
+            if "[macoblox]" in ll:
+                tag = self.tag_macoblox
+            elif any(k in ll for k in ("error", "crash", "fatal", "sigsegv", "exception", "abort")):
+                tag = self.tag_err
+            elif any(k in ll for k in ("warning", "warn")):
+                tag = self.tag_warn
+            elif any(k in ll for k in ("! joining game", "game join succeeded", "entered play session")):
+                tag = self.tag_success
+            elif "info" in ll:
+                tag = self.tag_info
+            elif any(k in ll for k in ("debug", "flog", "dflog")):
+                tag = self.tag_debug
+            else:
+                tag = None
+
+            m = self._ts_re.match(line)
+            end = self.buffer.get_end_iter()
+            if m:
+                self.buffer.insert_with_tags(end, m.group(1), self.tag_time)
+                end = self.buffer.get_end_iter()
+                rest = m.group(2) + "\n"
+                if tag:
+                    self.buffer.insert_with_tags(end, rest, tag)
+                else:
+                    self.buffer.insert(end, rest)
+            else:
+                if tag:
+                    self.buffer.insert_with_tags(end, line + "\n", tag)
+                else:
+                    self.buffer.insert(end, line + "\n")
 
     def reset(self, log_path=None):
         self.current_log_path = log_path
@@ -190,10 +235,12 @@ class GameLogsView(Gtk.Box):
                 if chunk:
                     self.last_pos = f.tell()
                     text = chunk.decode("utf-8", errors="replace")
-                    end_iter = self.buffer.get_end_iter()
-                    self.buffer.insert(end_iter, text)
+                    self._insert_highlighted_text(text)
 
                     line_count = self.buffer.get_line_count()
+                    if self.current_log_path:
+                        self.status_label.set_text(f"{self.current_log_path.name} ({line_count} l.)")
+
                     if line_count > 5000:
                         start_iter = self.buffer.get_start_iter()
                         trim_iter = self.buffer.get_iter_at_line(line_count - 4000)
@@ -228,7 +275,7 @@ class PlayPage(Adw.Bin):
         toolbar_view = Adw.ToolbarView()
 
         self.stack = Adw.ViewStack()
-        self.stack.connect("notify::visible-child-name", self._on_tab_changed)
+        self.top_box = None
 
         status = Adw.StatusPage()
         status.set_icon_name("macoblox")
@@ -269,6 +316,7 @@ class PlayPage(Adw.Bin):
 
         toolbar_view.add_top_bar(self.top_box)
         toolbar_view.set_content(self.stack)
+        self.stack.connect("notify::visible-child-name", self._on_tab_changed)
 
         action_bar = Gtk.ActionBar()
 
@@ -306,8 +354,36 @@ class PlayPage(Adw.Bin):
         self.refresh()
 
     def _on_tab_changed(self, stack, _pspec):
-        if stack.get_visible_child_name() == "logs":
+        if getattr(self, "top_box", None) is None:
+            return
+        tab = stack.get_visible_child_name()
+        if tab == "logs":
             self.logs_view.update()
+        elif tab == "play":
+            running = self.window.session is not None
+            busy = self.window.busy
+            active = running or busy == "starting"
+            if not active:
+                self.top_box.set_visible(False)
+
+    def show_logs(self, log_path=None):
+        if not log_path:
+            log_path = (self.window.session.log_path if self.window.session else None) or self.window.last_log
+        if not log_path or not log_path.exists():
+            _toast(self.window.toasts, _("No log found"))
+            return
+        self.top_box.set_visible(True)
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(True)
+                child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+        self.logs_view.reset(log_path)
+        self.logs_view.update()
+        self.stack.set_visible_child_name("logs")
 
     def _on_play_clicked(self):
         if self.window.session is not None:
@@ -326,23 +402,24 @@ class PlayPage(Adw.Bin):
         running = self.window.session is not None
         busy = self.window.busy
         active = running or busy == "starting"
+        viewing_logs = self.stack.get_visible_child_name() == "logs"
 
-        # Show switcher only when game is running or starting
-        self.top_box.set_visible(active)
+        # Show switcher when game is active or currently viewing logs
+        self.top_box.set_visible(active or viewing_logs)
 
         child = self.switcher.get_first_child()
         idx = 0
         while child:
             if idx == 1:
-                child.set_sensitive(active)
-                if not active:
+                child.set_sensitive(active or bool(self.window.last_log))
+                if not active and not self.window.last_log:
                     child.set_tooltip_text(_("Game is not running"))
                 else:
                     child.set_tooltip_text(_("View game logs"))
             child = child.get_next_sibling()
             idx += 1
 
-        if not active and self.stack.get_visible_child_name() == "logs":
+        if not active and not self.window.last_log and viewing_logs:
             self.stack.set_visible_child_name("play")
 
         version = core.installed_version()
@@ -369,7 +446,7 @@ class PlayPage(Adw.Bin):
             self.play.add_css_class("suggested-action")
             self.play.set_sensitive(not busy)
 
-        self.log_button.set_visible(self.window.last_log is not None and not running)
+        self.log_button.set_visible(bool(self.window.last_log) and not running)
         self.refresh_playtime()
 
 
@@ -1608,7 +1685,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         # restarting Darling or signing out. They share the client and Darling.
         self.busy = None
         self.quit_when_idle = False  # the window was closed during an operation
-        self.last_log = None
+        self.last_log = self._find_last_log()
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
         threading.Thread(target=self._check_startup_update, daemon=True).start()
@@ -2042,12 +2119,30 @@ class LauncherWindow(Adw.ApplicationWindow):
     def stop(self):
         threading.Thread(target=core.stop_roblox, daemon=True).start()
 
+    def _find_last_log(self):
+        if not core.LOGS.exists():
+            return None
+        logs = sorted(core.LOGS.glob("launch-*.log"), key=lambda p: p.stat().st_mtime)
+        return logs[-1] if logs else None
+
     def open_last_log(self):
-        if self.last_log:
-            try:
-                Gio.AppInfo.launch_default_for_uri(self.last_log.as_uri(), None)
-            except GLib.Error as error:
-                _toast(self.toasts, str(error))
+        log_path = (self.session.log_path if self.session else None) or self.last_log or self._find_last_log()
+        if log_path:
+            self.last_log = log_path
+            if hasattr(self, "play_page") and hasattr(self.play_page, "show_logs"):
+                self.play_page.show_logs(log_path)
+                return
+        self.open_external_log(log_path)
+
+    def open_external_log(self, log_path=None):
+        path = log_path or (self.session.log_path if self.session else None) or self.last_log or self._find_last_log()
+        if not path or not path.exists():
+            _toast(self.toasts, _("No log found"))
+            return
+        try:
+            Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+        except (GLib.Error, OSError) as error:
+            _toast(self.toasts, _("Could not open the log: {error}", error=error))
 
 
 class LauncherApp(Adw.Application):

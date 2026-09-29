@@ -302,6 +302,10 @@ RU = {
     "Logs copied to clipboard": "Логи скопированы в буфер обмена",
     "Clear view": "Очистить экран",
     "Open log file": "Открыть файл лога",
+    "Open in editor": "Открыть в редакторе",
+    "Open in text editor": "Открыть в текстовом редакторе",
+    "No log found": "Файл лога не найден",
+    "Could not open the log: {error}": "Не удалось открыть лог: {error}",
     "Game is not running": "Игра не запущена",
     "View game logs": "Просмотр логов игры",
     # Info
