@@ -13,7 +13,10 @@ RenderJob::setStartupThrottle, so the slow frequency is never applied:
 
     mov ebx, esi   ->   xor ebx, ebx
 
-Usage: patch_startup_throttle.py [--undo] [path/to/RobloxPlayer]
+Usage: patch_startup_throttle.py [--check | --undo] [path/to/RobloxPlayer]
+
+--check prints exactly one word: "patched", "original" or "not found".
+--undo restores the original bytes; without flags the patch is applied.
 
 The site is located by pattern on every run, so a client update just needs
 the same code shape; when the shape is not found the patch is skipped. Two
@@ -26,7 +29,11 @@ import re
 import sys
 from pathlib import Path
 
-BUNDLE = Path(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else (
+_ARGS = sys.argv[1:]
+UNDO = "--undo" in _ARGS
+CHECK = "--check" in _ARGS
+_path = next((a for a in _ARGS if not a.startswith("-")), None)
+BUNDLE = Path(_path) if _path else (
     Path(__file__).parent / "RobloxPlayer.app" / "Contents" / "MacOS" / "RobloxPlayer")
 if BUNDLE.is_dir():  # the .app bundle was given instead of its binary
     BUNDLE = BUNDLE / "Contents" / "MacOS" / "RobloxPlayer"
@@ -65,29 +72,34 @@ def find_site(data: bytes, moves: re.Pattern):
 
 
 def main() -> int:
-    undo = "--undo" in sys.argv
     if not BUNDLE.exists():
-        print(f"no client at {BUNDLE}, nothing to patch")
+        print("no client")
         return 0
-    data = bytearray(BUNDLE.read_bytes())
-    if undo:
-        offset = find_site(bytes(data), PATCHED)
+    data = bytes(BUNDLE.read_bytes())
+    if CHECK:
+        if find_site(data, PATCHED) is not None:
+            print("patched")
+        elif find_site(data, ARG_MOVES) is not None:
+            print("original")
+        else:
+            print("not found")
+        return 0
+    if UNDO:
+        offset = find_site(data, PATCHED)
         if offset is None:
             print("throttle patch not found, the client is already original")
             return 0
-        data[offset:offset + 2] = b"\x89\xf3"  # xor ebx, ebx -> mov ebx, esi
-        BUNDLE.write_bytes(bytes(data))
+        BUNDLE.write_bytes(data[:offset] + b"\x89\xf3" + data[offset + 2:])
         print(f"startup render throttle restored (original bytes at 0x{offset:x})")
         return 0
-    offset = find_site(bytes(data), ARG_MOVES)
+    offset = find_site(data, ARG_MOVES)
     if offset is None:
-        if find_site(bytes(data), PATCHED) is not None:
+        if find_site(data, PATCHED) is not None:
             print("startup render throttle already disabled")
             return 0
         print("startup throttle pattern not found in this client, skipping")
-        return 0
-    data[offset:offset + 2] = b"\x31\xdb"  # mov ebx, esi -> xor ebx, ebx
-    BUNDLE.write_bytes(bytes(data))
+        return 1
+    BUNDLE.write_bytes(data[:offset] + b"\x31\xdb" + data[offset + 2:])
     print(f"startup render throttle disabled (patched at 0x{offset:x})")
     return 0
 

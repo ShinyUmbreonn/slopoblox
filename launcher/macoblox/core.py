@@ -81,6 +81,7 @@ DEFAULT_SETTINGS = {
     "language": "en",
     "mouse_sensitivity": 1.0,
     "scroll_sensitivity": 1.5,
+    "auto_patch_throttle": True,
     "raw_mouse": True,
     "hide_menu_bar": False,
     "dns": "system",
@@ -358,6 +359,40 @@ def update_roblox(upload, progress=None):
     return backup if had_bundle else None
 
 
+def throttle_patch_state():
+    """Whether the startup render throttle is patched out of the installed
+    client: 'patched', 'original' or 'unsupported' (no client, or a build
+    whose code shape the patcher does not recognize)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(PROJECT / "patch_startup_throttle.py"),
+             str(APP_BUNDLE), "--check"],
+            capture_output=True, text=True, timeout=120)
+    except Exception:
+        return "unsupported"
+    out = (r.stdout or "").strip()
+    return out if out in ("patched", "original") else "unsupported"
+
+
+def run_throttle_patcher(*flags):
+    """Run the patcher and return its output; raises on a failure exit."""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(PROJECT / "patch_startup_throttle.py"),
+             str(APP_BUNDLE), *flags],
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "").strip() or f"exit {r.returncode}")
+    return (r.stdout or "").strip()
+
+
+def remove_throttle_patch():
+    """Restore the original client bytes; the inverse of the patch."""
+    return run_throttle_patcher("--undo")
+
+
 def apply_throttle_patch():
     """Re-apply the startup-throttle patch to the client binary (see
     patch_startup_throttle.py at the project root).
@@ -365,22 +400,20 @@ def apply_throttle_patch():
     The macOS client throttles the menu to ~3 FPS for its first 10 seconds
     under Darling (the normal release path needs a preRenderJob that is never
     created here). The patcher locates its site by pattern, so it survives
-    client updates and skips itself when the code shape changes. Called on
-    every install/update and on every launch, so a client carried over from
-    before the fix gets patched too; a run costs ~0.3 s."""
+    client updates and skips itself when the code shape changes. Runs on
+    installs, updates and every launch when auto_patch_throttle is on; a run
+    costs ~0.3 s."""
+    if not load_settings().get("auto_patch_throttle", True):
+        return
     try:
-        patched = subprocess.run(
-            [sys.executable, str(PROJECT / "patch_startup_throttle.py"), str(APP_BUNDLE)],
-            capture_output=True, text=True, timeout=120)
+        output = run_throttle_patcher()
     except Exception as e:
         logging.getLogger("macoblox").warning("Startup throttle patch failed: %s", e)
         return
-    output = (patched.stdout or "").strip()
-    if patched.returncode != 0 or "not found" in output:
-        logging.getLogger("macoblox").warning("Startup throttle patch: %s %s",
-                                              output, (patched.stderr or "").strip()[-300:])
-    elif "(patched at" in output:
+    if "(patched at" in output:
         logging.getLogger("macoblox").info(output)
+    elif "not found" in output:
+        logging.getLogger("macoblox").warning("Startup throttle patch: %s", output)
     # "already disabled" stays silent.
 
 

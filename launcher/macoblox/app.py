@@ -1200,6 +1200,22 @@ class SettingsPage(Adw.Bin):
         progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
         roblox.add(progress_row)
 
+        self.throttle_row = _button_row(_("Install the throttle patch"))
+        self.throttle_row.set_subtitle(_("Checking…"))
+        self.throttle_row.set_sensitive(False)
+        self.throttle_row.connect("activated", lambda *_args: self.toggle_throttle_patch())
+        roblox.add(self.throttle_row)
+
+        self.auto_patch_switch = Adw.SwitchRow(
+            title=_("Apply the throttle patch automatically"),
+            subtitle=_("Patch the client on every launch and after Roblox updates"),
+            active=settings.get("auto_patch_throttle", True),
+        )
+        self.auto_patch_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "auto_patch_throttle", row.get_active()))
+        roblox.add(self.auto_patch_switch)
+        self._in_thread(core.throttle_patch_state, self._throttle_state_done)
+
         delete_roblox = _button_row(_("Delete Roblox"))
         delete_roblox.add_css_class("destructive-action")
         delete_roblox.connect("activated", lambda *_args: self.delete_roblox())
@@ -1411,6 +1427,36 @@ class SettingsPage(Adw.Bin):
 
         dialog.connect("response", response)
         dialog.present(self.window)
+
+    def _throttle_state_done(self, state, _error):
+        if not hasattr(self, "throttle_row"):
+            return
+        row = self.throttle_row
+        row.set_sensitive(state != "unsupported")
+        if state == "patched":
+            row.set_title(_("Remove the throttle patch"))
+            row.set_subtitle(_("Applied: the menu renders at full speed from the first second"))
+            row.add_css_class("destructive-action")
+        elif state == "original":
+            row.set_title(_("Install the throttle patch"))
+            row.set_subtitle(_("Not applied: the menu may run at ~3 FPS for the first 10 seconds"))
+            row.remove_css_class("destructive-action")
+        else:
+            row.set_title(_("Throttle patch"))
+            row.set_subtitle(_("Unavailable for this Roblox build"))
+
+    def toggle_throttle_patch(self):
+        if not self.window.begin("patching"):
+            return
+        remove = core.throttle_patch_state() == "patched"
+
+        def done(_result, error):
+            self.window.end()
+            if error:
+                _error_dialog(self.window, _("Throttle patch failed"), str(error) or repr(error))
+            self._in_thread(core.throttle_patch_state, self._throttle_state_done)
+
+        self._in_thread(core.remove_throttle_patch if remove else core.apply_throttle_patch, done)
 
     def delete_roblox(self):
         if self.window.session:
