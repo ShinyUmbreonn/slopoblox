@@ -15,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import sys
 import time
 import urllib.request
 import zipfile
@@ -351,6 +352,18 @@ def update_roblox(upload, progress=None):
                 shutil.rmtree(old, ignore_errors=True)
     if flags:
         save_fast_flags(flags)
+    # The macOS client throttles the menu to ~3 FPS for its first 10 seconds
+    # under Darling (the normal release path needs a preRenderJob that is
+    # never created here). Disabled by patching the client binary; re-derived
+    # by pattern after every update, skipped when the shape changes.
+    try:
+        patched = subprocess.run(
+            [sys.executable, str(PROJECT / "patch_startup_throttle.py"), str(APP_BUNDLE)],
+            capture_output=True, text=True, timeout=120)
+        if patched.stdout.strip():
+            logging.getLogger("macoblox").info(patched.stdout.strip())
+    except Exception as e:
+        logging.getLogger("macoblox").warning("Startup throttle patch failed: %s", e)
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
