@@ -1200,8 +1200,7 @@ class SettingsPage(Adw.Bin):
         progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
         roblox.add(progress_row)
 
-        self.throttle_row = _button_row(_("Install the throttle patch"))
-        self.throttle_row.set_subtitle(_("Checking…"))
+        self.throttle_row = _button_row(_("Throttle patch"))
         self.throttle_row.set_sensitive(False)
         self.throttle_row.connect("activated", lambda *_args: self.toggle_throttle_patch())
         roblox.add(self.throttle_row)
@@ -1432,18 +1431,23 @@ class SettingsPage(Adw.Bin):
         if not hasattr(self, "throttle_row"):
             return
         row = self.throttle_row
+        # Adw.ButtonRow has no subtitle on libadwaita < 1.7; the state goes
+        # into the button text there and into the subtitle where supported.
+        def say(title, subtitle):
+            row.set_title(title)
+            if hasattr(row, "set_subtitle"):
+                row.set_subtitle(subtitle)
         row.set_sensitive(state != "unsupported")
         if state == "patched":
-            row.set_title(_("Remove the throttle patch"))
-            row.set_subtitle(_("Applied: the menu renders at full speed from the first second"))
+            say(_("Remove the throttle patch"),
+                _("Applied: the menu renders at full speed from the first second"))
             row.add_css_class("destructive-action")
         elif state == "original":
-            row.set_title(_("Install the throttle patch"))
-            row.set_subtitle(_("Not applied: the menu may run at ~3 FPS for the first 10 seconds"))
+            say(_("Install the throttle patch"),
+                _("Not applied: the menu may run at ~3 FPS for the first 10 seconds"))
             row.remove_css_class("destructive-action")
         else:
-            row.set_title(_("Throttle patch"))
-            row.set_subtitle(_("Unavailable for this Roblox build"))
+            say(_("Throttle patch"), _("Unavailable for this Roblox build"))
 
     def toggle_throttle_patch(self):
         if not self.window.begin("patching"):
