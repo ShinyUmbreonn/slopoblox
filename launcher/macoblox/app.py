@@ -1460,6 +1460,12 @@ class SettingsPage(Adw.Bin):
             return
         remove = core.throttle_patch_state() == "patched"
 
+        def work():
+            # The button is the manual path: run the patcher directly, not
+            # apply_throttle_patch, which is the automatic path and does
+            # nothing while auto_patch_throttle is off.
+            return core.remove_throttle_patch() if remove else core.run_throttle_patcher()
+
         def done(_result, error):
             self.window.end()
             if error:
@@ -1471,7 +1477,7 @@ class SettingsPage(Adw.Bin):
                 self.auto_patch_switch.set_active(not remove)
             self._in_thread(core.throttle_patch_state, self._throttle_state_done)
 
-        self._in_thread(core.remove_throttle_patch if remove else core.apply_throttle_patch, done)
+        self._in_thread(work, done)
 
     def delete_roblox(self):
         if self.window.session:
