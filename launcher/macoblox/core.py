@@ -61,6 +61,8 @@ FAST_FLAGS = APP_BUNDLE / "Contents" / "MacOS" / "ClientSettings" / "ClientAppSe
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macoblox"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "macoblox"
+# Written by the shim when Roblox starts terminating; see RobloxSession.poll.
+QUIT_SENTINEL = CACHE_DIR / "game-closing"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # Cookies and site data of Roblox's embedded web pages (web.py): sign-in state.
 WEB_DATA_DIR = CONFIG_DIR / "web"
@@ -1215,6 +1217,9 @@ class RobloxSession:
         # its socket as the guest sees it, and WebKit's user agent.
         self.web_socket = None
         self.web_user_agent = None
+        # A sentinel left over from a quit that outlived the launcher must not
+        # end this session before it starts.
+        QUIT_SENTINEL.unlink(missing_ok=True)
 
     def environment(self):
         return darling_environment()
@@ -1260,6 +1265,7 @@ class RobloxSession:
         # not carry the value as an argument (for example a retry after the
         # launcher was already open).
         variables.append(f"MACOBLOX_PENDING_URI_FILE=/Volumes/SystemRoot{CACHE_DIR / 'pending-uri'}")
+        variables.append(f"MACOBLOX_QUIT_SENTINEL=/Volumes/SystemRoot{QUIT_SENTINEL}")
         try:
             variables.append(f"MACOBLOX_ICON_ARGB=/Volumes/SystemRoot{icon_argb_file()}")
         except Exception:
@@ -1358,6 +1364,13 @@ class RobloxSession:
             return status
         if self.audio:
             self.audio.keep_playing()
+        # The shim touches the sentinel when Roblox starts terminating
+        # (Cmd+Q, Quit in the menu). Roblox's own teardown takes seconds, and
+        # the session can end for the user as soon as quitting began.
+        # seen_roblox keeps a sentinel left from a dead session irrelevant.
+        if self.seen_roblox and QUIT_SENTINEL.exists():
+            self.finish()
+            return -1
         # Suppress any crash handler to prevent slow dumps and exit blockage
         if self.seen_roblox and time.time() - self.started_at > 3:
             for pid in roblox_pids(("RobloxCrashHandler",)):
