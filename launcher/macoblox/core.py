@@ -1289,6 +1289,13 @@ class RobloxSession:
         variables = [
             f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}",
             f"MACOBLOX_SCROLL_SENSITIVITY={self.settings.get('scroll_sensitivity', 1.5):.2f}",
+            # Mesa builds its shader cache under the prefix's /Users, which
+            # is not writable on every setup ("Failed to create /Users for
+            # shader cache -- disabling"), so every launch recompiled every
+            # shader. Point it at the host cache instead; NVIDIA's driver
+            # ignores it, Mesa picks it up.
+            f"MESA_SHADER_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
+            f"MESA_GLSL_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
         ]
         vram = host_vram_bytes()
         if vram:
@@ -1380,6 +1387,8 @@ class RobloxSession:
             subprocess.run(["darling", "shell", "true"], env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         LOGS.mkdir(parents=True, exist_ok=True)
+        # The Mesa shader cache dir must exist before the game opens it.
+        (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
         with open(self.log_path, "wb") as log:
