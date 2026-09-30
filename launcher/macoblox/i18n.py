@@ -294,6 +294,8 @@ RU = {
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
+    "Rebuilding the shim…": "Пересобираю шим…",
+    "Restarting Darling…": "Перезапускаю Darling…",
     # Live logs view
     "Logs": "Логи",
     "Game Logs": "Логи игры",

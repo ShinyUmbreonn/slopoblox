@@ -1365,7 +1365,24 @@ class SettingsPage(Adw.Bin):
                 _toast(self.window.toasts, _("Roblox updated, the old version is in backups/") if backup
                        else _("Roblox installed"))
 
-        self._in_thread(lambda: core.update_roblox(upload, progress), done)
+        # A fresh client does not start until the shim is rebuilt and the
+        # Darling prefix is restarted (stale launchd and daemons from the old
+        # client), so both run as part of the same progress bar.
+        running = self.window.session is not None
+
+        def work():
+            backup = core.update_roblox(upload, progress)
+            progress(0.94, _("Rebuilding the shim…"))
+            ok, output = core.build_shim()
+            if not ok:
+                raise RuntimeError(output)
+            if not running:
+                progress(0.97, _("Restarting Darling…"))
+                core.restart_darling()
+            progress(1.0, _("Done"))
+            return backup
+
+        self._in_thread(work, done)
 
     def logout(self):
         dialog = Adw.AlertDialog(
