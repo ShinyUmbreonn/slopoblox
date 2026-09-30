@@ -352,21 +352,36 @@ def update_roblox(upload, progress=None):
                 shutil.rmtree(old, ignore_errors=True)
     if flags:
         save_fast_flags(flags)
-    # The macOS client throttles the menu to ~3 FPS for its first 10 seconds
-    # under Darling (the normal release path needs a preRenderJob that is
-    # never created here). Disabled by patching the client binary; re-derived
-    # by pattern after every update, skipped when the shape changes.
+    apply_throttle_patch()
+    if progress:
+        progress(1.0, _("Done"))
+    return backup if had_bundle else None
+
+
+def apply_throttle_patch():
+    """Re-apply the startup-throttle patch to the client binary (see
+    patch_startup_throttle.py at the project root).
+
+    The macOS client throttles the menu to ~3 FPS for its first 10 seconds
+    under Darling (the normal release path needs a preRenderJob that is never
+    created here). The patcher locates its site by pattern, so it survives
+    client updates and skips itself when the code shape changes. Called on
+    every install/update and on every launch, so a client carried over from
+    before the fix gets patched too; a run costs ~0.3 s."""
     try:
         patched = subprocess.run(
             [sys.executable, str(PROJECT / "patch_startup_throttle.py"), str(APP_BUNDLE)],
             capture_output=True, text=True, timeout=120)
-        if patched.stdout.strip():
-            logging.getLogger("macoblox").info(patched.stdout.strip())
     except Exception as e:
         logging.getLogger("macoblox").warning("Startup throttle patch failed: %s", e)
-    if progress:
-        progress(1.0, _("Done"))
-    return backup if had_bundle else None
+        return
+    output = (patched.stdout or "").strip()
+    if patched.returncode != 0 or "not found" in output:
+        logging.getLogger("macoblox").warning("Startup throttle patch: %s %s",
+                                              output, (patched.stderr or "").strip()[-300:])
+    elif "(patched at" in output:
+        logging.getLogger("macoblox").info(output)
+    # "already disabled" stays silent.
 
 
 def delete_roblox():
@@ -1319,6 +1334,7 @@ class RobloxSession:
             mods.apply_mods(self.settings)
         except Exception as e:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
+        apply_throttle_patch()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder

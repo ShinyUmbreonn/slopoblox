@@ -28,6 +28,8 @@ from pathlib import Path
 
 BUNDLE = Path(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else (
     Path(__file__).parent / "RobloxPlayer.app" / "Contents" / "MacOS" / "RobloxPlayer")
+if BUNDLE.is_dir():  # the .app bundle was given instead of its binary
+    BUNDLE = BUNDLE / "Contents" / "MacOS" / "RobloxPlayer"
 
 # mov ebx, esi; mov r14, rdi — the throttle argument and this-pointer move
 # right after RenderJob::setStartupThrottle's prologue.
