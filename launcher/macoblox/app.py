@@ -1206,6 +1206,27 @@ class SettingsPage(Adw.Bin):
         roblox.add(delete_roblox)
         self.roblox_page.add(roblox)
 
+        # The startup render throttle patch gets a group of its own: the
+        # button applies or reverts it by hand, the switch decides whether
+        # launches and updates keep it applied. Installing turns the switch
+        # on and removing turns it off, so the two cannot contradict.
+        throttle = Adw.PreferencesGroup(title=_("Throttle patch"))
+        self.throttle_row = _button_row(_("Throttle patch"))
+        self.throttle_row.set_sensitive(False)
+        self.throttle_row.connect("activated", lambda *_args: self.toggle_throttle_patch())
+        throttle.add(self.throttle_row)
+
+        self.auto_patch_switch = Adw.SwitchRow(
+            title=_("Apply the throttle patch automatically"),
+            subtitle=_("Patch the client on every launch and after Roblox updates"),
+            active=settings.get("auto_patch_throttle", True),
+        )
+        self.auto_patch_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "auto_patch_throttle", row.get_active()))
+        throttle.add(self.auto_patch_switch)
+        self._in_thread(core.throttle_patch_state, self._throttle_state_done)
+        self.roblox_page.add(throttle)
+
         account = Adw.PreferencesGroup(title=_("Account"))
         logout = _button_row(_("Sign out"))
         logout.add_css_class("destructive-action")
@@ -1411,6 +1432,52 @@ class SettingsPage(Adw.Bin):
 
         dialog.connect("response", response)
         dialog.present(self.window)
+
+    def _throttle_state_done(self, state, _error):
+        if not hasattr(self, "throttle_row"):
+            return
+        row = self.throttle_row
+        # Adw.ButtonRow has no subtitle on libadwaita < 1.7; the state goes
+        # into the button text there and into the subtitle where supported.
+        def say(title, subtitle):
+            row.set_title(title)
+            if hasattr(row, "set_subtitle"):
+                row.set_subtitle(subtitle)
+        row.set_sensitive(state != "unsupported")
+        if state == "patched":
+            say(_("Remove the throttle patch"),
+                _("Applied: the menu renders at full speed from the first second"))
+            row.add_css_class("destructive-action")
+        elif state == "original":
+            say(_("Install the throttle patch"),
+                _("Not applied: the menu may run at ~3 FPS for the first 10 seconds"))
+            row.remove_css_class("destructive-action")
+        else:
+            say(_("Not available for this Roblox build"), "")
+
+    def toggle_throttle_patch(self):
+        if not self.window.begin("patching"):
+            return
+        remove = core.throttle_patch_state() == "patched"
+
+        def work():
+            # The button is the manual path: run the patcher directly, not
+            # apply_throttle_patch, which is the automatic path and does
+            # nothing while auto_patch_throttle is off.
+            return core.remove_throttle_patch() if remove else core.run_throttle_patcher()
+
+        def done(_result, error):
+            self.window.end()
+            if error:
+                _error_dialog(self.window, _("Throttle patch failed"), str(error) or repr(error))
+            else:
+                # Keep the switch in step with the button: a hand-removed
+                # patch must not be re-applied on the next launch, and a
+                # hand-installed one is worth keeping that way.
+                self.auto_patch_switch.set_active(not remove)
+            self._in_thread(core.throttle_patch_state, self._throttle_state_done)
+
+        self._in_thread(work, done)
 
     def delete_roblox(self):
         if self.window.session:

@@ -296,6 +296,19 @@ RU = {
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
     "Rebuilding the shim…": "Пересобираю шим…",
     "Restarting Darling…": "Перезапускаю Darling…",
+    "Install the throttle patch": "Установить патч троттлинга",
+    "Remove the throttle patch": "Удалить патч троттлинга",
+    "Applied: the menu renders at full speed from the first second":
+        "Применён: меню рендерится на полной скорости с первой секунды",
+    "Not applied: the menu may run at ~3 FPS for the first 10 seconds":
+        "Не применён: меню может работать на ~3 FPS первые 10 секунд",
+    "Not available for this Roblox build": "Недоступно для этой сборки Roblox",
+    "Apply the throttle patch automatically": "Применять патч троттлинга автоматически",
+    "Patch the client on every launch and after Roblox updates":
+        "Патчить клиента при каждом запуске и после обновлений Roblox",
+    "Throttle patch": "Патч троттлинга",
+    "Checking…": "Проверяю…",
+    "Throttle patch failed": "Не удалось применить патч троттлинга",
     # Live logs view
     "Logs": "Логи",
     "Game Logs": "Логи игры",
