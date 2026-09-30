@@ -1200,10 +1200,21 @@ class SettingsPage(Adw.Bin):
         progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
         roblox.add(progress_row)
 
+        delete_roblox = _button_row(_("Delete Roblox"))
+        delete_roblox.add_css_class("destructive-action")
+        delete_roblox.connect("activated", lambda *_args: self.delete_roblox())
+        roblox.add(delete_roblox)
+        self.roblox_page.add(roblox)
+
+        # The startup render throttle patch gets a group of its own: the
+        # button applies or reverts it by hand, the switch decides whether
+        # launches and updates keep it applied. Installing turns the switch
+        # on and removing turns it off, so the two cannot contradict.
+        throttle = Adw.PreferencesGroup(title=_("Throttle patch"))
         self.throttle_row = _button_row(_("Throttle patch"))
         self.throttle_row.set_sensitive(False)
         self.throttle_row.connect("activated", lambda *_args: self.toggle_throttle_patch())
-        roblox.add(self.throttle_row)
+        throttle.add(self.throttle_row)
 
         self.auto_patch_switch = Adw.SwitchRow(
             title=_("Apply the throttle patch automatically"),
@@ -1212,14 +1223,9 @@ class SettingsPage(Adw.Bin):
         )
         self.auto_patch_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
             "auto_patch_throttle", row.get_active()))
-        roblox.add(self.auto_patch_switch)
+        throttle.add(self.auto_patch_switch)
         self._in_thread(core.throttle_patch_state, self._throttle_state_done)
-
-        delete_roblox = _button_row(_("Delete Roblox"))
-        delete_roblox.add_css_class("destructive-action")
-        delete_roblox.connect("activated", lambda *_args: self.delete_roblox())
-        roblox.add(delete_roblox)
-        self.roblox_page.add(roblox)
+        self.roblox_page.add(throttle)
 
         account = Adw.PreferencesGroup(title=_("Account"))
         logout = _button_row(_("Sign out"))
@@ -1447,7 +1453,7 @@ class SettingsPage(Adw.Bin):
                 _("Not applied: the menu may run at ~3 FPS for the first 10 seconds"))
             row.remove_css_class("destructive-action")
         else:
-            say(_("Throttle patch"), _("Unavailable for this Roblox build"))
+            say(_("Not available for this Roblox build"), "")
 
     def toggle_throttle_patch(self):
         if not self.window.begin("patching"):
@@ -1458,6 +1464,11 @@ class SettingsPage(Adw.Bin):
             self.window.end()
             if error:
                 _error_dialog(self.window, _("Throttle patch failed"), str(error) or repr(error))
+            else:
+                # Keep the switch in step with the button: a hand-removed
+                # patch must not be re-applied on the next launch, and a
+                # hand-installed one is worth keeping that way.
+                self.auto_patch_switch.set_active(not remove)
             self._in_thread(core.throttle_patch_state, self._throttle_state_done)
 
         self._in_thread(core.remove_throttle_patch if remove else core.apply_throttle_patch, done)

@@ -302,7 +302,7 @@ RU = {
         "Применён: меню рендерится на полной скорости с первой секунды",
     "Not applied: the menu may run at ~3 FPS for the first 10 seconds":
         "Не применён: меню может работать на ~3 FPS первые 10 секунд",
-    "Unavailable for this Roblox build": "Недоступен для этой сборки Roblox",
+    "Not available for this Roblox build": "Недоступно для этой сборки Roblox",
     "Apply the throttle patch automatically": "Применять патч троттлинга автоматически",
     "Patch the client on every launch and after Roblox updates":
         "Патчить клиента при каждом запуске и после обновлений Roblox",
