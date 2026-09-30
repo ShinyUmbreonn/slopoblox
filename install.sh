@@ -128,15 +128,23 @@ do_install() {
   command -v darling >/dev/null ||
     die "Darling is not installed. Build it with https://docs.darlinghq.org/build-instructions.html and run this again."
 
-  if [[ -d $DIR/.git ]]; then
+    if [[ -d $DIR/.git ]]; then
     say "Updating Mac O' Blox"
+
     # Checkouts from before the move to this fork still point at the original
     # repository, which does not have its fixes.
     case $(git -C "$DIR" remote get-url origin 2>/dev/null) in
       https://github.com/narezy/MacOBlox | https://github.com/narezy/MacOBlox.git)
         git -C "$DIR" remote set-url origin "$REPO" ;;
     esac
-    git -C "$DIR" pull --ff-only
+
+    # Mac O' Blox owns this checkout. Discard local changes and files before
+    # updating so an old/modified installation can never block an update.
+    say "Removing old local changes"
+    git -C "$DIR" fetch origin main
+    git -C "$DIR" reset --hard origin/main
+    git -C "$DIR" clean -fd
+
   else
     say "Downloading Mac O' Blox"
     git clone --depth 1 "$REPO" "$DIR"
