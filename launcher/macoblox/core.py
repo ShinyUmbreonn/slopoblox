@@ -354,6 +354,7 @@ def update_roblox(upload, progress=None):
     if flags:
         save_fast_flags(flags)
     apply_throttle_patch()
+    ensure_raknet_transport()
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
@@ -415,6 +416,145 @@ def apply_throttle_patch():
     elif "not found" in output:
         logging.getLogger("macoblox").warning("Startup throttle patch: %s", output)
     # "already disabled" stays silent.
+
+
+def ensure_raknet_transport():
+    """Ensure FastFlags in ClientAppSettings.json and the client binary disable
+    RbxTransport (QUIC) and enforce RakNet. Under Darling, RbxTransport fails socket
+    connection, causing an ~11 s freeze before Roblox disconnects with Error 256."""
+    try:
+        flags = load_fast_flags()
+        needed = {
+            "FFlagUseRbxTransportClient": "False",
+            "FFlagUseRbxTransportClient3": "False",
+            "FFlagUseRbxTransportServer": "False",
+            "FFlagShareRbxTransport": "False",
+            "FFlagRbxTransportRuntime": "False",
+            "DFFlagDebugDisableRbxTransportDummyClient": "True",
+            "FFlagDebugDisableRbxTransportDummyClient": "True",
+            "FStringRbxTransportDummyClientEnabledMinorVersions": "",
+            "FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter": "none",
+            "DFIntRbxTransportDummyClientConnectionTimeoutMs": 0,
+            "DFIntRbxTransportQuicHandshakeTimeoutMs": 0,
+            # The Pop-latency STUN probe sends UDP bursts to 24 datacenters
+            # every 0.5 s for ~5 s: it delays the first join (menu appears
+            # late) and blocks the render switch after leaving a game.
+            "DFFlagEnablePopLatencyProbe3": "False",
+            "DFFlagAttachPopUdpProbeToGameJoin2": "False",
+            # While on RakNet, Roblox opens a shadow RbxTransport connection
+            # ("DummyClient will connect") that can never connect under
+            # Darling; closing the session then waits for it, freezing the
+            # return to the menu for seconds.
+            "DFFlagRakNetFallbackToRbxTransportEvent": "False",
+            "DFFlagRakNetFallbackToRbxTransportStatus": "False",
+            "DFFlagConnectDummyServiceClientEarly": "False",
+            "DFIntRbxTransportClientConnectionWaitIntervalMs": 0,
+        }
+        changed = False
+        for k, v in needed.items():
+            if flags.get(k) != v:
+                flags[k] = v
+                changed = True
+        if changed:
+            save_fast_flags(flags)
+
+        binary = APP_BUNDLE / "Contents" / "MacOS" / "RobloxPlayer"
+        if binary.is_file():
+            with open(binary, "r+b") as f:
+                data = f.read()
+                str_pos = data.find(b"useRbxTransportEnabled\x00")
+                if str_pos != -1:
+                    pattern = re.compile(rb"\x48\x8d[\x00-\xff]")
+                    for m in pattern.finditer(data):
+                        i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
+                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                        if i + 7 + disp == str_pos:
+                            prefix = data[max(0, i-17):i]
+                            call_idx = prefix.find(b"\xe8")
+                            if call_idx != -1:
+                                call_file_pos = max(0, i-17) + call_idx
+                                call_disp = int.from_bytes(data[call_file_pos+1:call_file_pos+5], "little", signed=True)
+                                fn_pos = call_file_pos + 5 + call_disp
+                                if 0 <= fn_pos < len(data) - 4 and data[fn_pos:fn_pos+4] == b"\x55\x48\x89\xe5":
+                                    f.seek(fn_pos)
+                                    f.write(b"\x31\xc0\xc3\x90")
+                            break
+                # The RakNet fallback setup ("Setting up fallback to
+                # RbxTransport") starts a shadow RbxTransport connection that
+                # can never connect under Darling; closing a session then
+                # waits for its 10 s timeout, freezing the return to the
+                # menu. D-flag overrides from ClientAppSettings are ignored
+                # by the client, so gate the setup off in binary: the check
+                # `cmp byte [flag], 1; jne skip` becomes never-true.
+                fb_str = data.find(b"Setting up fallback to RbxTransport")
+                if fb_str != -1:
+                    for m in pattern.finditer(data):
+                        i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
+                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                        target = i + 7 + disp
+                        if fb_str - 0x80 <= target <= fb_str:
+                            window = data[i:i+0x100]
+                            gate = re.compile(rb"\x80\x3d.{4}\x01\x0f\x85", re.DOTALL)
+                            g = gate.search(window)
+                            if g:
+                                imm_pos = i + g.start() + 6
+                                if data[imm_pos] == 1:
+                                    f.seek(imm_pos)
+                                    f.write(b"\xff")
+                            break
+                # The DummyClient also starts from a runtime path ("DummyClient
+                # will connect to server"): its start function is called from
+                # two sites, each gated by a compare of the same flag global
+                # (opposite polarity: ==1 at one, ==0 at the other). Patch
+                # each caller's guard so the connect call is always skipped:
+                # a short `jne` becomes `jmp`, a near `jne rel32` gets the
+                # compare's immediate set to 0xFF (never equal).
+                dc_str = data.find(b"DummyClient will connect to server")
+                if dc_str != -1:
+                    starts = []
+                    for m in pattern.finditer(data):
+                        i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
+                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                        target = i + 7 + disp
+                        if dc_str - 0x80 <= target <= dc_str:
+                            starts.append(i)
+                    for start in starts:
+                        prologue = data.rfind(b"\x55\x48\x89\xe5", start - 0x800, start)
+                        if prologue == -1:
+                            continue
+                        for m in re.finditer(rb"\xe8", data):
+                            i = m.start()
+                            if i + 5 + int.from_bytes(data[i+1:i+5], "little", signed=True) != prologue:
+                                continue
+                            # Guard candidate sits within 0x60 bytes before the call:
+                            # cmp byte ptr [rip+disp32], imm8; (a move or two;) jne.
+                            window_start = max(0, i - 0x60)
+                            window = data[window_start:i]
+                            for g in re.finditer(rb"\x80\x3d", window):
+                                cmp_pos = window_start + g.start()
+                                imm_pos = cmp_pos + 6
+                                if data[imm_pos] not in (0, 1):
+                                    continue
+                                gap = data[imm_pos + 1:imm_pos + 9]
+                                jne = gap.find(b"\x75")
+                                if jne != -1:
+                                    f.seek(imm_pos + 1 + jne)
+                                    f.write(b"\xeb")  # jne -> jmp: always skip
+                                elif gap[:2] == b"\x0f\x85":
+                                    f.seek(imm_pos)
+                                    f.write(b"\xff")  # never equal: always skip
+                                break
+    except Exception as e:
+        logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)
 
 
 def delete_roblox():
@@ -1296,6 +1436,12 @@ class RobloxSession:
             # ignores it, Mesa picks it up.
             f"MESA_SHADER_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
             f"MESA_GLSL_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
+            # Roblox keeps its own caches (flag cache, thumbnail temp files)
+            # under the prefix's /private/tmp, which does not survive a
+            # Darling restart: every launch re-downloaded 23k flags and every
+            # menu return re-fetched every thumbnail (429 rate limits, blank
+            # place tiles). A host directory makes those caches persistent.
+            f"TMPDIR=/Volumes/SystemRoot{CACHE_DIR / 'roblox-tmp'}",
         ]
         vram = host_vram_bytes()
         if vram:
@@ -1375,6 +1521,7 @@ class RobloxSession:
         except Exception as e:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         apply_throttle_patch()
+        ensure_raknet_transport()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder
@@ -1389,6 +1536,8 @@ class RobloxSession:
         LOGS.mkdir(parents=True, exist_ok=True)
         # The Mesa shader cache dir must exist before the game opens it.
         (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
+        # The guest TMPDIR (Roblox's flag and thumbnail caches) likewise.
+        (CACHE_DIR / "roblox-tmp").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
         with open(self.log_path, "wb") as log:
