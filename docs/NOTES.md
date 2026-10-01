@@ -242,6 +242,31 @@ holds the look, `app.py` the new shell; every settings page keeps its widgets):
 - For screenshots: `MACOBLOX_PAGE` (play, env, roblox, flags, mods, logs,
   info) and `MACOBLOX_WINDOW_SIZE=WxH`.
 
+## Changes 2026-10-01, evening: a report from another Darling build
+
+A user's game died at start with `-[RBXWindow setTitlebarAppearsTransparent:]:
+unrecognized selector`; the log began with "Validation layer requested but
+not available" and Mesa's "Failed to create /Volumes for shader cache", and
+had `NSApplication got exception: -[MTLDev...` before the crash.
+
+- Roblox prefers Metal and only uses OpenGL when it finds no Metal device.
+  On the tested Darling release (and here, NVIDIA) `MTLCreateSystemDefaultDevice`
+  returns nil, which is the only reason OpenGL ran. That user's Darling
+  returned a device, Roblox started its Metal renderer, and Darling cannot
+  carry it. `gpu_info.c` now interposes `MTLCreateSystemDefaultDevice` (nil)
+  and `MTLCopyAllDevices` (empty array); `MACOBLOX_METAL=1` keeps Darling's
+  answer for the Vulkan work. The interposers are verified to be called; a
+  Darling that returns a device could not be reproduced here.
+- `setTitlebarAppearsTransparent:`, `setTitleVisibility:` and their getters
+  are missing from Darling's NSWindow (also in the tested release; Roblox
+  only reaches them on the Metal path). The shim adds them where missing.
+- The launch log's second line is now `Darling: <darling --version>`.
+- Mesa's shader cache: `MESA_SHADER_CACHE_DIR` carried the guest prefix
+  `/Volumes/SystemRoot`, but Mesa is a host library and sees host paths, so
+  the cache stayed off on every Mesa system. Tested under Darling with
+  llvmpipe: with the prefix "Failed to create /Volumes", no files; with the
+  plain host path the cache fills.
+
 ## What to Check Next
 
 We need a recent startup log from a regular terminal. This will help determine where

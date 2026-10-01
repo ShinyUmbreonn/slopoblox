@@ -19,7 +19,7 @@ clang -target x86_64-apple-darwin -fuse-ld=lld \
   -Wl,-undefined,dynamic_lookup \
   -install_name @rpath/libMacOBloxShims.dylib \
   "$project_dir/libMacOBloxShims.m" "$project_dir/xattr_compat.c" "$project_dir/exit_compat.c" "$project_dir/missing_symbols.c" "$project_dir/net_trace.c" "$project_dir/darling_fixes.c" "$project_dir/thread_kick.c" "$project_dir/xfixes_raw.c" "$project_dir/raw_mouse.c" "$project_dir/dns_override.c" "$project_dir/audio_hal.c" "$project_dir/gpu_info.c" "$project_dir/gl_profile.c" "$project_dir/connectx_compat.c" "$project_dir/memory_stats.c" "$project_dir/web_bridge.m" "$build_dir/fast_libc.o" \
-  -lobjc -lc++ -lc++abi -framework Foundation -framework AppKit -framework WebKit \
+  -lobjc -lc++ -lc++abi -framework Foundation -framework AppKit -framework WebKit -framework Metal \
   -o "$tmp_output"
 mv -- "$tmp_output" "$build_dir/libMacOBloxShims.dylib"
 printf 'Built: %s\n' "$build_dir/libMacOBloxShims.dylib"
