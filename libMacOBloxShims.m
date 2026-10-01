@@ -3272,11 +3272,15 @@ static int macoblox_filter_locked_motion(id event) {
     return dropped;
 }
 
-// Consume the motion event of a pointer warp, locked or not: the restore on
-// unlock lands after the grab is gone, and the game would turn the camera by
-// the service delta (phantom spins, the cursor jumping around).
+// Consume the motion event of a pointer warp when the lock filter is not
+// running (the restore on unlock lands after the grab is gone): the game
+// would turn the camera by the service delta (phantom spins, the cursor
+// jumping around). While the lock owns the pointer, its own filter handles
+// warp motions - stepping in here first would stall its recentering.
 static int macoblox_consume_warp_motion(id event) {
     if (!macoblox_global_warp_pending)
+        return 0;
+    if (macoblox_pointer_grabbed && !macoblox_raw_mouse_active)
         return 0;
     SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
     double dx = orig_mouse_event_delta_x ? orig_mouse_event_delta_x(event, delta_x)
