@@ -464,9 +464,12 @@ def ensure_raknet_transport():
                 data = f.read()
                 str_pos = data.find(b"useRbxTransportEnabled\x00")
                 if str_pos != -1:
-                    pattern = re.compile(rb"\x48\x8d\x35")
+                    pattern = re.compile(rb"\x48\x8d[\x00-\xff]")
                     for m in pattern.finditer(data):
                         i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
                         disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
                         if i + 7 + disp == str_pos:
                             prefix = data[max(0, i-17):i]
@@ -478,6 +481,32 @@ def ensure_raknet_transport():
                                 if 0 <= fn_pos < len(data) - 4 and data[fn_pos:fn_pos+4] == b"\x55\x48\x89\xe5":
                                     f.seek(fn_pos)
                                     f.write(b"\x31\xc0\xc3\x90")
+                            break
+                # The RakNet fallback setup ("Setting up fallback to
+                # RbxTransport") starts a shadow RbxTransport connection that
+                # can never connect under Darling; closing a session then
+                # waits for its 10 s timeout, freezing the return to the
+                # menu. D-flag overrides from ClientAppSettings are ignored
+                # by the client, so gate the setup off in binary: the check
+                # `cmp byte [flag], 1; jne skip` becomes never-true.
+                fb_str = data.find(b"Setting up fallback to RbxTransport")
+                if fb_str != -1:
+                    for m in pattern.finditer(data):
+                        i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
+                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                        target = i + 7 + disp
+                        if fb_str - 0x80 <= target <= fb_str:
+                            window = data[i:i+0x100]
+                            gate = re.compile(rb"\x80\x3d.{4}\x01\x0f\x85", re.DOTALL)
+                            g = gate.search(window)
+                            if g:
+                                imm_pos = i + g.start() + 6
+                                if data[imm_pos] == 1:
+                                    f.seek(imm_pos)
+                                    f.write(b"\xff")
                             break
     except Exception as e:
         logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)

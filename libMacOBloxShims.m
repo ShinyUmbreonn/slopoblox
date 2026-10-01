@@ -3320,10 +3320,13 @@ static double hooked_mouse_event_delta_y(id self, SEL cmd) {
 }
 
 // Scroll wheel APIs missing from Darling's NSEvent. X11 wheels report coarse
-// line deltas, so they are never "precise".
+// line deltas; macOS reports pixels for the same events (about 10 px per
+// line). Roblox's Universal App menu scrolls on the pixel deltas only, so
+// with line-scale values the wheel appeared dead there.
+#define MACOBLOX_SCROLL_LINE_PIXELS 10.0
 static MacOBloxBool event_has_precise_scrolling_deltas(id self, SEL cmd) {
     (void)self; (void)cmd;
-    return 0;
+    return 1;
 }
 static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
     (void)self; (void)cmd;
@@ -3332,12 +3335,12 @@ static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
 static double event_scrolling_delta_x(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaX"));
-    return d * macoblox_scroll_sensitivity();
+    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
 }
 static double event_scrolling_delta_y(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaY"));
-    return d * macoblox_scroll_sensitivity();
+    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
 }
 
 // Darling's -[X11Cursor initWithImage:hotPoint:] copies each pixel row with a
