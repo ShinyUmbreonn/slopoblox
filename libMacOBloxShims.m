@@ -2737,13 +2737,16 @@ static volatile int macoblox_anchor_warp_pending;
 static volatile int macoblox_global_warp_pending;
 static volatile int macoblox_global_warp_wait;
 
-// Move the pointer by (dx, dy) window points (Cocoa axes, y up).
-static void macoblox_warp_pointer_by(double dx, double dy) {
+static id macoblox_lock_window(void);
+static MacOBloxPoint macoblox_window_center(id window);
+
+// Warp the pointer to the window's exact center in X11 coordinates (dst_w = handle,
+// dst_x = w/2, dst_y = h/2). Absolute warp eliminates sign flips and coordinate
+// mismatch between Cocoa and X11: the pointer lands on the exact same pixel every time.
+static void macoblox_warp_to_window_center(void) {
     static int (*warp)(void*, unsigned long, unsigned long, int, int,
                        unsigned int, unsigned int, int, int);
     static int (*flush)(void*);
-    // A failed lookup is not cached: libX11 may load with Darling's backend
-    // after the first lock.
     if (!warp || !flush) {
         warp = (int (*)(void*, unsigned long, unsigned long, int, int,
                         unsigned int, unsigned int, int, int))
@@ -2755,38 +2758,24 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
     void* display = display_object
         ? ((void* (*)(id, SEL))objc_msgSend)(display_object, sel_registerName("display"))
         : 0;
-    int ix = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
-    int iy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
-    if (!warp || !display || (!ix && !iy)) {
-        static volatile long failures;
-        if (__sync_add_and_fetch(&failures, 1) <= 5) {
-            write_str("[MacOBlox Lock] Warp unavailable: warp=");
-            print_num(warp ? 1 : 0);
-            write_str(" display=");
-            print_num(display ? 1 : 0);
-            write_str(" move=");
-            print_num(ix);
-            write_str(",");
-            print_num(iy);
-            write_str("\n");
-        }
+    id window = macoblox_lock_window();
+    unsigned long handle = window
+        ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle"))
+        : 0;
+    if (!warp || !display || !window || !handle)
         return;
-    }
-    // X11 y grows downward.
-    warp(display, 0, 0, 0, 0, 0, 0, ix, -iy);
-    // The recentering motion is dropped by order at the X level; mark it
-    // before the flush so the pump cannot read the warp's motion before the
-    // flag is up (a late mark let the service delta reach the game as a
-    // camera jerk).
+    extern void objc_msgSend_stret(void);
+    MacOBloxRect frame = ((MacOBloxRect (*)(id, SEL))objc_msgSend_stret)(
+        window, sel_registerName("frame"));
+    int cx = (int)(frame.size.width / 2.0);
+    int cy = (int)(frame.size.height / 2.0);
+    if (cx <= 0 || cy <= 0)
+        return;
+    // X11 coordinates: dst_w = handle, dst_x = cx, dst_y = cy.
+    warp(display, 0, handle, 0, 0, 0, 0, cx, cy);
     macoblox_anchor_warp_pending = 1;
     if (flush)
         flush(display);
-    macoblox_expected_warp_delta.x = ix;
-    macoblox_expected_warp_delta.y = iy;
-    macoblox_warp_wait_events = 0;
-    macoblox_drop_warp_motion = 1;
-    macoblox_global_warp_pending = 1;
-    macoblox_global_warp_wait = 0;
 }
 
 static MacOBloxPoint macoblox_window_center(id window) {
@@ -3236,10 +3225,15 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         // still hidden, then show it.
         macoblox_pointer_grabbed = 0;
         if (macoblox_raw_mouse_active && macoblox_raw_have_anchor) {
-            // Darling saw no pointer motion during the lock; the event loop
-            // did (X coordinates, y down; the warp takes Cocoa's y up).
-            macoblox_warp_pointer_by(macoblox_raw_start_x - macoblox_raw_last_x,
-                                     macoblox_raw_last_y - macoblox_raw_start_y);
+            id display_object = ((id (*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("NSDisplay"), sel_registerName("currentDisplay"));
+            void* display = display_object
+                ? ((void* (*)(id, SEL))objc_msgSend)(display_object, sel_registerName("display"))
+                : 0;
+            if (display)
+                macoblox_warp_on_display(display,
+                                         macoblox_raw_start_x - macoblox_raw_last_x,
+                                         macoblox_raw_start_y - macoblox_raw_last_y);
         }
         // Delta mode: no restore warp. The pointer sits on the anchor (it is
         // recentred after every event), and Darling's mouseLocationOutsideOfEventStream
@@ -3333,28 +3327,20 @@ static int macoblox_consume_warp_motion(id event) {
 
 static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
     (void)dx; (void)dy;
+    id window = macoblox_lock_window();
+    if (!window)
+        return 0;
+    MacOBloxPoint center = macoblox_window_center(window);
     MacOBloxPoint location = macoblox_real_event_location(event);
-    // Virtual raw input: the pointer is recentred on the anchor after every
-    // event, so it never drifts further than one movement and deltas keep
-    // flowing near screen edges. Events reach this point in queue order, so
-    // the motion right after a recentring warp is the warp's own: it lands
-    // exactly on the anchor, while a real movement lands off it. Dropping it
-    // here (not at the X level) - the warp is issued in this call, and the
-    // X-level drop raced the event queue and ate real movements.
-    if (macoblox_anchor_warp_pending) {
-        macoblox_anchor_warp_pending = 0;
-        double wx = location.x - macoblox_lock_anchor.x,
-               wy = location.y - macoblox_lock_anchor.y;
-        if (wx * wx + wy * wy < 2.25)
-            return 1;
-    }
-    double ox = location.x - macoblox_lock_anchor.x, oy = location.y - macoblox_lock_anchor.y;
-    if (macoblox_lock_anchor_pending)
-        macoblox_lock_anchor_pending = 0;
-    if (ox || oy) {
-        macoblox_warp_pointer_by(-ox, -oy);
-        macoblox_anchor_warp_pending = 1;
-    }
+    // Any motion that places the pointer exactly at the window center is
+    // our own recentring warp: drop it so the service return does not turn
+    // the camera. A real movement places the pointer off-center.
+    double cx = location.x - center.x, cy = location.y - center.y;
+    if (cx * cx + cy * cy < 4.0)
+        return 1;
+    // Always warp back to the exact center: the pointer stays in the middle
+    // of the window, never reaches the screen edges, and deltas never die.
+    macoblox_warp_to_window_center();
     return 0;
 }
 
@@ -4458,15 +4444,6 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             }
             write_str(macoblox_pointer_grabbed ? " locked\n" : "\n");
         }
-    }
-    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
-        !macoblox_raw_mouse_active && macoblox_anchor_warp_pending) {
-        /* The recentring warp's own motion. The pending mark is set before
-         * the warp request is flushed (see macoblox_warp_pointer_by), so the
-         * pump reads it in time; X delivers the warp's motion right after
-         * the real one that caused it. */
-        macoblox_anchor_warp_pending = 0;
-        return;
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
