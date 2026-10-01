@@ -2090,17 +2090,10 @@ static void hooked_app_finish_launching(id self, SEL cmd) {
     }
 }
 
-// Swizzle NSApplication terminate: and replyToApplicationShouldTerminate:
+// Swizzle NSApplication terminate:
 // The launcher watches MACOBLOX_QUIT_SENTINEL: the file's existence means the
 // user asked to quit, so the session can end without waiting for Roblox's
 // whole teardown (network closes, telemetry) to finish.
-//
-// NOTE: terminate: is called by Cocotron's _checkForTerminate on every run loop
-// tick whenever windows are temporarily hidden (such as during place loading /
-// replaceDataModel). Cocotron asks Roblox's delegate applicationShouldTerminate:,
-// which returns NSTerminateCancel (0), causing replyToApplicationShouldTerminate: NO.
-// Therefore, the quit sentinel must ONLY be written when termination is actually
-// approved (replyToApplicationShouldTerminate: YES), never prematurely in terminate:.
 static void macoblox_write_quit_sentinel(void) {
     const char* path = getenv("MACOBLOX_QUIT_SENTINEL");
     if (!path || !path[0])
@@ -2112,40 +2105,16 @@ static void macoblox_write_quit_sentinel(void) {
     write_str("[MacOBlox] Quit sentinel written\n");
 }
 static void hooked_app_check_for_terminate(id self, SEL _cmd) {
-    // No-op. Cocotron calls _checkForTerminate on every run loop iteration.
-    // When returning from a game to the menu (or when loading into a place),
-    // windows are temporarily hidden or unmapped for a few frames.
-    // Cocotron mistakenly calls [self terminate: self], which prompts Roblox's
-    // delegate to terminate the game while in the menu.
-    // Real macOS AppKit has no such method and never terminates on hidden windows.
+    // No-op: Cocotron's _checkForTerminate calls [self terminate: self] whenever
+    // windows are temporarily hidden (place load, return to menu).
 }
-
 static void (*orig_app_terminate)(id self, SEL _cmd, id sender) = 0;
 static void hooked_app_terminate(id self, SEL _cmd, id sender) {
-    write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called, sender: ");
-    write_str(sender ? object_getClassName(sender) : "(nil)");
-    write_str("\nBacktrace:\n");
+    write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called!\nBacktrace:\n");
     print_backtrace();
-    if (sender == self) {
-        // Cocotron's own _checkForTerminate: not a user ask to quit.
-        write_str("[MacOBlox Hook] Ignoring self-initiated terminate:\n");
-        return;
-    }
-    // A real quit request (Quit menu item, Cmd+Q): the session can end.
-    macoblox_write_quit_sentinel();
-    orig_app_terminate(self, _cmd, sender);
-}
-
-static void (*orig_app_replyToApplicationShouldTerminate)(id self, SEL _cmd, signed char shouldTerminate) = 0;
-static void hooked_app_replyToApplicationShouldTerminate(id self, SEL _cmd, signed char shouldTerminate) {
-    write_str("\n[MacOBlox Hook] -[NSApplication replyToApplicationShouldTerminate:] called with: ");
-    write_str(shouldTerminate ? "YES\n" : "NO\n");
-    if (shouldTerminate) {
+    if (sender != self)
         macoblox_write_quit_sentinel();
-    }
-    if (orig_app_replyToApplicationShouldTerminate) {
-        orig_app_replyToApplicationShouldTerminate(self, _cmd, shouldTerminate);
-    }
+    orig_app_terminate(self, _cmd, sender);
 }
 
 // Swizzle NSApplication setDelegate:
@@ -2290,16 +2259,6 @@ static MacOBloxRect window_convert_rect_to_screen(id self, SEL cmd, MacOBloxRect
     rect.origin = ((MacOBloxPoint (*)(id, SEL, MacOBloxPoint))objc_msgSend)(
         self, sel_registerName("convertBaseToScreen:"), rect.origin);
     return rect;
-}
-
-static long window_number_at_point(id cls, SEL cmd, MacOBloxPoint point, long belowWindowNumber) {
-    (void)cls; (void)cmd; (void)point; (void)belowWindowNumber;
-    id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-    id keyWin = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
-    if (keyWin) {
-        return ((long (*)(id, SEL))objc_msgSend)(keyWin, sel_registerName("windowNumber"));
-    }
-    return 0;
 }
 
 // Darling exposes a deliberately small WebPreferences forwarding stub, but
@@ -2717,37 +2676,19 @@ extern int CGAssociateMouseAndMouseCursorPosition(unsigned int connected);
 extern int CGWarpMouseCursorPosition(MacOBloxPoint position);
 #define MACOBLOX_LOCK_RADIUS 100.0
 static volatile int macoblox_pointer_grabbed;
-static volatile int macoblox_drop_next_motion; // first motion after re-entering mid-lock
 static volatile int macoblox_drop_warp_motion;
 static int macoblox_warp_wait_events; // motion events seen since the warp
 static MacOBloxPoint macoblox_expected_warp_delta;
 static volatile long macoblox_associate_mouse_count;
 static MacOBloxPoint macoblox_lock_anchor;
 static volatile int macoblox_lock_anchor_pending;
-// Set right after a recentring warp: the next motion at the X level is the
-// warp's own and is dropped by order, not by delta matching (fast real
-// movement merges with the warp's motion and a matched delta would deliver
-// the whole service delta to the game as a camera spin).
-static volatile int macoblox_anchor_warp_pending;
-// Warps of the pointer (recentring during a lock, the restore on unlock)
-// produce real motion events; without a grab the lock filter does not see
-// them, and the game turns the camera by the service delta. Every warp
-// marks its expected delta here; such motions are consumed globally, lock
-// or not.
-static volatile int macoblox_global_warp_pending;
-static volatile int macoblox_global_warp_wait;
 
-static id macoblox_lock_window(void);
-static MacOBloxPoint macoblox_window_center(id window);
-
-// Warp the pointer to the window's exact center in X11 coordinates (dst_w = handle,
-// dst_x = w/2, dst_y = h/2). Absolute warp eliminates sign flips and coordinate
-// mismatch between Cocoa and X11: the pointer lands on the exact same pixel every time.
-static void macoblox_warp_to_window_center(void) {
+// Move the pointer by (dx, dy) window points (Cocoa axes, y up).
+static void macoblox_warp_pointer_by(double dx, double dy) {
     static int (*warp)(void*, unsigned long, unsigned long, int, int,
                        unsigned int, unsigned int, int, int);
     static int (*flush)(void*);
-    if (!warp || !flush) {
+    if (!warp) {
         warp = (int (*)(void*, unsigned long, unsigned long, int, int,
                         unsigned int, unsigned int, int, int))
             dlsym(RTLD_DEFAULT, "XWarpPointer");
@@ -2758,24 +2699,18 @@ static void macoblox_warp_to_window_center(void) {
     void* display = display_object
         ? ((void* (*)(id, SEL))objc_msgSend)(display_object, sel_registerName("display"))
         : 0;
-    id window = macoblox_lock_window();
-    unsigned long handle = window
-        ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle"))
-        : 0;
-    if (!warp || !display || !window || !handle)
+    int ix = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
+    int iy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
+    if (!warp || !display || (!ix && !iy))
         return;
-    extern void objc_msgSend_stret(void);
-    MacOBloxRect frame = ((MacOBloxRect (*)(id, SEL))objc_msgSend_stret)(
-        window, sel_registerName("frame"));
-    int cx = (int)(frame.size.width / 2.0);
-    int cy = (int)(frame.size.height / 2.0);
-    if (cx <= 0 || cy <= 0)
-        return;
-    // X11 coordinates: dst_w = handle, dst_x = cx, dst_y = cy.
-    warp(display, 0, handle, 0, 0, 0, 0, cx, cy);
-    macoblox_anchor_warp_pending = 1;
+    // X11 y grows downward.
+    warp(display, 0, 0, 0, 0, 0, 0, ix, -iy);
     if (flush)
         flush(display);
+    macoblox_expected_warp_delta.x = ix;
+    macoblox_expected_warp_delta.y = iy;
+    macoblox_warp_wait_events = 0;
+    macoblox_drop_warp_motion = 1;
 }
 
 static MacOBloxPoint macoblox_window_center(id window) {
@@ -2855,14 +2790,6 @@ extern int pipe(int[2]);
 extern long read(int, void*, unsigned long);
 static volatile int macoblox_cursor_wanted_hidden;
 static int macoblox_cursor_wake[2] = {-1, -1};
-// The game's cursor and window, set by the X11Cursor hook (game thread) and
-// applied by the worker on its own Xlib connection. X resources are
-// server-global, so a second connection can define them; Xlib calls for the
-// game's own display from another thread are what desynchronizes the
-// connection with its event pump.
-static volatile unsigned long macoblox_window_cursor;
-static volatile unsigned long macoblox_window_cursor_handle;
-static volatile int macoblox_window_cursor_dirty;
 static void* macoblox_xfixes_worker(void* unused) {
     (void)unused;
     if (!macoblox_raw_xfixes_open()) {
@@ -2870,19 +2797,6 @@ static void* macoblox_xfixes_worker(void* unused) {
         return 0;
     }
     write_str("[MacOBlox] XFixes ready for cursor hiding\n");
-    void* (*open_display)(const char*) =
-        (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
-    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
-        (unsigned long (*)(void*, unsigned long, unsigned long))
-            dlsym(RTLD_DEFAULT, "XDefineCursor");
-    int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
-                      unsigned long**, unsigned int*) =
-        (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
-                 unsigned long**, unsigned int*))dlsym(RTLD_DEFAULT, "XQueryTree");
-    int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
-    void* xlib_display = open_display ? open_display(0) : 0;
-    if (xlib_display && define_cursor)
-        write_str("[MacOBlox] Window cursor worker ready\n");
     int applied = 0;
     for (;;) {
         int wanted = macoblox_cursor_wanted_hidden;
@@ -2890,30 +2804,6 @@ static void* macoblox_xfixes_worker(void* unused) {
             macoblox_raw_xfixes_set_hidden(wanted);
             applied = wanted;
             continue; // it may have changed again meanwhile
-        }
-        if (macoblox_window_cursor_dirty) {
-            macoblox_window_cursor_dirty = 0;
-            unsigned long handle = macoblox_window_cursor_handle;
-            unsigned long cursor = macoblox_window_cursor;
-            if (handle && cursor && xlib_display && define_cursor && query_tree) {
-                define_cursor(xlib_display, handle, cursor);
-                // The GL subwindow (a child of the game window) carries the
-                // pointer; it keeps a default cursor unless set too. A fresh
-                // subwindow is covered by the next cursor the game sets.
-                unsigned long root, parent, *children = 0;
-                unsigned int count = 0;
-                if (query_tree(xlib_display, handle, &root, &parent,
-                               &children, &count) && children) {
-                    for (unsigned int index = 0; index < count; index++)
-                        define_cursor(xlib_display, children[index], cursor);
-                    if (free_data)
-                        free_data(children);
-                }
-                static volatile long defined;
-                if (__sync_add_and_fetch(&defined, 1) <= 3) {
-                    write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
-                }
-            }
         }
         char bytes[64];
         if (read(macoblox_cursor_wake[0], bytes, sizeof bytes) <= 0)
@@ -3211,34 +3101,23 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
                                            anchor.y != macoblox_lock_anchor.y;
             macoblox_lock_anchor = anchor;
         }
-        write_str("[MacOBlox Lock] anchor=");
-        print_num((long long)macoblox_lock_anchor.x);
-        write_str(",");
-        print_num((long long)macoblox_lock_anchor.y);
-        write_str(" window=");
-        print_num(window ? 1 : 0);
-        write_str("\n");
         macoblox_pointer_grabbed = 1;
         macoblox_set_x_cursor_hidden(1);
     } else {
         // Put the pointer back where the button was pressed, while it is
         // still hidden, then show it.
         macoblox_pointer_grabbed = 0;
+        id window = macoblox_lock_window();
         if (macoblox_raw_mouse_active && macoblox_raw_have_anchor) {
-            id display_object = ((id (*)(id, SEL))objc_msgSend)(
-                (id)objc_getClass("NSDisplay"), sel_registerName("currentDisplay"));
-            void* display = display_object
-                ? ((void* (*)(id, SEL))objc_msgSend)(display_object, sel_registerName("display"))
-                : 0;
-            if (display)
-                macoblox_warp_on_display(display,
-                                         macoblox_raw_start_x - macoblox_raw_last_x,
-                                         macoblox_raw_start_y - macoblox_raw_last_y);
+            // Darling saw no pointer motion during the lock; the event loop
+            // did (X coordinates, y down; the warp takes Cocoa's y up).
+            macoblox_warp_pointer_by(macoblox_raw_start_x - macoblox_raw_last_x,
+                                     macoblox_raw_last_y - macoblox_raw_start_y);
+        } else if (window) {
+            MacOBloxPoint location = macoblox_real_window_mouse_location(window);
+            macoblox_warp_pointer_by(macoblox_frozen_window_location.x - location.x,
+                                     macoblox_frozen_window_location.y - location.y);
         }
-        // Delta mode: no restore warp. The pointer sits on the anchor (it is
-        // recentred after every event), and Darling's mouseLocationOutsideOfEventStream
-        // speaks a different coordinate space - the "restore" built from it
-        // threw the cursor at the window edge. Unhide it where it is.
         macoblox_drop_warp_motion = 0;
         macoblox_set_x_cursor_hidden(0);
     }
@@ -3297,50 +3176,32 @@ static int macoblox_filter_locked_motion(id event) {
     return dropped;
 }
 
-// Consume the motion event of a pointer warp when the lock filter is not
-// running (the restore on unlock lands after the grab is gone): the game
-// would turn the camera by the service delta (phantom spins, the cursor
-// jumping around). While the lock owns the pointer, its own filter handles
-// warp motions - stepping in here first would stall its recentering.
-static int macoblox_consume_warp_motion(id event) {
-    if (!macoblox_global_warp_pending)
-        return 0;
-    if (macoblox_pointer_grabbed && !macoblox_raw_mouse_active)
-        return 0;
-    SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
-    double dx = orig_mouse_event_delta_x ? orig_mouse_event_delta_x(event, delta_x)
-        : ((double (*)(id, SEL))objc_msgSend)(event, delta_x);
-    double dy = orig_mouse_event_delta_y ? orig_mouse_event_delta_y(event, delta_y)
-        : ((double (*)(id, SEL))objc_msgSend)(event, delta_y);
-    double ex = macoblox_expected_warp_delta.x, ey = macoblox_expected_warp_delta.y;
-    if ((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey) <
-        0.25 * (ex * ex + ey * ey) + 4.0) {
-        macoblox_global_warp_pending = 0;
-        return 1;
-    }
-    // The warp's motion may have merged with real movement: give up after a
-    // few events, real ones must keep flowing.
-    if (++macoblox_global_warp_wait > 8)
-        macoblox_global_warp_pending = 0;
-    return 0;
-}
-
 static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
-    (void)dx; (void)dy;
-    id window = macoblox_lock_window();
-    if (!window)
-        return 0;
-    MacOBloxPoint center = macoblox_window_center(window);
-    MacOBloxPoint location = macoblox_real_event_location(event);
-    // Any motion that places the pointer exactly at the window center is
-    // our own recentring warp: drop it so the service return does not turn
-    // the camera. A real movement places the pointer off-center.
-    double cx = location.x - center.x, cy = location.y - center.y;
-    if (cx * cx + cy * cy < 4.0)
-        return 1;
-    // Always warp back to the exact center: the pointer stays in the middle
-    // of the window, never reaches the screen edges, and deltas never die.
-    macoblox_warp_to_window_center();
+    if (macoblox_drop_warp_motion) {
+        double ex = macoblox_expected_warp_delta.x, ey = macoblox_expected_warp_delta.y;
+        if ((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey) <
+            0.25 * (ex * ex + ey * ey) + 4.0) {
+            macoblox_drop_warp_motion = 0;
+            return 1;
+        }
+        // The warp's motion never came alone (lost, or merged with a fast
+        // movement): recentre again after a few events. Waiting for it
+        // forever stopped the recentring for the rest of the lock, until
+        // the pointer reached the screen edge and the camera stopped turning.
+        if (++macoblox_warp_wait_events > 8)
+            macoblox_drop_warp_motion = 0;
+    }
+    if (!macoblox_drop_warp_motion) {
+        MacOBloxPoint location = macoblox_real_event_location(event);
+        double ox = location.x - macoblox_lock_anchor.x, oy = location.y - macoblox_lock_anchor.y;
+        if (macoblox_lock_anchor_pending) {
+            macoblox_lock_anchor_pending = 0;
+            macoblox_warp_pointer_by(-ox, -oy);
+        } else if (ox > MACOBLOX_LOCK_RADIUS || ox < -MACOBLOX_LOCK_RADIUS ||
+                   oy > MACOBLOX_LOCK_RADIUS || oy < -MACOBLOX_LOCK_RADIUS) {
+            macoblox_warp_pointer_by(-ox, -oy);
+        }
+    }
     return 0;
 }
 
@@ -3421,13 +3282,10 @@ static double hooked_mouse_event_delta_y(id self, SEL cmd) {
 }
 
 // Scroll wheel APIs missing from Darling's NSEvent. X11 wheels report coarse
-// line deltas; macOS reports pixels for the same events (about 10 px per
-// line). Roblox's Universal App menu scrolls on the pixel deltas only, so
-// with line-scale values the wheel appeared dead there.
-#define MACOBLOX_SCROLL_LINE_PIXELS 25.0
+// line deltas, so they are never "precise".
 static MacOBloxBool event_has_precise_scrolling_deltas(id self, SEL cmd) {
     (void)self; (void)cmd;
-    return 1;
+    return 0;
 }
 static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
     (void)self; (void)cmd;
@@ -3436,12 +3294,12 @@ static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
 static double event_scrolling_delta_x(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaX"));
-    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
+    return d * macoblox_scroll_sensitivity();
 }
 static double event_scrolling_delta_y(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaY"));
-    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
+    return d * macoblox_scroll_sensitivity();
 }
 
 // Darling's -[X11Cursor initWithImage:hotPoint:] copies each pixel row with a
@@ -3725,38 +3583,6 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
     if (!cursor)
         return orig_x11_cursor_init_image(self, cmd, image, hot);
     *(unsigned long*)((char*)self + ivar_getOffset(cursor_ivar)) = cursor;
-
-    // Remember the cursor for the window-cursor worker (macoblox_xfixes_worker):
-    // X shows the window's cursor while the pointer is inside it and the system
-    // cursor when it leaves, which is what Roblox expects. The Xlib calls go to
-    // the worker's own connection and thread - calling Xlib for the game's
-    // display from whatever thread creates a cursor desynchronizes the
-    // connection with the event pump. The key window handle is read here, where
-    // AppKit is safe, and applied there.
-    unsigned long (*define_cursor_probe)(void*, unsigned long, unsigned long) =
-        (unsigned long (*)(void*, unsigned long, unsigned long))
-            dlsym(RTLD_DEFAULT, "XDefineCursor");
-    if (define_cursor_probe) {
-        id app = ((id (*)(id, SEL))objc_msgSend)(
-            (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-        id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
-        unsigned long handle = window
-            ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
-        if (handle) {
-            macoblox_window_cursor = cursor;
-            macoblox_window_cursor_handle = handle;
-            macoblox_window_cursor_dirty = 1;
-            macoblox_start_xfixes_worker();
-            if (macoblox_cursor_wake[1] >= 0)
-                write(macoblox_cursor_wake[1], "w", 1);
-            static volatile long reported;
-            if (__sync_add_and_fetch(&reported, 1) <= 3) {
-                write_str("[MacOBlox Cursor] Queued for the game window (handle ");
-                print_hex(handle);
-                write_str(")\n");
-            }
-        }
-    }
     return self;
 }
 
@@ -3870,9 +3696,6 @@ static void hooked_app_send_event(id self, SEL cmd, id event) {
             write_str(((signed char (*)(id, SEL))objc_msgSend)(event, sel_registerName("isARepeat")) ? " repeat\n" : "\n");
         }
         if ((type == 5 || type == 6 || type == 7 || type == 27) &&
-            macoblox_consume_warp_motion(event))
-            return;
-        if ((type == 5 || type == 6 || type == 7 || type == 27) &&
             macoblox_filter_locked_motion(event))
             return;
         unsigned long long event_mask = type < 64 ? 1ULL << type : 0;
@@ -3907,27 +3730,6 @@ static MacOBloxBool hooked_window_accepts_mouse_moved(id self, SEL cmd) {
     if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
         return 1;
     return orig_window_accepts_mouse_moved(self, cmd);
-}
-
-// The launcher ends the session as soon as the user asks to quit (the quit
-// sentinel; see macoblox_write_quit_sentinel). Closing the game window is
-// that ask: Roblox's own teardown would otherwise keep the process alive
-// for seconds after the window is gone, with the launcher still waiting.
-static void (*orig_window_close)(id, SEL) = 0;
-static void hooked_window_close(id self, SEL cmd) {
-    const char* class_name = object_getClassName(self);
-    if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
-        macoblox_write_quit_sentinel();
-    if (orig_window_close)
-        orig_window_close(self, cmd);
-}
-static void (*orig_window_perform_close)(id, SEL, id) = 0;
-static void hooked_window_perform_close(id self, SEL cmd, id sender) {
-    const char* class_name = object_getClassName(self);
-    if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
-        macoblox_write_quit_sentinel();
-    if (orig_window_perform_close)
-        orig_window_perform_close(self, cmd, sender);
 }
 
 // MACOBLOX_TRACE_EVENTS=1: log mouse events as AppKit dispatches them.
@@ -4447,42 +4249,6 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
-    if (type == 7 /* EnterNotify */ && macoblox_pointer_grabbed)
-        /* The pointer drifted out of the window during a mouse lock and came
-         * back. The first motion after it reports the whole distance from the
-         * exit point, which would fling the game camera: drop that one. */
-        macoblox_drop_next_motion = 1;
-    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
-        macoblox_drop_next_motion) {
-        macoblox_drop_next_motion = 0;
-        return;
-    }
-    if (type == 33 /* ClientMessage */) {
-        /* The window manager's WM_DELETE_WINDOW (the X button): the user is
-         * quitting. Roblox's own teardown can take a while (telemetry with
-         * 5 s timeouts), and Darling's Cocoa close path no longer reaches
-         * terminate:, so tell the launcher directly. XClientMessageEvent,
-         * LP64: window at 24, message_type atom at 32. */
-        static int (*atom_name)(void*, unsigned long, char**) = 0;
-        static int (*free_data)(void*) = 0;
-        if (!atom_name) {
-            atom_name = (int (*)(void*, unsigned long, char**))
-                dlsym(RTLD_DEFAULT, "XGetAtomName");
-            free_data = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
-        }
-        void* display = macoblox_x11_display_connection(self);
-        char* name = 0;
-        if (display && atom_name &&
-            atom_name(display, *(unsigned long*)((char*)event + 32), &name) && name) {
-            int is_delete = ascii_strings_equal(name, "WM_DELETE_WINDOW");
-            if (free_data)
-                free_data(name);
-            if (is_delete) {
-                write_str("[MacOBlox] Window close requested (WM_DELETE_WINDOW)\n");
-                macoblox_write_quit_sentinel();
-            }
-        }
-    }
     if (type == 6 /* MotionNotify */) {
         static int compression = -1;
         static int (*queued)(void*, int);
@@ -4498,8 +4264,7 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             compression = !macoblox_env_on("MACOBLOX_NO_MOTION_COMPRESSION") && queued && peek &&
                           display_offset >= 0;
         }
-        void* display = compression && !macoblox_drop_warp_motion &&
-                        !macoblox_pointer_grabbed ? *(void**)((char*)self + display_offset) : 0;
+        void* display = compression && !macoblox_drop_warp_motion ? *(void**)((char*)self + display_offset) : 0;
         if (display && queued(display, 0 /* QueuedAlready */) > 0) {
             unsigned char next[192];
             peek(display, next);
@@ -4634,20 +4399,6 @@ static void macoblox_install_late_hooks(void) {
                 (MacOBloxBool (*)(id, SEL))method_getImplementation(accepts);
             method_setImplementation(accepts, (IMP)hooked_window_accepts_mouse_moved);
             write_str("[MacOBlox] RBXWindow always accepts mouse-moved events\n");
-        }
-        Method wclose = class_getInstanceMethod(
-            objc_getClass("NSWindow"), sel_registerName("close"));
-        if (wclose) {
-            orig_window_close = (void (*)(id, SEL))method_getImplementation(wclose);
-            method_setImplementation(wclose, (IMP)hooked_window_close);
-            write_str("[MacOBlox] RBXWindow close writes the quit sentinel\n");
-        }
-        Method wperform = class_getInstanceMethod(
-            objc_getClass("NSWindow"), sel_registerName("performClose:"));
-        if (wperform) {
-            orig_window_perform_close =
-                (void (*)(id, SEL, id))method_getImplementation(wperform);
-            method_setImplementation(wperform, (IMP)hooked_window_perform_close);
         }
     }
     static volatile int button_number_hooked;
@@ -5657,15 +5408,6 @@ static void install_swizzles(void) {
                             (IMP)window_convert_rect_to_screen,
                             rect_conversion_types))
             write_str("[MacOBlox] Added NSWindow convertRectToScreen:\n");
-        SEL win_at_pt = sel_registerName("windowNumberAtPoint:belowWindowWithWindowNumber:");
-        Method mWinAtPt = class_getClassMethod(window_class, win_at_pt);
-        if (mWinAtPt) {
-            method_setImplementation(mWinAtPt, (IMP)window_number_at_point);
-        } else {
-            class_addMethod(object_getClass((id)window_class), win_at_pt,
-                            (IMP)window_number_at_point, "q@:{CGPoint=dd}q");
-        }
-        write_str("[MacOBlox] Implemented +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]\n");
     }
 
     Class ccls = objc_getClass("NSConcreteScanner");
@@ -5699,19 +5441,10 @@ static void install_swizzles(void) {
             method_setImplementation(mTerm, (IMP)hooked_app_terminate);
             write_str("[MacOBlox] Hooked NSApplication terminate:\n");
         }
-        Method mCheck = class_getInstanceMethod(
-            appCls, sel_registerName("_checkForTerminate"));
+        Method mCheck = class_getInstanceMethod(appCls, sel_registerName("_checkForTerminate"));
         if (mCheck) {
             method_setImplementation(mCheck, (IMP)hooked_app_check_for_terminate);
             write_str("[MacOBlox] Neutralized NSApplication _checkForTerminate\n");
-        }
-        Method mReply = class_getInstanceMethod(
-            appCls, sel_registerName("replyToApplicationShouldTerminate:"));
-        if (mReply) {
-            orig_app_replyToApplicationShouldTerminate =
-                (void (*)(id, SEL, signed char))method_getImplementation(mReply);
-            method_setImplementation(mReply, (IMP)hooked_app_replyToApplicationShouldTerminate);
-            write_str("[MacOBlox] Hooked NSApplication replyToApplicationShouldTerminate:\n");
         }
         Method mDel = class_getInstanceMethod(appCls, sel_registerName("setDelegate:"));
         if (mDel) {
