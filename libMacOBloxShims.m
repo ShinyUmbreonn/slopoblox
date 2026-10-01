@@ -2717,6 +2717,7 @@ extern int CGAssociateMouseAndMouseCursorPosition(unsigned int connected);
 extern int CGWarpMouseCursorPosition(MacOBloxPoint position);
 #define MACOBLOX_LOCK_RADIUS 100.0
 static volatile int macoblox_pointer_grabbed;
+static volatile int macoblox_drop_next_motion; // first motion after re-entering mid-lock
 static volatile int macoblox_drop_warp_motion;
 static int macoblox_warp_wait_events; // motion events seen since the warp
 static MacOBloxPoint macoblox_expected_warp_delta;
@@ -2831,6 +2832,14 @@ extern int pipe(int[2]);
 extern long read(int, void*, unsigned long);
 static volatile int macoblox_cursor_wanted_hidden;
 static int macoblox_cursor_wake[2] = {-1, -1};
+// The game's cursor and window, set by the X11Cursor hook (game thread) and
+// applied by the worker on its own Xlib connection. X resources are
+// server-global, so a second connection can define them; Xlib calls for the
+// game's own display from another thread are what desynchronizes the
+// connection with its event pump.
+static volatile unsigned long macoblox_window_cursor;
+static volatile unsigned long macoblox_window_cursor_handle;
+static volatile int macoblox_window_cursor_dirty;
 static void* macoblox_xfixes_worker(void* unused) {
     (void)unused;
     if (!macoblox_raw_xfixes_open()) {
@@ -2838,6 +2847,19 @@ static void* macoblox_xfixes_worker(void* unused) {
         return 0;
     }
     write_str("[MacOBlox] XFixes ready for cursor hiding\n");
+    void* (*open_display)(const char*) =
+        (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
+    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
+        (unsigned long (*)(void*, unsigned long, unsigned long))
+            dlsym(RTLD_DEFAULT, "XDefineCursor");
+    int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
+                      unsigned long**, unsigned int*) =
+        (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
+                 unsigned long**, unsigned int*))dlsym(RTLD_DEFAULT, "XQueryTree");
+    int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
+    void* xlib_display = open_display ? open_display(0) : 0;
+    if (xlib_display && define_cursor)
+        write_str("[MacOBlox] Window cursor worker ready\n");
     int applied = 0;
     for (;;) {
         int wanted = macoblox_cursor_wanted_hidden;
@@ -2845,6 +2867,30 @@ static void* macoblox_xfixes_worker(void* unused) {
             macoblox_raw_xfixes_set_hidden(wanted);
             applied = wanted;
             continue; // it may have changed again meanwhile
+        }
+        if (macoblox_window_cursor_dirty) {
+            macoblox_window_cursor_dirty = 0;
+            unsigned long handle = macoblox_window_cursor_handle;
+            unsigned long cursor = macoblox_window_cursor;
+            if (handle && cursor && xlib_display && define_cursor && query_tree) {
+                define_cursor(xlib_display, handle, cursor);
+                // The GL subwindow (a child of the game window) carries the
+                // pointer; it keeps a default cursor unless set too. A fresh
+                // subwindow is covered by the next cursor the game sets.
+                unsigned long root, parent, *children = 0;
+                unsigned int count = 0;
+                if (query_tree(xlib_display, handle, &root, &parent,
+                               &children, &count) && children) {
+                    for (unsigned int index = 0; index < count; index++)
+                        define_cursor(xlib_display, children[index], cursor);
+                    if (free_data)
+                        free_data(children);
+                }
+                static volatile long defined;
+                if (__sync_add_and_fetch(&defined, 1) <= 3) {
+                    write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
+                }
+            }
         }
         char bytes[64];
         if (read(macoblox_cursor_wake[0], bytes, sizeof bytes) <= 0)
@@ -3628,39 +3674,34 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
         return orig_x11_cursor_init_image(self, cmd, image, hot);
     *(unsigned long*)((char*)self + ivar_getOffset(cursor_ivar)) = cursor;
 
-    // Make the cursor stick to the game window: X shows the window's cursor
-    // while the pointer is inside it and the system cursor when it leaves,
-    // which is what Roblox's menu expects. Darling defines no window cursor,
-    // so the system arrow used to show everywhere. The pointer is over the
-    // GL subwindow (a child of the game window), which carries its own
-    // (default) cursor unless set too, so define on the children as well.
-    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
+    // Remember the cursor for the window-cursor worker (macoblox_xfixes_worker):
+    // X shows the window's cursor while the pointer is inside it and the system
+    // cursor when it leaves, which is what Roblox expects. The Xlib calls go to
+    // the worker's own connection and thread - calling Xlib for the game's
+    // display from whatever thread creates a cursor desynchronizes the
+    // connection with the event pump. The key window handle is read here, where
+    // AppKit is safe, and applied there.
+    unsigned long (*define_cursor_probe)(void*, unsigned long, unsigned long) =
         (unsigned long (*)(void*, unsigned long, unsigned long))
             dlsym(RTLD_DEFAULT, "XDefineCursor");
-    int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
-                      unsigned long**, unsigned int*) =
-        (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
-                 unsigned long**, unsigned int*))dlsym(RTLD_DEFAULT, "XQueryTree");
-    int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
-    if (define_cursor && query_tree) {
+    if (define_cursor_probe) {
         id app = ((id (*)(id, SEL))objc_msgSend)(
             (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
         id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
         unsigned long handle = window
             ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
         if (handle) {
-            define_cursor(display, handle, cursor);
-            unsigned long root, parent, *children = 0;
-            unsigned int count = 0;
-            if (query_tree(display, handle, &root, &parent, &children, &count) && children) {
-                for (unsigned int index = 0; index < count; index++)
-                    define_cursor(display, children[index], cursor);
-                if (free_data)
-                    free_data(children);
-            }
-            static volatile long defined;
-            if (__sync_add_and_fetch(&defined, 1) <= 3) {
-                write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
+            macoblox_window_cursor = cursor;
+            macoblox_window_cursor_handle = handle;
+            macoblox_window_cursor_dirty = 1;
+            macoblox_start_xfixes_worker();
+            if (macoblox_cursor_wake[1] >= 0)
+                write(macoblox_cursor_wake[1], "w", 1);
+            static volatile long reported;
+            if (__sync_add_and_fetch(&reported, 1) <= 3) {
+                write_str("[MacOBlox Cursor] Queued for the game window (handle ");
+                print_hex(handle);
+                write_str(")\n");
             }
         }
     }
@@ -4351,6 +4392,16 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
+    if (type == 7 /* EnterNotify */ && macoblox_pointer_grabbed)
+        /* The pointer drifted out of the window during a mouse lock and came
+         * back. The first motion after it reports the whole distance from the
+         * exit point, which would fling the game camera: drop that one. */
+        macoblox_drop_next_motion = 1;
+    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
+        macoblox_drop_next_motion) {
+        macoblox_drop_next_motion = 0;
+        return;
+    }
     if (type == 33 /* ClientMessage */) {
         /* The window manager's WM_DELETE_WINDOW (the X button): the user is
          * quitting. Roblox's own teardown can take a while (telemetry with
