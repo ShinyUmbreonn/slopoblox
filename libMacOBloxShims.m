@@ -3306,12 +3306,21 @@ static int macoblox_consume_warp_motion(id event) {
 
 static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
     (void)dx; (void)dy;
-    // Virtual raw input: recentre the pointer on the anchor after every
-    // event. It then never drifts further than one movement, so deltas keep
-    // flowing near screen edges (the old 100 px fence let the pointer reach
-    // the edge, where no more motions come and the camera dies). The
-    // recentring motion itself is dropped by order at the X level.
     MacOBloxPoint location = macoblox_real_event_location(event);
+    // Virtual raw input: the pointer is recentred on the anchor after every
+    // event, so it never drifts further than one movement and deltas keep
+    // flowing near screen edges. Events reach this point in queue order, so
+    // the motion right after a recentring warp is the warp's own: it lands
+    // exactly on the anchor, while a real movement lands off it. Dropping it
+    // here (not at the X level) - the warp is issued in this call, and the
+    // X-level drop raced the event queue and ate real movements.
+    if (macoblox_anchor_warp_pending) {
+        macoblox_anchor_warp_pending = 0;
+        double wx = location.x - macoblox_lock_anchor.x,
+               wy = location.y - macoblox_lock_anchor.y;
+        if (wx * wx + wy * wy < 2.25)
+            return 1;
+    }
     double ox = location.x - macoblox_lock_anchor.x, oy = location.y - macoblox_lock_anchor.y;
     if (macoblox_lock_anchor_pending)
         macoblox_lock_anchor_pending = 0;
@@ -4422,15 +4431,6 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             }
             write_str(macoblox_pointer_grabbed ? " locked\n" : "\n");
         }
-    }
-    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
-        !macoblox_raw_mouse_active && macoblox_anchor_warp_pending) {
-        /* The recentring warp's own motion: X delivers it right after the
-         * real one that triggered the warp. Dropping by order instead of by
-         * delta: a fast real movement merged into the same event would
-         * otherwise smuggle the service delta to the game. */
-        macoblox_anchor_warp_pending = 0;
-        return;
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
