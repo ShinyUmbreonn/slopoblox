@@ -2759,6 +2759,11 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
         return;
     // X11 y grows downward.
     warp(display, 0, 0, 0, 0, 0, 0, ix, -iy);
+    // The recentering motion is dropped by order at the X level; mark it
+    // before the flush so the pump cannot read the warp's motion before the
+    // flag is up (a late mark let the service delta reach the game as a
+    // camera jerk).
+    macoblox_anchor_warp_pending = 1;
     if (flush)
         flush(display);
     macoblox_expected_warp_delta.x = ix;
@@ -4431,6 +4436,15 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             }
             write_str(macoblox_pointer_grabbed ? " locked\n" : "\n");
         }
+    }
+    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
+        !macoblox_raw_mouse_active && macoblox_anchor_warp_pending) {
+        /* The recentring warp's own motion. The pending mark is set before
+         * the warp request is flushed (see macoblox_warp_pointer_by), so the
+         * pump reads it in time; X delivers the warp's motion right after
+         * the real one that caused it. */
+        macoblox_anchor_warp_pending = 0;
+        return;
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
