@@ -53,20 +53,12 @@ static int macoblox_connectx(int fd, const sa_endpoints_t *endpoints, unsigned i
         return -1;
 
     int result = connect(fd, endpoints->dstaddr, endpoints->dstaddrlen);
-    if (result < 0) {
-        if (*__error() != EINPROGRESS)
-            return -1;
-
-        /*
-         * Non-blocking sockets are allowed to report EINPROGRESS.
-         * Keep the connection attempt alive instead of treating it
-         * as an immediate failure (same semantics as real connectx
-         * / connect on macOS).
-         */
-        if (connid)
-            *connid = 1;
-        return 0;
-    }
+    /* EINPROGRESS must reach the caller as -1/errno too: it means the
+     * caller still needs to wait for writability and check SO_ERROR.
+     * Returning success here skips that asynchronous connection path and
+     * also claims completion without sending any initial data. */
+    if (result < 0)
+        return -1;
 
     if (connid)
         *connid = 1;
