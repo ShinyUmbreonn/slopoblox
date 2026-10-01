@@ -2127,9 +2127,12 @@ static void hooked_app_terminate(id self, SEL _cmd, id sender) {
     write_str("\nBacktrace:\n");
     print_backtrace();
     if (sender == self) {
+        // Cocotron's own _checkForTerminate: not a user ask to quit.
         write_str("[MacOBlox Hook] Ignoring self-initiated terminate:\n");
         return;
     }
+    // A real quit request (Quit menu item, Cmd+Q): the session can end.
+    macoblox_write_quit_sentinel();
     orig_app_terminate(self, _cmd, sender);
 }
 
@@ -3624,6 +3627,43 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
     if (!cursor)
         return orig_x11_cursor_init_image(self, cmd, image, hot);
     *(unsigned long*)((char*)self + ivar_getOffset(cursor_ivar)) = cursor;
+
+    // Make the cursor stick to the game window: X shows the window's cursor
+    // while the pointer is inside it and the system cursor when it leaves,
+    // which is what Roblox's menu expects. Darling defines no window cursor,
+    // so the system arrow used to show everywhere. The pointer is over the
+    // GL subwindow (a child of the game window), which carries its own
+    // (default) cursor unless set too, so define on the children as well.
+    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
+        (unsigned long (*)(void*, unsigned long, unsigned long))
+            dlsym(RTLD_DEFAULT, "XDefineCursor");
+    int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
+                      unsigned long**, unsigned int*) =
+        (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
+                 unsigned long**, unsigned int*))dlsym(RTLD_DEFAULT, "XQueryTree");
+    int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
+    if (define_cursor && query_tree) {
+        id app = ((id (*)(id, SEL))objc_msgSend)(
+            (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+        id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
+        unsigned long handle = window
+            ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
+        if (handle) {
+            define_cursor(display, handle, cursor);
+            unsigned long root, parent, *children = 0;
+            unsigned int count = 0;
+            if (query_tree(display, handle, &root, &parent, &children, &count) && children) {
+                for (unsigned int index = 0; index < count; index++)
+                    define_cursor(display, children[index], cursor);
+                if (free_data)
+                    free_data(children);
+            }
+            static volatile long defined;
+            if (__sync_add_and_fetch(&defined, 1) <= 3) {
+                write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
+            }
+        }
+    }
     return self;
 }
 
@@ -3771,6 +3811,27 @@ static MacOBloxBool hooked_window_accepts_mouse_moved(id self, SEL cmd) {
     if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
         return 1;
     return orig_window_accepts_mouse_moved(self, cmd);
+}
+
+// The launcher ends the session as soon as the user asks to quit (the quit
+// sentinel; see macoblox_write_quit_sentinel). Closing the game window is
+// that ask: Roblox's own teardown would otherwise keep the process alive
+// for seconds after the window is gone, with the launcher still waiting.
+static void (*orig_window_close)(id, SEL) = 0;
+static void hooked_window_close(id self, SEL cmd) {
+    const char* class_name = object_getClassName(self);
+    if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
+        macoblox_write_quit_sentinel();
+    if (orig_window_close)
+        orig_window_close(self, cmd);
+}
+static void (*orig_window_perform_close)(id, SEL, id) = 0;
+static void hooked_window_perform_close(id self, SEL cmd, id sender) {
+    const char* class_name = object_getClassName(self);
+    if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
+        macoblox_write_quit_sentinel();
+    if (orig_window_perform_close)
+        orig_window_perform_close(self, cmd, sender);
 }
 
 // MACOBLOX_TRACE_EVENTS=1: log mouse events as AppKit dispatches them.
@@ -4290,6 +4351,32 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
+    if (type == 33 /* ClientMessage */) {
+        /* The window manager's WM_DELETE_WINDOW (the X button): the user is
+         * quitting. Roblox's own teardown can take a while (telemetry with
+         * 5 s timeouts), and Darling's Cocoa close path no longer reaches
+         * terminate:, so tell the launcher directly. XClientMessageEvent,
+         * LP64: window at 24, message_type atom at 32. */
+        static int (*atom_name)(void*, unsigned long, char**) = 0;
+        static int (*free_data)(void*) = 0;
+        if (!atom_name) {
+            atom_name = (int (*)(void*, unsigned long, char**))
+                dlsym(RTLD_DEFAULT, "XGetAtomName");
+            free_data = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
+        }
+        void* display = macoblox_x11_display_connection(self);
+        char* name = 0;
+        if (display && atom_name &&
+            atom_name(display, *(unsigned long*)((char*)event + 32), &name) && name) {
+            int is_delete = ascii_strings_equal(name, "WM_DELETE_WINDOW");
+            if (free_data)
+                free_data(name);
+            if (is_delete) {
+                write_str("[MacOBlox] Window close requested (WM_DELETE_WINDOW)\n");
+                macoblox_write_quit_sentinel();
+            }
+        }
+    }
     if (type == 6 /* MotionNotify */) {
         static int compression = -1;
         static int (*queued)(void*, int);
@@ -4440,6 +4527,20 @@ static void macoblox_install_late_hooks(void) {
                 (MacOBloxBool (*)(id, SEL))method_getImplementation(accepts);
             method_setImplementation(accepts, (IMP)hooked_window_accepts_mouse_moved);
             write_str("[MacOBlox] RBXWindow always accepts mouse-moved events\n");
+        }
+        Method wclose = class_getInstanceMethod(
+            objc_getClass("NSWindow"), sel_registerName("close"));
+        if (wclose) {
+            orig_window_close = (void (*)(id, SEL))method_getImplementation(wclose);
+            method_setImplementation(wclose, (IMP)hooked_window_close);
+            write_str("[MacOBlox] RBXWindow close writes the quit sentinel\n");
+        }
+        Method wperform = class_getInstanceMethod(
+            objc_getClass("NSWindow"), sel_registerName("performClose:"));
+        if (wperform) {
+            orig_window_perform_close =
+                (void (*)(id, SEL, id))method_getImplementation(wperform);
+            method_setImplementation(wperform, (IMP)hooked_window_perform_close);
         }
     }
     static volatile int button_number_hooked;
