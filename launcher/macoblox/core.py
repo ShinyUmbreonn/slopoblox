@@ -449,6 +449,23 @@ def ensure_raknet_transport():
             "DFFlagRakNetFallbackToRbxTransportStatus": "False",
             "DFFlagConnectDummyServiceClientEarly": "False",
             "DFIntRbxTransportClientConnectionWaitIntervalMs": 0,
+            # Disable client-side HTTP throttling and retry queues (which freeze
+            # menu return for 5-6 s when batch thumbnails get throttled).
+            "DFFlagHttpLocalThrottle": "False",
+            "FFlagHttpLocalThrottle": "False",
+            "DFIntHttpMaxRetries": 0,
+            "DFIntHttpMaxRetryAfterSec": 0,
+            "DFIntHttpRbxApiMaxThrottledQueueSize": 0,
+            "DFIntHttpRetryAndLocalThrottleJitterMaxPercent": 0,
+            "DFFlagHttpRetryOnExplicitHeader": "False",
+            "DFFlagDebugSlimLoaderDisableHTTPRetry": "True",
+            "FFlagDebugSlimLoaderDisableHTTPRetry": "True",
+            "DFIntBatchThumbnailMaxWaitMs": 0,
+            "DFIntBatchThumbnailMinWaitMs": 0,
+            "DFIntBatchThumbnailExponentialInitialWaitMs": 0,
+            "DFIntBatchThumbnailMaxExponentialRetries": 0,
+            "DFIntBatchThumbnailAllowedExternalTimedOutRetries": 0,
+            "DFIntLuaAppThumbnailsApiRetryTimeMultiplier": 0,
         }
         changed = False
         for k, v in needed.items():
