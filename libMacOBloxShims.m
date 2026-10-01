@@ -1236,6 +1236,11 @@ static int macoblox_is_blocked_telemetry(const char* node) {
         return 1;
     if (len >= 18 && ascii_strings_equal(node + len - 18, ".pulsar.roblox.com"))
         return 1;
+    // LMS latency measurement probes (lms-*.roblox.com) return 503 and block the network queue in retries for 5s:
+    if (len >= 15 && ascii_strings_equal(node + len - 11, ".roblox.com")) {
+        if (node[0] == 'l' && node[1] == 'm' && node[2] == 's' && node[3] == '-')
+            return 1;
+    }
     return 0;
 }
 static int macoblox_getaddrinfo(const char* node, const char* service,
@@ -2288,9 +2293,19 @@ static MacOBloxRect window_convert_rect_to_screen(id self, SEL cmd, MacOBloxRect
 static long window_number_at_point(id cls, SEL cmd, MacOBloxPoint point, long belowWindowNumber) {
     (void)cls; (void)cmd; (void)point; (void)belowWindowNumber;
     id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-    id keyWin = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
-    if (keyWin) {
-        return ((long (*)(id, SEL))objc_msgSend)(keyWin, sel_registerName("windowNumber"));
+    id win = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
+    if (!win && app)
+        win = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("mainWindow"));
+    if (!win && app) {
+        id windows = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("windows"));
+        if (windows && ((unsigned long (*)(id, SEL))objc_msgSend)(windows, sel_registerName("count")) > 0)
+            win = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), 0);
+    }
+    if (win) {
+        if (!((MacOBloxBool (*)(id, SEL))objc_msgSend)(win, sel_registerName("isKeyWindow"))) {
+            ((void (*)(id, SEL, id))objc_msgSend)(win, sel_registerName("makeKeyAndOrderFront:"), (id)0);
+        }
+        return ((long (*)(id, SEL))objc_msgSend)(win, sel_registerName("windowNumber"));
     }
     return 0;
 }
@@ -2825,6 +2840,9 @@ extern int pipe(int[2]);
 extern long read(int, void*, unsigned long);
 static volatile int macoblox_cursor_wanted_hidden;
 static int macoblox_cursor_wake[2] = {-1, -1};
+static volatile unsigned long macoblox_window_cursor;
+static volatile unsigned long macoblox_window_cursor_handle;
+static volatile int macoblox_window_cursor_dirty;
 static void* macoblox_xfixes_worker(void* unused) {
     (void)unused;
     if (!macoblox_raw_xfixes_open()) {
@@ -2832,6 +2850,19 @@ static void* macoblox_xfixes_worker(void* unused) {
         return 0;
     }
     write_str("[MacOBlox] XFixes ready for cursor hiding\n");
+    void* (*open_display)(const char*) =
+        (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
+    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
+        (unsigned long (*)(void*, unsigned long, unsigned long))
+            dlsym(RTLD_DEFAULT, "XDefineCursor");
+    int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
+                      unsigned long**, unsigned int*) =
+        (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
+                 unsigned long**, unsigned int*))dlsym(RTLD_DEFAULT, "XQueryTree");
+    int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
+    void* xlib_display = open_display ? open_display(0) : 0;
+    if (xlib_display && define_cursor)
+        write_str("[MacOBlox] Window cursor worker ready\n");
     int applied = 0;
     for (;;) {
         int wanted = macoblox_cursor_wanted_hidden;
@@ -2839,6 +2870,27 @@ static void* macoblox_xfixes_worker(void* unused) {
             macoblox_raw_xfixes_set_hidden(wanted);
             applied = wanted;
             continue; // it may have changed again meanwhile
+        }
+        if (macoblox_window_cursor_dirty) {
+            macoblox_window_cursor_dirty = 0;
+            unsigned long handle = macoblox_window_cursor_handle;
+            unsigned long cursor = macoblox_window_cursor;
+            if (handle && cursor && xlib_display && define_cursor && query_tree) {
+                define_cursor(xlib_display, handle, cursor);
+                unsigned long root, parent, *children = 0;
+                unsigned int count = 0;
+                if (query_tree(xlib_display, handle, &root, &parent,
+                               &children, &count) && children) {
+                    for (unsigned int index = 0; index < count; index++)
+                        define_cursor(xlib_display, children[index], cursor);
+                    if (free_data)
+                        free_data(children);
+                }
+                static volatile long defined;
+                if (__sync_add_and_fetch(&defined, 1) <= 3) {
+                    write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
+                }
+            }
         }
         char bytes[64];
         if (read(macoblox_cursor_wake[0], bytes, sizeof bytes) <= 0)
@@ -3625,6 +3677,33 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
     if (!cursor)
         return orig_x11_cursor_init_image(self, cmd, image, hot);
     *(unsigned long*)((char*)self + ivar_getOffset(cursor_ivar)) = cursor;
+
+    unsigned long (*define_cursor_probe)(void*, unsigned long, unsigned long) =
+        (unsigned long (*)(void*, unsigned long, unsigned long))
+            dlsym(RTLD_DEFAULT, "XDefineCursor");
+    if (define_cursor_probe) {
+        id app = ((id (*)(id, SEL))objc_msgSend)(
+            (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+        id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
+        if (!window && app)
+            window = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("mainWindow"));
+        unsigned long handle = window
+            ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
+        if (handle) {
+            macoblox_window_cursor = cursor;
+            macoblox_window_cursor_handle = handle;
+            macoblox_window_cursor_dirty = 1;
+            macoblox_start_xfixes_worker();
+            if (macoblox_cursor_wake[1] >= 0)
+                write(macoblox_cursor_wake[1], "w", 1);
+            static volatile long reported;
+            if (__sync_add_and_fetch(&reported, 1) <= 3) {
+                write_str("[MacOBlox Cursor] Queued for the game window (handle ");
+                print_hex(handle);
+                write_str(")\n");
+            }
+        }
+    }
     return self;
 }
 
@@ -3768,10 +3847,8 @@ static void hooked_app_send_event(id self, SEL cmd, id event) {
 // Darling does not deliver here, so the Roblox window always accepts them.
 static MacOBloxBool (*orig_window_accepts_mouse_moved)(id, SEL) = 0;
 static MacOBloxBool hooked_window_accepts_mouse_moved(id self, SEL cmd) {
-    const char* class_name = object_getClassName(self);
-    if (class_name && ascii_strings_equal(class_name, "RBXWindow"))
-        return 1;
-    return orig_window_accepts_mouse_moved(self, cmd);
+    (void)self; (void)cmd;
+    return 1;
 }
 
 // The launcher ends the session as soon as the user asks to quit (the quit
