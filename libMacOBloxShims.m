@@ -2742,7 +2742,9 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
     static int (*warp)(void*, unsigned long, unsigned long, int, int,
                        unsigned int, unsigned int, int, int);
     static int (*flush)(void*);
-    if (!warp) {
+    // A failed lookup is not cached: libX11 may load with Darling's backend
+    // after the first lock.
+    if (!warp || !flush) {
         warp = (int (*)(void*, unsigned long, unsigned long, int, int,
                         unsigned int, unsigned int, int, int))
             dlsym(RTLD_DEFAULT, "XWarpPointer");
@@ -2755,8 +2757,21 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
         : 0;
     int ix = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int iy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
-    if (!warp || !display || (!ix && !iy))
+    if (!warp || !display || (!ix && !iy)) {
+        static volatile long failures;
+        if (__sync_add_and_fetch(&failures, 1) <= 5) {
+            write_str("[MacOBlox Lock] Warp unavailable: warp=");
+            print_num(warp ? 1 : 0);
+            write_str(" display=");
+            print_num(display ? 1 : 0);
+            write_str(" move=");
+            print_num(ix);
+            write_str(",");
+            print_num(iy);
+            write_str("\n");
+        }
         return;
+    }
     // X11 y grows downward.
     warp(display, 0, 0, 0, 0, 0, 0, ix, -iy);
     // The recentering motion is dropped by order at the X level; mark it
@@ -3207,6 +3222,13 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
                                            anchor.y != macoblox_lock_anchor.y;
             macoblox_lock_anchor = anchor;
         }
+        write_str("[MacOBlox Lock] anchor=");
+        print_num((long long)macoblox_lock_anchor.x);
+        write_str(",");
+        print_num((long long)macoblox_lock_anchor.y);
+        write_str(" window=");
+        print_num(window ? 1 : 0);
+        write_str("\n");
         macoblox_pointer_grabbed = 1;
         macoblox_set_x_cursor_hidden(1);
     } else {
