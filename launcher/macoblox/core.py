@@ -430,6 +430,12 @@ def ensure_raknet_transport():
             "FFlagUseRbxTransportServer": "False",
             "FFlagShareRbxTransport": "False",
             "FFlagRbxTransportRuntime": "False",
+            "DFFlagDebugDisableRbxTransportDummyClient": "True",
+            "FFlagDebugDisableRbxTransportDummyClient": "True",
+            "FStringRbxTransportDummyClientEnabledMinorVersions": "",
+            "FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter": "none",
+            "DFIntRbxTransportDummyClientConnectionTimeoutMs": 0,
+            "DFIntRbxTransportQuicHandshakeTimeoutMs": 0,
         }
         changed = False
         for k, v in needed.items():
