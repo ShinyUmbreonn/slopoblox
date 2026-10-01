@@ -1223,8 +1223,32 @@ static void macoblox_dns_trace(const char* node, const char* service,
     write_str(" took_ms="); print_num(took_ms);
     write_str("\n");
 }
+static int ascii_strings_equal(const char* left, const char* right);
+static int macoblox_is_blocked_telemetry(const char* node) {
+    if (!node)
+        return 0;
+    if (ascii_strings_equal(node, "silver.roblox.com") ||
+        ascii_strings_equal(node, "pulsar.roblox.com"))
+        return 1;
+    int len = 0;
+    while (node[len]) len++;
+    if (len >= 18 && ascii_strings_equal(node + len - 18, ".silver.roblox.com"))
+        return 1;
+    if (len >= 18 && ascii_strings_equal(node + len - 18, ".pulsar.roblox.com"))
+        return 1;
+    return 0;
+}
 static int macoblox_getaddrinfo(const char* node, const char* service,
                                 const void* hints, void** result) {
+    // silver.roblox.com and pulsar.roblox.com are 1x1 GIF tracking/telemetry beacons
+    // that are blocked/unreachable in some regions. Under curl they time out for 5000 ms
+    // each (stacking up to 15 s when exiting a place, completely freezing the home menu).
+    // Failing resolution instantly (EAI_NONAME = 8) drops them in 0 ms and unfreezes the menu.
+    if (macoblox_is_blocked_telemetry(node)) {
+        if (result)
+            *result = 0;
+        return 8; /* EAI_NONAME */
+    }
     long started = macoblox_millis();
     // DNS chosen in the launcher, for Roblox only (dns_override.c).
     int own = macoblox_dns_resolve(node, service, hints, result);
@@ -5251,6 +5275,13 @@ static id shared_current_display(id cls, SEL cmd) {
 
 __attribute__((constructor))
 static void install_swizzles(void) {
+    extern const char* getprogname(void);
+    const char *prog = getprogname();
+    if (prog && ascii_strings_equal(prog, "RobloxCrashHandler")) {
+        write_str("[MacOBlox] Crashpad handler started.\n");
+        return;
+    }
+
     write_str("[MacOBlox] libMacOBloxShims loaded.\n");
     long slide = _dyld_get_image_vmaddr_slide(0);
     write_str("[MacOBlox] Main executable ASLR slide: ");
