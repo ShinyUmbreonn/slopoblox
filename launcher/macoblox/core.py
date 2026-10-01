@@ -508,6 +508,51 @@ def ensure_raknet_transport():
                                     f.seek(imm_pos)
                                     f.write(b"\xff")
                             break
+                # The DummyClient also starts from a runtime path ("DummyClient
+                # will connect to server"): its start function is called from
+                # two sites, each gated by a compare of the same flag global
+                # (opposite polarity: ==1 at one, ==0 at the other). Patch
+                # each caller's guard so the connect call is always skipped:
+                # a short `jne` becomes `jmp`, a near `jne rel32` gets the
+                # compare's immediate set to 0xFF (never equal).
+                dc_str = data.find(b"DummyClient will connect to server")
+                if dc_str != -1:
+                    starts = []
+                    for m in pattern.finditer(data):
+                        i = m.start()
+                        modrm = data[i + 2]
+                        if (modrm & 0xC7) != 0x05:
+                            continue
+                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                        target = i + 7 + disp
+                        if dc_str - 0x80 <= target <= dc_str:
+                            starts.append(i)
+                    for start in starts:
+                        prologue = data.rfind(b"\x55\x48\x89\xe5", start - 0x800, start)
+                        if prologue == -1:
+                            continue
+                        for m in re.finditer(rb"\xe8", data):
+                            i = m.start()
+                            if i + 5 + int.from_bytes(data[i+1:i+5], "little", signed=True) != prologue:
+                                continue
+                            # Guard candidate sits within 0x60 bytes before the call:
+                            # cmp byte ptr [rip+disp32], imm8; (a move or two;) jne.
+                            window_start = max(0, i - 0x60)
+                            window = data[window_start:i]
+                            for g in re.finditer(rb"\x80\x3d", window):
+                                cmp_pos = window_start + g.start()
+                                imm_pos = cmp_pos + 6
+                                if data[imm_pos] not in (0, 1):
+                                    continue
+                                gap = data[imm_pos + 1:imm_pos + 9]
+                                jne = gap.find(b"\x75")
+                                if jne != -1:
+                                    f.seek(imm_pos + 1 + jne)
+                                    f.write(b"\xeb")  # jne -> jmp: always skip
+                                elif gap[:2] == b"\x0f\x85":
+                                    f.seek(imm_pos)
+                                    f.write(b"\xff")  # never equal: always skip
+                                break
     except Exception as e:
         logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)
 

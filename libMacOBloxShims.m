@@ -3323,7 +3323,7 @@ static double hooked_mouse_event_delta_y(id self, SEL cmd) {
 // line deltas; macOS reports pixels for the same events (about 10 px per
 // line). Roblox's Universal App menu scrolls on the pixel deltas only, so
 // with line-scale values the wheel appeared dead there.
-#define MACOBLOX_SCROLL_LINE_PIXELS 10.0
+#define MACOBLOX_SCROLL_LINE_PIXELS 25.0
 static MacOBloxBool event_has_precise_scrolling_deltas(id self, SEL cmd) {
     (void)self; (void)cmd;
     return 1;
