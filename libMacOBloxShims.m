@@ -2111,12 +2111,25 @@ static void macoblox_write_quit_sentinel(void) {
     fclose(file);
     write_str("[MacOBlox] Quit sentinel written\n");
 }
+static void hooked_app_check_for_terminate(id self, SEL _cmd) {
+    // No-op. Cocotron calls _checkForTerminate on every run loop iteration.
+    // When returning from a game to the menu (or when loading into a place),
+    // windows are temporarily hidden or unmapped for a few frames.
+    // Cocotron mistakenly calls [self terminate: self], which prompts Roblox's
+    // delegate to terminate the game while in the menu.
+    // Real macOS AppKit has no such method and never terminates on hidden windows.
+}
+
 static void (*orig_app_terminate)(id self, SEL _cmd, id sender) = 0;
 static void hooked_app_terminate(id self, SEL _cmd, id sender) {
     write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called, sender: ");
     write_str(sender ? object_getClassName(sender) : "(nil)");
     write_str("\nBacktrace:\n");
     print_backtrace();
+    if (sender == self) {
+        write_str("[MacOBlox Hook] Ignoring self-initiated terminate:\n");
+        return;
+    }
     orig_app_terminate(self, _cmd, sender);
 }
 
@@ -5455,6 +5468,12 @@ static void install_swizzles(void) {
             orig_app_terminate = (void (*)(id, SEL, id))method_getImplementation(mTerm);
             method_setImplementation(mTerm, (IMP)hooked_app_terminate);
             write_str("[MacOBlox] Hooked NSApplication terminate:\n");
+        }
+        Method mCheck = class_getInstanceMethod(
+            appCls, sel_registerName("_checkForTerminate"));
+        if (mCheck) {
+            method_setImplementation(mCheck, (IMP)hooked_app_check_for_terminate);
+            write_str("[MacOBlox] Neutralized NSApplication _checkForTerminate\n");
         }
         Method mReply = class_getInstanceMethod(
             appCls, sel_registerName("replyToApplicationShouldTerminate:"));
