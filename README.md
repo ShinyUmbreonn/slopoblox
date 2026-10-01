@@ -164,6 +164,8 @@ Made by [Narezany](https://github.com/narezy). This version is maintained by
 
 [Darling](https://www.darlinghq.org) · Tux by Larry Ewing and The GIMP ·
 [Comfortaa](https://github.com/alexeiva/comfortaa) font (SIL OFL) ·
+[Archivo](https://github.com/Omnibus-Type/Archivo) and
+[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) fonts in the launcher (SIL OFL) ·
 icons from [Simple Icons](https://simpleicons.org)
 
 Mac O’ Blox is MIT licensed. Not affiliated with Roblox Corporation.

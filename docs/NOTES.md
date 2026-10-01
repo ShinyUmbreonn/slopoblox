@@ -214,6 +214,34 @@ cookies); the old build fails the new tests, while the new one passes them all.
   (darling#715). Now `getpwuid(0)` in darling/darlingserver returns the entry
   for the actual user.
 
+## Changes 2026-10-01: the launcher as a desktop
+
+The launcher's interface is redone after aubree.wtf (`launcher/macoblox/theme.py`
+holds the look, `app.py` the new shell; every settings page keeps its widgets):
+
+- Dark monochrome, square corners, no hue: state is filled against hollow,
+  brightness, and a text label. Archivo for the interface, JetBrains Mono for
+  titles and small facts; both ship in `launcher/macoblox/assets/fonts`
+  (SIL OFL, cut down to the weights used) and are registered with Pango at
+  start, so nothing is installed on the system.
+- A top bar (`macoblox@darling`, the game's state, the time in the running
+  game, a clock, the window buttons) over a "desktop": the play window and
+  the menu window on the left, the open page in a window on the right
+  (console, settings with its three tabs, mods, logs, info). Below 860 px
+  the windows stack in one scrolling column, as on the site.
+- The console replaces the old status page: each line is a check made just
+  now (tools, Roblox, shim, Darling, sound, sign-in window, account), set as
+  the unit lines of a boot console.
+- The backdrop (`theme.Backdrop`) is a line field in the manner of the
+  site's topology wallpaper: points follow a smooth flow field and leave
+  marks in a grey bitmap shown as a texture. It draws in for about eight
+  seconds (2 ms per 40 ms tick) and then stops; with animations turned off
+  in the system it appears finished.
+- The log viewer's highlighting is monochrome too (level by brightness and
+  weight). The old sidebar and its `show_sidebar` setting are gone.
+- For screenshots: `MACOBLOX_PAGE` (play, env, roblox, flags, mods, logs,
+  info) and `MACOBLOX_WINDOW_SIZE=WxH`.
+
 ## What to Check Next
 
 We need a recent startup log from a regular terminal. This will help determine where
