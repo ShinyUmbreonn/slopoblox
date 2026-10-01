@@ -2724,6 +2724,13 @@ static MacOBloxPoint macoblox_expected_warp_delta;
 static volatile long macoblox_associate_mouse_count;
 static MacOBloxPoint macoblox_lock_anchor;
 static volatile int macoblox_lock_anchor_pending;
+// Warps of the pointer (recentring during a lock, the restore on unlock)
+// produce real motion events; without a grab the lock filter does not see
+// them, and the game turns the camera by the service delta. Every warp
+// marks its expected delta here; such motions are consumed globally, lock
+// or not.
+static volatile int macoblox_global_warp_pending;
+static volatile int macoblox_global_warp_wait;
 
 // Move the pointer by (dx, dy) window points (Cocoa axes, y up).
 static void macoblox_warp_pointer_by(double dx, double dy) {
@@ -2753,6 +2760,8 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
     macoblox_expected_warp_delta.y = iy;
     macoblox_warp_wait_events = 0;
     macoblox_drop_warp_motion = 1;
+    macoblox_global_warp_pending = 1;
+    macoblox_global_warp_wait = 0;
 }
 
 static MacOBloxPoint macoblox_window_center(id window) {
@@ -3261,6 +3270,30 @@ static int macoblox_filter_locked_motion(id event) {
                                dropped ? "DROPPED" : (dropping && !macoblox_drop_warp_motion ? "" :
                                (macoblox_drop_warp_motion && !dropping ? "RECENTER" : "")));
     return dropped;
+}
+
+// Consume the motion event of a pointer warp, locked or not: the restore on
+// unlock lands after the grab is gone, and the game would turn the camera by
+// the service delta (phantom spins, the cursor jumping around).
+static int macoblox_consume_warp_motion(id event) {
+    if (!macoblox_global_warp_pending)
+        return 0;
+    SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
+    double dx = orig_mouse_event_delta_x ? orig_mouse_event_delta_x(event, delta_x)
+        : ((double (*)(id, SEL))objc_msgSend)(event, delta_x);
+    double dy = orig_mouse_event_delta_y ? orig_mouse_event_delta_y(event, delta_y)
+        : ((double (*)(id, SEL))objc_msgSend)(event, delta_y);
+    double ex = macoblox_expected_warp_delta.x, ey = macoblox_expected_warp_delta.y;
+    if ((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey) <
+        0.25 * (ex * ex + ey * ey) + 4.0) {
+        macoblox_global_warp_pending = 0;
+        return 1;
+    }
+    // The warp's motion may have merged with real movement: give up after a
+    // few events, real ones must keep flowing.
+    if (++macoblox_global_warp_wait > 8)
+        macoblox_global_warp_pending = 0;
+    return 0;
 }
 
 static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
@@ -3817,6 +3850,9 @@ static void hooked_app_send_event(id self, SEL cmd, id event) {
             print_num(((unsigned short (*)(id, SEL))objc_msgSend)(event, sel_registerName("keyCode")));
             write_str(((signed char (*)(id, SEL))objc_msgSend)(event, sel_registerName("isARepeat")) ? " repeat\n" : "\n");
         }
+        if ((type == 5 || type == 6 || type == 7 || type == 27) &&
+            macoblox_consume_warp_motion(event))
+            return;
         if ((type == 5 || type == 6 || type == 7 || type == 27) &&
             macoblox_filter_locked_motion(event))
             return;
