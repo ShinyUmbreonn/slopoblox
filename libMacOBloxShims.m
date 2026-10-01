@@ -2289,6 +2289,16 @@ static MacOBloxRect window_convert_rect_to_screen(id self, SEL cmd, MacOBloxRect
     return rect;
 }
 
+static long window_number_at_point(id cls, SEL cmd, MacOBloxPoint point, long belowWindowNumber) {
+    (void)cls; (void)cmd; (void)point; (void)belowWindowNumber;
+    id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+    id keyWin = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
+    if (keyWin) {
+        return ((long (*)(id, SEL))objc_msgSend)(keyWin, sel_registerName("windowNumber"));
+    }
+    return 0;
+}
+
 // Darling exposes a deliberately small WebPreferences forwarding stub, but
 // omits this legacy singleton constructor.  Roblox asks for the singleton while
 // creating its experience coordinator, before any preference setters are sent.
@@ -5436,6 +5446,15 @@ static void install_swizzles(void) {
                             (IMP)window_convert_rect_to_screen,
                             rect_conversion_types))
             write_str("[MacOBlox] Added NSWindow convertRectToScreen:\n");
+        SEL win_at_pt = sel_registerName("windowNumberAtPoint:belowWindowWithWindowNumber:");
+        Method mWinAtPt = class_getClassMethod(window_class, win_at_pt);
+        if (mWinAtPt) {
+            method_setImplementation(mWinAtPt, (IMP)window_number_at_point);
+        } else {
+            class_addMethod(object_getClass((id)window_class), win_at_pt,
+                            (IMP)window_number_at_point, "q@:{CGPoint=dd}q");
+        }
+        write_str("[MacOBlox] Implemented +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]\n");
     }
 
     Class ccls = objc_getClass("NSConcreteScanner");
