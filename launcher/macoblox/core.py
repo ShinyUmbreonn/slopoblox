@@ -354,6 +354,7 @@ def update_roblox(upload, progress=None):
     if flags:
         save_fast_flags(flags)
     apply_throttle_patch()
+    ensure_raknet_transport()
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
@@ -415,6 +416,51 @@ def apply_throttle_patch():
     elif "not found" in output:
         logging.getLogger("macoblox").warning("Startup throttle patch: %s", output)
     # "already disabled" stays silent.
+
+
+def ensure_raknet_transport():
+    """Ensure FastFlags in ClientAppSettings.json and the client binary disable
+    RbxTransport (QUIC) and enforce RakNet. Under Darling, RbxTransport fails socket
+    connection, causing an ~11 s freeze before Roblox disconnects with Error 256."""
+    try:
+        flags = load_fast_flags()
+        needed = {
+            "FFlagUseRbxTransportClient": "False",
+            "FFlagUseRbxTransportClient3": "False",
+            "FFlagUseRbxTransportServer": "False",
+            "FFlagShareRbxTransport": "False",
+            "FFlagRbxTransportRuntime": "False",
+        }
+        changed = False
+        for k, v in needed.items():
+            if flags.get(k) != v:
+                flags[k] = v
+                changed = True
+        if changed:
+            save_fast_flags(flags)
+
+        binary = APP_BUNDLE / "Contents" / "MacOS" / "RobloxPlayer"
+        if binary.is_file():
+            with open(binary, "r+b") as f:
+                data = f.read()
+                str_pos = data.find(b"useRbxTransportEnabled\x00")
+                if str_pos != -1:
+                    for i in range(0x1000, min(len(data) - 7, 0x6000000)):
+                        if data[i:i+3] == b"\x48\x8d\x35":
+                            disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
+                            if i + 7 + disp == str_pos:
+                                prefix = data[i-17:i]
+                                call_idx = prefix.find(b"\xe8")
+                                if call_idx != -1:
+                                    call_file_pos = i - 17 + call_idx
+                                    call_disp = int.from_bytes(data[call_file_pos+1:call_file_pos+5], "little", signed=True)
+                                    fn_pos = call_file_pos + 5 + call_disp
+                                    if 0 <= fn_pos < len(data) - 4 and data[fn_pos:fn_pos+4] == b"\x55\x48\x89\xe5":
+                                        f.seek(fn_pos)
+                                        f.write(b"\x31\xc0\xc3\x90")
+                                break
+    except Exception as e:
+        logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)
 
 
 def delete_roblox():
@@ -1375,6 +1421,7 @@ class RobloxSession:
         except Exception as e:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         apply_throttle_patch()
+        ensure_raknet_transport()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder

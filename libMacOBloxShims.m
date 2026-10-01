@@ -2090,10 +2090,17 @@ static void hooked_app_finish_launching(id self, SEL cmd) {
     }
 }
 
-// Swizzle NSApplication terminate:
+// Swizzle NSApplication terminate: and replyToApplicationShouldTerminate:
 // The launcher watches MACOBLOX_QUIT_SENTINEL: the file's existence means the
 // user asked to quit, so the session can end without waiting for Roblox's
 // whole teardown (network closes, telemetry) to finish.
+//
+// NOTE: terminate: is called by Cocotron's _checkForTerminate on every run loop
+// tick whenever windows are temporarily hidden (such as during place loading /
+// replaceDataModel). Cocotron asks Roblox's delegate applicationShouldTerminate:,
+// which returns NSTerminateCancel (0), causing replyToApplicationShouldTerminate: NO.
+// Therefore, the quit sentinel must ONLY be written when termination is actually
+// approved (replyToApplicationShouldTerminate: YES), never prematurely in terminate:.
 static void macoblox_write_quit_sentinel(void) {
     const char* path = getenv("MACOBLOX_QUIT_SENTINEL");
     if (!path || !path[0])
@@ -2106,10 +2113,23 @@ static void macoblox_write_quit_sentinel(void) {
 }
 static void (*orig_app_terminate)(id self, SEL _cmd, id sender) = 0;
 static void hooked_app_terminate(id self, SEL _cmd, id sender) {
-    write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called!\nBacktrace:\n");
+    write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called, sender: ");
+    write_str(sender ? object_getClassName(sender) : "(nil)");
+    write_str("\nBacktrace:\n");
     print_backtrace();
-    macoblox_write_quit_sentinel();
     orig_app_terminate(self, _cmd, sender);
+}
+
+static void (*orig_app_replyToApplicationShouldTerminate)(id self, SEL _cmd, signed char shouldTerminate) = 0;
+static void hooked_app_replyToApplicationShouldTerminate(id self, SEL _cmd, signed char shouldTerminate) {
+    write_str("\n[MacOBlox Hook] -[NSApplication replyToApplicationShouldTerminate:] called with: ");
+    write_str(shouldTerminate ? "YES\n" : "NO\n");
+    if (shouldTerminate) {
+        macoblox_write_quit_sentinel();
+    }
+    if (orig_app_replyToApplicationShouldTerminate) {
+        orig_app_replyToApplicationShouldTerminate(self, _cmd, shouldTerminate);
+    }
 }
 
 // Swizzle NSApplication setDelegate:
@@ -5435,6 +5455,14 @@ static void install_swizzles(void) {
             orig_app_terminate = (void (*)(id, SEL, id))method_getImplementation(mTerm);
             method_setImplementation(mTerm, (IMP)hooked_app_terminate);
             write_str("[MacOBlox] Hooked NSApplication terminate:\n");
+        }
+        Method mReply = class_getInstanceMethod(
+            appCls, sel_registerName("replyToApplicationShouldTerminate:"));
+        if (mReply) {
+            orig_app_replyToApplicationShouldTerminate =
+                (void (*)(id, SEL, signed char))method_getImplementation(mReply);
+            method_setImplementation(mReply, (IMP)hooked_app_replyToApplicationShouldTerminate);
+            write_str("[MacOBlox] Hooked NSApplication replyToApplicationShouldTerminate:\n");
         }
         Method mDel = class_getInstanceMethod(appCls, sel_registerName("setDelegate:"));
         if (mDel) {
