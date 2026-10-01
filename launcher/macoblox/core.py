@@ -436,6 +436,11 @@ def ensure_raknet_transport():
             "FStringRbxTransportDummyClientEnabledMinorVersions_PlaceFilter": "none",
             "DFIntRbxTransportDummyClientConnectionTimeoutMs": 0,
             "DFIntRbxTransportQuicHandshakeTimeoutMs": 0,
+            # The Pop-latency STUN probe sends UDP bursts to 24 datacenters
+            # every 0.5 s for ~5 s: it delays the first join (menu appears
+            # late) and blocks the render switch after leaving a game.
+            "DFFlagEnablePopLatencyProbe3": "False",
+            "DFFlagAttachPopUdpProbeToGameJoin2": "False",
         }
         changed = False
         for k, v in needed.items():
