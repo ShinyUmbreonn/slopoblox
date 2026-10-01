@@ -2724,6 +2724,11 @@ static MacOBloxPoint macoblox_expected_warp_delta;
 static volatile long macoblox_associate_mouse_count;
 static MacOBloxPoint macoblox_lock_anchor;
 static volatile int macoblox_lock_anchor_pending;
+// Set right after a recentring warp: the next motion at the X level is the
+// warp's own and is dropped by order, not by delta matching (fast real
+// movement merges with the warp's motion and a matched delta would deliver
+// the whole service delta to the game as a camera spin).
+static volatile int macoblox_anchor_warp_pending;
 // Warps of the pointer (recentring during a lock, the restore on unlock)
 // produce real motion events; without a grab the lock filter does not see
 // them, and the game turns the camera by the service delta. Every warp
@@ -3203,17 +3208,16 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         // Put the pointer back where the button was pressed, while it is
         // still hidden, then show it.
         macoblox_pointer_grabbed = 0;
-        id window = macoblox_lock_window();
         if (macoblox_raw_mouse_active && macoblox_raw_have_anchor) {
             // Darling saw no pointer motion during the lock; the event loop
             // did (X coordinates, y down; the warp takes Cocoa's y up).
             macoblox_warp_pointer_by(macoblox_raw_start_x - macoblox_raw_last_x,
                                      macoblox_raw_last_y - macoblox_raw_start_y);
-        } else if (window) {
-            MacOBloxPoint location = macoblox_real_window_mouse_location(window);
-            macoblox_warp_pointer_by(macoblox_frozen_window_location.x - location.x,
-                                     macoblox_frozen_window_location.y - location.y);
         }
+        // Delta mode: no restore warp. The pointer sits on the anchor (it is
+        // recentred after every event), and Darling's mouseLocationOutsideOfEventStream
+        // speaks a different coordinate space - the "restore" built from it
+        // threw the cursor at the window edge. Unhide it where it is.
         macoblox_drop_warp_motion = 0;
         macoblox_set_x_cursor_hidden(0);
     }
@@ -3301,30 +3305,19 @@ static int macoblox_consume_warp_motion(id event) {
 }
 
 static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
-    if (macoblox_drop_warp_motion) {
-        double ex = macoblox_expected_warp_delta.x, ey = macoblox_expected_warp_delta.y;
-        if ((dx - ex) * (dx - ex) + (dy - ey) * (dy - ey) <
-            0.25 * (ex * ex + ey * ey) + 4.0) {
-            macoblox_drop_warp_motion = 0;
-            return 1;
-        }
-        // The warp's motion never came alone (lost, or merged with a fast
-        // movement): recentre again after a few events. Waiting for it
-        // forever stopped the recentring for the rest of the lock, until
-        // the pointer reached the screen edge and the camera stopped turning.
-        if (++macoblox_warp_wait_events > 8)
-            macoblox_drop_warp_motion = 0;
-    }
-    if (!macoblox_drop_warp_motion) {
-        MacOBloxPoint location = macoblox_real_event_location(event);
-        double ox = location.x - macoblox_lock_anchor.x, oy = location.y - macoblox_lock_anchor.y;
-        if (macoblox_lock_anchor_pending) {
-            macoblox_lock_anchor_pending = 0;
-            macoblox_warp_pointer_by(-ox, -oy);
-        } else if (ox > MACOBLOX_LOCK_RADIUS || ox < -MACOBLOX_LOCK_RADIUS ||
-                   oy > MACOBLOX_LOCK_RADIUS || oy < -MACOBLOX_LOCK_RADIUS) {
-            macoblox_warp_pointer_by(-ox, -oy);
-        }
+    (void)dx; (void)dy;
+    // Virtual raw input: recentre the pointer on the anchor after every
+    // event. It then never drifts further than one movement, so deltas keep
+    // flowing near screen edges (the old 100 px fence let the pointer reach
+    // the edge, where no more motions come and the camera dies). The
+    // recentring motion itself is dropped by order at the X level.
+    MacOBloxPoint location = macoblox_real_event_location(event);
+    double ox = location.x - macoblox_lock_anchor.x, oy = location.y - macoblox_lock_anchor.y;
+    if (macoblox_lock_anchor_pending)
+        macoblox_lock_anchor_pending = 0;
+    if (ox || oy) {
+        macoblox_warp_pointer_by(-ox, -oy);
+        macoblox_anchor_warp_pending = 1;
     }
     return 0;
 }
@@ -4430,6 +4423,15 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             write_str(macoblox_pointer_grabbed ? " locked\n" : "\n");
         }
     }
+    if (type == 6 /* MotionNotify */ && macoblox_pointer_grabbed &&
+        !macoblox_raw_mouse_active && macoblox_anchor_warp_pending) {
+        /* The recentring warp's own motion: X delivers it right after the
+         * real one that triggered the warp. Dropping by order instead of by
+         * delta: a fast real movement merged into the same event would
+         * otherwise smuggle the service delta to the game. */
+        macoblox_anchor_warp_pending = 0;
+        return;
+    }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
     if (type == 7 /* EnterNotify */ && macoblox_pointer_grabbed)
@@ -4483,7 +4485,8 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             compression = !macoblox_env_on("MACOBLOX_NO_MOTION_COMPRESSION") && queued && peek &&
                           display_offset >= 0;
         }
-        void* display = compression && !macoblox_drop_warp_motion ? *(void**)((char*)self + display_offset) : 0;
+        void* display = compression && !macoblox_drop_warp_motion &&
+                        !macoblox_pointer_grabbed ? *(void**)((char*)self + display_offset) : 0;
         if (display && queued(display, 0 /* QueuedAlready */) > 0) {
             unsigned char next[192];
             peek(display, next);
