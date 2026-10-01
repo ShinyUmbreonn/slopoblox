@@ -1184,23 +1184,70 @@ extern void macoblox_sleep_us(unsigned int);
 static volatile int macoblox_dns_lock;
 extern int macoblox_dns_resolve(const char* node, const char* service,
                                 const void* hints, void** result);
+// Milliseconds on the Linux CLOCK_MONOTONIC, like macoblox_sleep_us: the
+// resolver work and its lock waits are what a startup stall is made of.
+struct macoblox_timespec { long sec; long nsec; };
+static long macoblox_millis(void) {
+    struct macoblox_timespec now = {0, 0};
+    long result;
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"(228L /* Linux clock_gettime */), "D"(1L /* MONOTONIC */), "S"(&now)
+                     : "rcx", "r11", "memory");
+    (void)result;
+    return now.sec * 1000 + now.nsec / 1000000;
+}
+// One line per lookup. Emitted for every failed lookup and for any lookup
+// (or lock wait) slower than 200 ms: a multi-second startup stall shows up
+// here as the slow node and who was holding the resolver lock.
+static void macoblox_dns_trace(const char* node, const char* service,
+                               const void* hints, int attempts, int status,
+                               long waited_ms, long took_ms) {
+    write_str("[MacOBlox DNS] node=");
+    write_str(node ? node : "(null)");
+    write_str(" service=");
+    write_str(service ? service : "(null)");
+    if (hints) {
+        const struct macoblox_addrinfo_head* head =
+            (const struct macoblox_addrinfo_head*)hints;
+        write_str(" flags="); print_num(head->ai_flags);
+        write_str(" family="); print_num(head->ai_family);
+        write_str(" socktype="); print_num(head->ai_socktype);
+        write_str(" protocol="); print_num(head->ai_protocol);
+    } else {
+        write_str(" hints=(null)");
+    }
+    write_str(" attempts="); print_num(attempts);
+    write_str(" result="); print_num(status);
+    write_str(" waited_ms="); print_num(waited_ms);
+    write_str(" took_ms="); print_num(took_ms);
+    write_str("\n");
+}
 static int macoblox_getaddrinfo(const char* node, const char* service,
                                 const void* hints, void** result) {
+    long started = macoblox_millis();
     // DNS chosen in the launcher, for Roblox only (dns_override.c).
     int own = macoblox_dns_resolve(node, service, hints, result);
-    if (own >= 0)
+    if (own >= 0) {
+        long took = macoblox_millis() - started;
+        if (took > 200)
+            macoblox_dns_trace(node, service, hints, 0, own, 0, took);
         return own;
+    }
     int (*real_getaddrinfo)(const char*, const char*, const void*, void**) =
         MACOBLOX_NEXT(int (*)(const char*, const char*, const void*, void**), "getaddrinfo");
 
     int status = -1;
     int attempts = 0;
+    long waited_ms = 0;
     while (real_getaddrinfo && attempts < 4) {
         if (attempts)
             macoblox_sleep_us(50000);
         attempts++;
+        long wait_started = macoblox_millis();
         while (__sync_lock_test_and_set(&macoblox_dns_lock, 1))
             macoblox_sleep_us(1000);
+        waited_ms += macoblox_millis() - wait_started;
         if (result)
             *result = 0;
         status = real_getaddrinfo(node, service, hints, result);
@@ -1209,25 +1256,11 @@ static int macoblox_getaddrinfo(const char* node, const char* service,
             break;
     }
 
+    long took = macoblox_millis() - started;
     static volatile int trace = -1;
-    if (status != 0 || macoblox_env_cached("MACOBLOX_TRACE_DNS", &trace)) {
-        write_str("[MacOBlox DNS] node=");
-        write_str(node ? node : "(null)");
-        write_str(" service=");
-        write_str(service ? service : "(null)");
-        if (hints) {
-            const struct macoblox_addrinfo_head* head =
-                (const struct macoblox_addrinfo_head*)hints;
-            write_str(" flags="); print_num(head->ai_flags);
-            write_str(" family="); print_num(head->ai_family);
-            write_str(" socktype="); print_num(head->ai_socktype);
-            write_str(" protocol="); print_num(head->ai_protocol);
-        } else {
-            write_str(" hints=(null)");
-        }
-        write_str(" attempts="); print_num(attempts);
-        write_str(" result="); print_num(status);
-        write_str("\n");
+    if (status != 0 || waited_ms > 200 || took > 200 ||
+        macoblox_env_cached("MACOBLOX_TRACE_DNS", &trace)) {
+        macoblox_dns_trace(node, service, hints, attempts, status, waited_ms, took);
     }
     return status;
 }
@@ -2058,10 +2091,24 @@ static void hooked_app_finish_launching(id self, SEL cmd) {
 }
 
 // Swizzle NSApplication terminate:
+// The launcher watches MACOBLOX_QUIT_SENTINEL: the file's existence means the
+// user asked to quit, so the session can end without waiting for Roblox's
+// whole teardown (network closes, telemetry) to finish.
+static void macoblox_write_quit_sentinel(void) {
+    const char* path = getenv("MACOBLOX_QUIT_SENTINEL");
+    if (!path || !path[0])
+        return;
+    MacOBloxFILE* file = fopen(path, "w");
+    if (!file)
+        return;
+    fclose(file);
+    write_str("[MacOBlox] Quit sentinel written\n");
+}
 static void (*orig_app_terminate)(id self, SEL _cmd, id sender) = 0;
 static void hooked_app_terminate(id self, SEL _cmd, id sender) {
     write_str("\n[MacOBlox Hook] -[NSApplication terminate:] called!\nBacktrace:\n");
     print_backtrace();
+    macoblox_write_quit_sentinel();
     orig_app_terminate(self, _cmd, sender);
 }
 

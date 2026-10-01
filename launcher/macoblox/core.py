@@ -15,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import sys
 import time
 import urllib.request
 import zipfile
@@ -61,6 +62,8 @@ FAST_FLAGS = APP_BUNDLE / "Contents" / "MacOS" / "ClientSettings" / "ClientAppSe
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macoblox"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "macoblox"
+# Written by the shim when Roblox starts terminating; see RobloxSession.poll.
+QUIT_SENTINEL = CACHE_DIR / "game-closing"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # Cookies and site data of Roblox's embedded web pages (web.py): sign-in state.
 WEB_DATA_DIR = CONFIG_DIR / "web"
@@ -78,6 +81,7 @@ DEFAULT_SETTINGS = {
     "language": "en",
     "mouse_sensitivity": 1.0,
     "scroll_sensitivity": 1.5,
+    "auto_patch_throttle": True,
     "raw_mouse": True,
     "hide_menu_bar": False,
     "dns": "system",
@@ -349,9 +353,68 @@ def update_roblox(upload, progress=None):
                 shutil.rmtree(old, ignore_errors=True)
     if flags:
         save_fast_flags(flags)
+    apply_throttle_patch()
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
+
+
+def throttle_patch_state():
+    """Whether the startup render throttle is patched out of the installed
+    client: 'patched', 'original' or 'unsupported' (no client, or a build
+    whose code shape the patcher does not recognize)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(PROJECT / "patch_startup_throttle.py"),
+             str(APP_BUNDLE), "--check"],
+            capture_output=True, text=True, timeout=120)
+    except Exception:
+        return "unsupported"
+    out = (r.stdout or "").strip()
+    return out if out in ("patched", "original") else "unsupported"
+
+
+def run_throttle_patcher(*flags):
+    """Run the patcher and return its output; raises on a failure exit."""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(PROJECT / "patch_startup_throttle.py"),
+             str(APP_BUNDLE), *flags],
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "").strip() or f"exit {r.returncode}")
+    return (r.stdout or "").strip()
+
+
+def remove_throttle_patch():
+    """Restore the original client bytes; the inverse of the patch."""
+    return run_throttle_patcher("--undo")
+
+
+def apply_throttle_patch():
+    """Re-apply the startup-throttle patch to the client binary (see
+    patch_startup_throttle.py at the project root).
+
+    The macOS client throttles the menu to ~3 FPS for its first 10 seconds
+    under Darling (the normal release path needs a preRenderJob that is never
+    created here). The patcher locates its site by pattern, so it survives
+    client updates and skips itself when the code shape changes. Runs on
+    installs, updates and every launch when auto_patch_throttle is on; a run
+    costs ~0.3 s."""
+    if not load_settings().get("auto_patch_throttle", True):
+        return
+    try:
+        output = run_throttle_patcher()
+    except Exception as e:
+        logging.getLogger("macoblox").warning("Startup throttle patch failed: %s", e)
+        return
+    if "(patched at" in output:
+        logging.getLogger("macoblox").info(output)
+    elif "not found" in output:
+        logging.getLogger("macoblox").warning("Startup throttle patch: %s", output)
+    # "already disabled" stays silent.
 
 
 def delete_roblox():
@@ -1215,6 +1278,9 @@ class RobloxSession:
         # its socket as the guest sees it, and WebKit's user agent.
         self.web_socket = None
         self.web_user_agent = None
+        # A sentinel left over from a quit that outlived the launcher must not
+        # end this session before it starts.
+        QUIT_SENTINEL.unlink(missing_ok=True)
 
     def environment(self):
         return darling_environment()
@@ -1223,6 +1289,13 @@ class RobloxSession:
         variables = [
             f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}",
             f"MACOBLOX_SCROLL_SENSITIVITY={self.settings.get('scroll_sensitivity', 1.5):.2f}",
+            # Mesa builds its shader cache under the prefix's /Users, which
+            # is not writable on every setup ("Failed to create /Users for
+            # shader cache -- disabling"), so every launch recompiled every
+            # shader. Point it at the host cache instead; NVIDIA's driver
+            # ignores it, Mesa picks it up.
+            f"MESA_SHADER_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
+            f"MESA_GLSL_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
         ]
         vram = host_vram_bytes()
         if vram:
@@ -1260,6 +1333,7 @@ class RobloxSession:
         # not carry the value as an argument (for example a retry after the
         # launcher was already open).
         variables.append(f"MACOBLOX_PENDING_URI_FILE=/Volumes/SystemRoot{CACHE_DIR / 'pending-uri'}")
+        variables.append(f"MACOBLOX_QUIT_SENTINEL=/Volumes/SystemRoot{QUIT_SENTINEL}")
         try:
             variables.append(f"MACOBLOX_ICON_ARGB=/Volumes/SystemRoot{icon_argb_file()}")
         except Exception:
@@ -1300,6 +1374,7 @@ class RobloxSession:
             mods.apply_mods(self.settings)
         except Exception as e:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
+        apply_throttle_patch()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder
@@ -1312,6 +1387,8 @@ class RobloxSession:
             subprocess.run(["darling", "shell", "true"], env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         LOGS.mkdir(parents=True, exist_ok=True)
+        # The Mesa shader cache dir must exist before the game opens it.
+        (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
         with open(self.log_path, "wb") as log:
@@ -1358,6 +1435,13 @@ class RobloxSession:
             return status
         if self.audio:
             self.audio.keep_playing()
+        # The shim touches the sentinel when Roblox starts terminating
+        # (Cmd+Q, Quit in the menu). Roblox's own teardown takes seconds, and
+        # the session can end for the user as soon as quitting began.
+        # seen_roblox keeps a sentinel left from a dead session irrelevant.
+        if self.seen_roblox and QUIT_SENTINEL.exists():
+            self.finish()
+            return -1
         # Suppress any crash handler to prevent slow dumps and exit blockage
         if self.seen_roblox and time.time() - self.started_at > 3:
             for pid in roblox_pids(("RobloxCrashHandler",)):
