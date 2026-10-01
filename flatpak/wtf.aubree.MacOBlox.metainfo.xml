@@ -67,6 +67,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.16" date="2026-10-01">
+      <description>
+        <p>A new launcher interface: a dark desktop with a console that shows what is installed and ready. Raw mouse input for the camera, Discord Rich Presence, playtime, mods (sounds, cursors, fonts), a log viewer with search, and Play links from the browser. Fixes for freezes when leaving a game and when quitting.</p>
+      </description>
+    </release>
     <release version="0.15" date="2026-09-27">
       <description>
         <p>Signing in with a password and other embedded pages open in the launcher's own browser window. Microphone for voice chat. New app ID wtf.aubree.MacOBlox. Fixes for a Fedora KDE crash loop, for Darling's thread stacks, and for the Flatpak failing with "Cannot determine your user name".</p>

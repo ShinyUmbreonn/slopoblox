@@ -135,7 +135,7 @@ installed on the system. Download `MacOBlox-*.flatpak` from the
 [latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
 
 ```bash
-flatpak install --user MacOBlox-0.15-x86_64.flatpak
+flatpak install --user MacOBlox-0.16-x86_64.flatpak
 ```
 
 It keeps its own Darling prefix, so sign in to Roblox again there. Roblox Studio
