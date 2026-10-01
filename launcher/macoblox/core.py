@@ -441,6 +441,14 @@ def ensure_raknet_transport():
             # late) and blocks the render switch after leaving a game.
             "DFFlagEnablePopLatencyProbe3": "False",
             "DFFlagAttachPopUdpProbeToGameJoin2": "False",
+            # While on RakNet, Roblox opens a shadow RbxTransport connection
+            # ("DummyClient will connect") that can never connect under
+            # Darling; closing the session then waits for it, freezing the
+            # return to the menu for seconds.
+            "DFFlagRakNetFallbackToRbxTransportEvent": "False",
+            "DFFlagRakNetFallbackToRbxTransportStatus": "False",
+            "DFFlagConnectDummyServiceClientEarly": "False",
+            "DFIntRbxTransportClientConnectionWaitIntervalMs": 0,
         }
         changed = False
         for k, v in needed.items():
@@ -1354,6 +1362,12 @@ class RobloxSession:
             # ignores it, Mesa picks it up.
             f"MESA_SHADER_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
             f"MESA_GLSL_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
+            # Roblox keeps its own caches (flag cache, thumbnail temp files)
+            # under the prefix's /private/tmp, which does not survive a
+            # Darling restart: every launch re-downloaded 23k flags and every
+            # menu return re-fetched every thumbnail (429 rate limits, blank
+            # place tiles). A host directory makes those caches persistent.
+            f"TMPDIR=/Volumes/SystemRoot{CACHE_DIR / 'roblox-tmp'}",
         ]
         vram = host_vram_bytes()
         if vram:
@@ -1448,6 +1462,8 @@ class RobloxSession:
         LOGS.mkdir(parents=True, exist_ok=True)
         # The Mesa shader cache dir must exist before the game opens it.
         (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
+        # The guest TMPDIR (Roblox's flag and thumbnail caches) likewise.
+        (CACHE_DIR / "roblox-tmp").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
         with open(self.log_path, "wb") as log:
