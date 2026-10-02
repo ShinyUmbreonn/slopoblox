@@ -189,3 +189,51 @@ static void macoblox_glRenderbufferStorageMultisample(unsigned int target, int s
     glRenderbufferStorageMultisample(target, samples, format, width, height);
 }
 DYLD_INTERPOSE(macoblox_glRenderbufferStorageMultisample, glRenderbufferStorageMultisample)
+
+/* Metal off: Roblox renders with OpenGL here.
+ *
+ * Roblox prefers Metal and only falls back to OpenGL when it finds no Metal
+ * device. With the Darling release this is tested with, on most GPUs,
+ * Darling's Metal (Indium on Vulkan) returns none, and that is why OpenGL is
+ * what runs. Other Darling builds and drivers do return a device (a source
+ * build on Mesa: the log starts with "Validation layer requested but not
+ * available"); Roblox then starts its Metal renderer, which Darling cannot
+ * carry: an exception from the device ("-[MTLDev..."), then a crash in
+ * -[RBXWindow setTitlebarAppearsTransparent:]. So the answer is always "no
+ * device". MACOBLOX_METAL=1 keeps Darling's answer (the Vulkan work). */
+typedef struct objc_object *macoblox_id;
+extern macoblox_id objc_msgSend(macoblox_id, void *, ...);
+extern void *sel_registerName(const char *);
+extern void *objc_getClass(const char *);
+__attribute__((weak_import)) extern macoblox_id MTLCreateSystemDefaultDevice(void);
+__attribute__((weak_import)) extern macoblox_id MTLCopyAllDevices(void);
+
+static int metal_allowed(void) {
+    const char *value = getenv("MACOBLOX_METAL");
+    return value && value[0] == '1';
+}
+
+static void metal_off_once(void) {
+    static int said;
+    if (!__sync_bool_compare_and_swap(&said, 0, 1))
+        return;
+    write(2, "[MacOBlox] Metal device hidden, Roblox renders with OpenGL\n", 59);
+}
+
+static macoblox_id macoblox_MTLCreateSystemDefaultDevice(void) {
+    if (metal_allowed())
+        return MTLCreateSystemDefaultDevice();
+    metal_off_once();
+    return 0;
+}
+DYLD_INTERPOSE(macoblox_MTLCreateSystemDefaultDevice, MTLCreateSystemDefaultDevice)
+
+static macoblox_id macoblox_MTLCopyAllDevices(void) {
+    if (metal_allowed())
+        return MTLCopyAllDevices();
+    metal_off_once();
+    /* An empty array the caller owns, as the Copy in the name promises. */
+    macoblox_id array = ((macoblox_id (*)(void *, void *))objc_msgSend)(objc_getClass("NSArray"), sel_registerName("alloc"));
+    return ((macoblox_id (*)(macoblox_id, void *))objc_msgSend)(array, sel_registerName("init"));
+}
+DYLD_INTERPOSE(macoblox_MTLCopyAllDevices, MTLCopyAllDevices)

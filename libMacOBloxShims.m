@@ -2271,6 +2271,31 @@ static MacOBloxSize backing_size_1x(id self, SEL cmd, MacOBloxSize size) {
     return size;
 }
 
+// Title bar options of macOS 10.10 that Roblox sets on its window
+// (setTitlebarAppearsTransparent:, setTitleVisibility:). The Darling release
+// this is tested with has them; an older or differently built Darling does
+// not, and the game died at start with "unrecognized selector". Darling draws
+// no such title bar anyway, so where they are missing they only remember the
+// value. Per window state is not needed: Roblox has one window.
+static signed char macoblox_titlebar_transparent;
+static long macoblox_title_visibility;
+static void window_set_titlebar_appears_transparent(id self, SEL cmd, signed char flag) {
+    (void)self; (void)cmd;
+    macoblox_titlebar_transparent = flag;
+}
+static signed char window_titlebar_appears_transparent(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return macoblox_titlebar_transparent;
+}
+static void window_set_title_visibility(id self, SEL cmd, long visibility) {
+    (void)self; (void)cmd;
+    macoblox_title_visibility = visibility;
+}
+static long window_title_visibility(id self, SEL cmd) {
+    (void)self; (void)cmd;
+    return macoblox_title_visibility;
+}
+
 // NSWindow gained rectangle variants of its screen conversion API after the
 // AppKit snapshot used by Darling.  Roblox uses convertRectFromScreen: while
 // handling mouse movement.  Falling through Objective-C forwarding is unsafe
@@ -5635,6 +5660,21 @@ static void install_swizzles(void) {
                             (IMP)window_convert_rect_to_screen,
                             rect_conversion_types))
             write_str("[MacOBlox] Added NSWindow convertRectToScreen:\n");
+        struct { const char* name; IMP imp; const char* types; } titlebar_methods[] = {
+            {"setTitlebarAppearsTransparent:", (IMP)window_set_titlebar_appears_transparent, "v@:c"},
+            {"titlebarAppearsTransparent", (IMP)window_titlebar_appears_transparent, "c@:"},
+            {"setTitleVisibility:", (IMP)window_set_title_visibility, "v@:q"},
+            {"titleVisibility", (IMP)window_title_visibility, "q@:"},
+        };
+        int titlebar_added = 0;
+        for (unsigned long i = 0; i < sizeof titlebar_methods / sizeof titlebar_methods[0]; i++) {
+            SEL selector = sel_registerName(titlebar_methods[i].name);
+            if (!class_getInstanceMethod(window_class, selector) &&
+                class_addMethod(window_class, selector, titlebar_methods[i].imp, titlebar_methods[i].types))
+                titlebar_added++;
+        }
+        if (titlebar_added)
+            write_str("[MacOBlox] Added NSWindow title bar options missing in this Darling\n");
         SEL win_at_pt = sel_registerName("windowNumberAtPoint:belowWindowWithWindowNumber:");
         Method mWinAtPt = class_getClassMethod(window_class, win_at_pt);
         if (mWinAtPt) {

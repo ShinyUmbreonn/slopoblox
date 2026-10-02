@@ -750,6 +750,19 @@ def raise_darling_priority():
     return sum(_raise_priority(pid, target) for pid in _with_descendants(_darlingservers()))
 
 
+def darling_version(env=None):
+    """What `darling --version` calls itself (a release prints its commit),
+    for the launch log: reports from another Darling build than the tested
+    one are otherwise hard to tell apart."""
+    try:
+        result = subprocess.run(["darling", "--version"], capture_output=True, text=True,
+                                timeout=5, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return lines[0].strip() if lines else "unknown"
+
+
 def darlingserver_running():
     return bool(_darlingservers())
 
@@ -1446,13 +1459,15 @@ class RobloxSession:
         variables = [
             f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}",
             f"MACOBLOX_SCROLL_SENSITIVITY={self.settings.get('scroll_sensitivity', 1.5):.2f}",
-            # Mesa builds its shader cache under the prefix's /Users, which
-            # is not writable on every setup ("Failed to create /Users for
-            # shader cache -- disabling"), so every launch recompiled every
-            # shader. Point it at the host cache instead; NVIDIA's driver
-            # ignores it, Mesa picks it up.
-            f"MESA_SHADER_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
-            f"MESA_GLSL_CACHE_DIR=/Volumes/SystemRoot{CACHE_DIR / 'mesa-shader-cache'}",
+            # Mesa is the host's library and sees the host's file system,
+            # not the prefix: with HOME=/Users/<name> it could not create
+            # its shader cache ("Failed to create /Users for shader cache
+            # -- disabling") and every launch recompiled every shader. So
+            # the cache directory is given as the host path, without the
+            # /Volumes/SystemRoot the guest's paths carry (with it Mesa
+            # failed the same way on /Volumes). NVIDIA's driver ignores it.
+            f"MESA_SHADER_CACHE_DIR={CACHE_DIR / 'mesa-shader-cache'}",
+            f"MESA_GLSL_CACHE_DIR={CACHE_DIR / 'mesa-shader-cache'}",
             # Roblox keeps its own caches (flag cache, thumbnail temp files)
             # under the prefix's /private/tmp, which does not survive a
             # Darling restart: every launch re-downloaded 23k flags and every
@@ -1559,6 +1574,7 @@ class RobloxSession:
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
         with open(self.log_path, "wb") as log:
             log.write(f"Mac O’ Blox {__version__}\n".encode())
+            log.write(f"Darling: {darling_version(env)}\n".encode())
             if leftover:
                 log.write(f"Ended {len(leftover)} Roblox process(es) of an earlier game\n".encode())
             if orphans:
