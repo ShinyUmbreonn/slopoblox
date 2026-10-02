@@ -13,9 +13,17 @@ trap 'rm -f -- "$tmp_output"' EXIT
 # builtins, compiled on their own (see fast_libc.c).
 clang -target x86_64-apple-darwin -isysroot "$sysroot" -mmacosx-version-min=11.0 \
   -O2 -fno-builtin -c "$project_dir/fast_libc.c" -o "$build_dir/fast_libc.o"
+# Newer clang compiles Objective-C literals (@1, @[], @{}) to constant objects
+# of classes Darling's runtime does not have; -fno-objc-constant-literals turns
+# that off. Older clang (22 and before) has neither the feature nor the flag
+# and stops with "unknown argument", so it is passed only where it exists.
+objc_literal_flag=
+if clang -target x86_64-apple-darwin -fno-objc-constant-literals -x objective-c -fsyntax-only /dev/null 2>/dev/null; then
+  objc_literal_flag=-fno-objc-constant-literals
+fi
 clang -target x86_64-apple-darwin -fuse-ld=lld \
   -isysroot "$sysroot" -mmacosx-version-min=11.0 \
-  -dynamiclib -fno-objc-arc -fno-objc-constant-literals -Werror=incompatible-function-pointer-types \
+  -dynamiclib -fno-objc-arc $objc_literal_flag -Werror=incompatible-function-pointer-types \
   -Wl,-undefined,dynamic_lookup \
   -install_name @rpath/libMacOBloxShims.dylib \
   "$project_dir/libMacOBloxShims.m" "$project_dir/xattr_compat.c" "$project_dir/exit_compat.c" "$project_dir/missing_symbols.c" "$project_dir/net_trace.c" "$project_dir/darling_fixes.c" "$project_dir/thread_kick.c" "$project_dir/xfixes_raw.c" "$project_dir/raw_mouse.c" "$project_dir/dns_override.c" "$project_dir/audio_hal.c" "$project_dir/gpu_info.c" "$project_dir/gl_profile.c" "$project_dir/connectx_compat.c" "$project_dir/memory_stats.c" "$project_dir/web_bridge.m" "$build_dir/fast_libc.o" \
