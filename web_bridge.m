@@ -81,6 +81,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 - (long)longValue; - (BOOL)boolValue; - (double)doubleValue;
 @end
 @interface NSArray : NSObject
++ (id)array;
 + (id)arrayWithObjects:(const id *)objects count:(NSUInteger)count;
 - (NSUInteger)count; - (id)objectAtIndex:(NSUInteger)index; - (id)objectAtIndexedSubscript:(NSUInteger)index;
 - (id)lastObject; - (id)sortedArrayUsingDescriptors:(NSArray *)order;
@@ -89,6 +90,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 + (id)array; - (void)addObject:(id)object; - (void)removeObjectAtIndex:(NSUInteger)index;
 @end
 @interface NSDictionary : NSObject
++ (id)dictionary;
 + (id)dictionaryWithObjects:(const id *)objects forKeys:(const id *)keys count:(NSUInteger)count;
 - (id)objectForKey:(id)key; - (id)objectForKeyedSubscript:(id)key; - (NSArray *)allKeys;
 @end
@@ -521,7 +523,7 @@ static long request(NSMutableDictionary *message, void (^completion)(id, NSError
     request([@{@"op": @"cookies-get"} mutableCopy], ^(id value, NSError *error) {
         (void)error;
         NSMutableArray *cookies = [NSMutableArray array];
-        NSArray *list = [value isKindOfClass:[NSArray class]] ? value : @[];
+        NSArray *list = [value isKindOfClass:[NSArray class]] ? value : [NSArray array];
         for (NSUInteger i = 0; i < [list count]; i++) {
             NSDictionary *c = [list objectAtIndex:i];
             if (![c isKindOfClass:[NSDictionary class]] || !c[@"name"] || !c[@"value"] || !c[@"domain"] || !c[@"path"])
@@ -653,7 +655,7 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
 - (id)loadRequest:(NSURLRequest *)urlRequest {
     id controller = [_configuration userContentController];
     NSDictionary *handlers = stateFor(controller)[@"handlers"];
-    NSArray *names = handlers ? [(id)handlers allKeys] : @[];
+    NSArray *names = handlers ? [(id)handlers allKeys] : [NSArray array];
     for (NSUInteger i = 0; i < [names count]; i++)
         sendMessage(@{@"op": @"handler", @"view": @(_id), @"name": [names objectAtIndex:i]});
     NSArray *scripts = stateFor(controller)[@"scripts"];
@@ -670,7 +672,7 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
     if (!url)
         return _navigation;
     sendMessage(@{@"op": @"load", @"view": @(_id), @"url": url,
-                  @"headers": [urlRequest allHTTPHeaderFields] ?: @{},
+                  @"headers": [urlRequest allHTTPHeaderFields] ?: [NSDictionary dictionary],
                   @"panelTitle": [title isKindOfClass:[NSString class]] ? title : @"",
                   @"delegate": @([_navigationDelegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)]),
                   @"agent": [self userAgent]});

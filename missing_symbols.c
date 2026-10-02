@@ -129,3 +129,7 @@ void *SCNetworkServiceGetInterface(const void *service) { (void)service; return 
 const void *SCNetworkInterfaceGetInterfaceType(const void *interface) {
     (void)interface; return NULL;
 }
+
+/* Fallback empty collection structs for Clang-compiled Objective-C literals on Darling. */
+void *___NSArray0__struct[4] = {0};
+void *___NSDictionary0__struct[4] = {0};
