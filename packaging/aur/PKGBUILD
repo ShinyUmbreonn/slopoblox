@@ -24,7 +24,7 @@ package() {
   cd "$_name"
   local share="$pkgdir/usr/share/macoblox"
   install -d "$share"
-  cp -r --no-preserve=ownership launcher branding frameworks build_debug_shim.sh ./*.c ./*.m "$share/"
+  cp -r --no-preserve=ownership launcher branding frameworks build_debug_shim.sh ./*.c ./*.m ./*.h "$share/"
   rm -f "$share/launcher/install.sh"
   python -m compileall -q -d /usr/share/macoblox/launcher "$share/launcher"
 

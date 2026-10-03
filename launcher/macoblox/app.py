@@ -13,7 +13,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import __version__, author, core, discord, dns, i18n, mods, studio, theme, uri as uri_handoff  # noqa: E402
+from . import __version__, author, core, discord, dns, i18n, mods, studio, uri as uri_handoff  # noqa: E402
 from .i18n import _  # noqa: E402
 
 APP_ID = "wtf.aubree.MacOBlox"
@@ -120,8 +120,10 @@ class GameLogsView(Gtk.Box):
         bar.set_margin_end(16)
         bar.set_margin_top(8)
 
-        # Which log, and how long: the window's title already says "logs".
-        self.status_label = Gtk.Label(css_classes=["link-note"])
+        self.title_label = Gtk.Label(label=_("Game Logs"), css_classes=["heading"])
+        bar.append(self.title_label)
+
+        self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=8)
         bar.append(self.status_label)
 
         spacer = Gtk.Box(hexpand=True)
@@ -217,18 +219,16 @@ class GameLogsView(Gtk.Box):
         self.text_view.set_bottom_margin(12)
         self.buffer = self.text_view.get_buffer()
 
-        # No hue, as everywhere in the launcher: a line's level shows in its
-        # brightness and weight, and the line itself says Error or Warning.
-        self.tag_ln = self.buffer.create_tag("log_ln", foreground=theme.FAINT)
-        self.tag_time = self.buffer.create_tag("log_time", foreground=theme.FAINT)
-        self.tag_err = self.buffer.create_tag("log_err", foreground="#ffffff", weight=Pango.Weight.BOLD)
-        self.tag_warn = self.buffer.create_tag("log_warn", foreground=theme.TEXT, weight=Pango.Weight.MEDIUM)
-        self.tag_info = self.buffer.create_tag("log_info", foreground=theme.DIM)
-        self.tag_success = self.buffer.create_tag("log_success", foreground=theme.ACCENT, weight=Pango.Weight.MEDIUM)
-        self.tag_debug = self.buffer.create_tag("log_debug", foreground=theme.FAINT)
-        self.tag_macoblox = self.buffer.create_tag("log_macoblox", foreground=theme.ACCENT2, weight=Pango.Weight.MEDIUM)
-        self.tag_match = self.buffer.create_tag("search_match", background="#3a3a3a", foreground="#ffffff")
-        self.tag_current = self.buffer.create_tag("search_current", background=theme.ACCENT, foreground="#000000")
+        self.tag_ln = self.buffer.create_tag("log_ln", foreground="#6e6e73")
+        self.tag_time = self.buffer.create_tag("log_time", foreground="#77767b")
+        self.tag_err = self.buffer.create_tag("log_err", foreground="#ed333b", weight=Pango.Weight.BOLD)
+        self.tag_warn = self.buffer.create_tag("log_warn", foreground="#e5a50a", weight=Pango.Weight.SEMIBOLD)
+        self.tag_info = self.buffer.create_tag("log_info", foreground="#3584e4")
+        self.tag_success = self.buffer.create_tag("log_success", foreground="#33d17a", weight=Pango.Weight.BOLD)
+        self.tag_debug = self.buffer.create_tag("log_debug", foreground="#7f848e")
+        self.tag_macoblox = self.buffer.create_tag("log_macoblox", foreground="#c061cb", weight=Pango.Weight.BOLD)
+        self.tag_match = self.buffer.create_tag("search_match", background="#2a5c9a", foreground="#ffffff")
+        self.tag_current = self.buffer.create_tag("search_current", background="#f6d32d", foreground="#000000")
         self._ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s,]*)(.*)$")
 
         self.scrolled.set_child(self.text_view)
@@ -429,52 +429,122 @@ class GameLogsView(Gtk.Box):
         self.close_search()
 
 
-class PlayPage(Gtk.Box):
-    """The "play" window of the desktop: what is installed, what is running,
-    and the two buttons. The log has its own window (GameLogsView)."""
-
+class PlayPage(Adw.Bin):
     def __init__(self, window):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        super().__init__()
         self.window = window
+        toolbar_view = Adw.ToolbarView()
 
-        head = Gtk.Box(spacing=13, margin_bottom=11)
-        logo = core.PROJECT / "branding" / "logo_1024.png"
-        picture = Gtk.Image.new_from_file(str(logo)) if logo.exists() else Gtk.Image(icon_name="macoblox")
-        picture.set_pixel_size(62)
-        picture.add_css_class("pfp")
-        head.append(picture)
-        names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        names.append(Gtk.Label(label="Mac O’ Blox", xalign=0, css_classes=["about-name"]))
-        names.append(Gtk.Label(label=f"v{__version__}", xalign=0, css_classes=["about-version"]))
-        live = Gtk.Box(spacing=6, margin_top=3)
-        self.live_dot = theme.dot()
-        self.live_label = Gtk.Label(xalign=0, css_classes=["about-live"])
-        live.append(self.live_dot)
-        live.append(self.live_label)
-        names.append(live)
-        head.append(names)
-        self.append(head)
+        self.stack = Adw.ViewStack()
+        self.top_box = None
 
-        self.roblox_fact = theme.Fact("Roblox")
-        self.darling_fact = theme.Fact("Darling")
-        self.account_fact = theme.Fact(_("Account"))
-        self.playtime_fact = theme.Fact(_("Total playtime"), dotted=False)
-        for fact in (self.roblox_fact, self.darling_fact, self.account_fact, self.playtime_fact):
-            self.append(fact)
+        status = Adw.StatusPage()
+        status.set_icon_name("macoblox")
+        status.set_title("Mac O’ Blox")
+        self.status = status
 
-        self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False, margin_top=10)
-        self.append(self.studio_progress)
+        center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                             halign=Gtk.Align.CENTER)
 
-        buttons = Gtk.Box(spacing=6, margin_top=12)
-        self.play = Gtk.Button(label=_("Play"), hexpand=True, css_classes=["big", "suggested-action"])
+        self.log_button = Gtk.Button(label=_("Open last log"))
+        self.log_button.add_css_class("flat")
+        self.log_button.set_visible(False)
+        self.log_button.connect("clicked", lambda *_args: window.open_last_log())
+        center_box.append(self.log_button)
+
+        links = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=14)
+        for title, icon, uri in _links():
+            button = Gtk.Button(icon_name=icon, tooltip_text=title)
+            button.add_css_class("flat")
+            button.add_css_class("circular")
+            button.connect("clicked", lambda *_args, u=uri: _open_uri(window, u))
+            links.append(button)
+        center_box.append(links)
+
+        status.set_child(center_box)
+        self.stack.add_titled_with_icon(status, "play", _("Play"), "media-playback-start-symbolic")
+
+        self.logs_view = GameLogsView(window)
+        self.stack.add_titled_with_icon(self.logs_view, "logs", _("Logs"), "utilities-terminal-symbolic")
+
+        self.top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.top_box.set_margin_top(10)
+        self.top_box.set_margin_bottom(10)
+        self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.switcher.set_halign(Gtk.Align.CENTER)
+        self.top_box.append(self.switcher)
+        self.top_box.set_visible(False)
+
+        toolbar_view.add_top_bar(self.top_box)
+        toolbar_view.set_content(self.stack)
+        self.stack.connect("notify::visible-child-name", self._on_tab_changed)
+
+        action_bar = Gtk.ActionBar()
+
+        self.playtime_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.playtime_box.set_valign(Gtk.Align.CENTER)
+        self.playtime_box.add_css_class("dim-label")
+        clock_icon = Gtk.Image(icon_name="preferences-system-time-symbolic")
+        self.playtime_label = Gtk.Label()
+        self.playtime_box.append(clock_icon)
+        self.playtime_box.append(self.playtime_label)
+        self.playtime_box.set_tooltip_text(_("Total playtime"))
+        action_bar.pack_start(self.playtime_box)
+
+        self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False)
+        self.studio_progress.set_size_request(160, -1)
+        action_bar.pack_start(self.studio_progress)
+
+        self.play = Gtk.Button(label=_("Play"))
+        self.play.add_css_class("suggested-action")
+        self.play.add_css_class("pill")
+        self.play.set_size_request(140, -1)
         self.play.connect("clicked", lambda *_args: self._on_play_clicked())
-        buttons.append(self.play)
-        self.studio = Gtk.Button(label=_("Roblox Studio"), css_classes=["big"])
+        action_bar.pack_end(self.play)
+
+        self.studio = Gtk.Button(label=_("Roblox Studio"))
+        self.studio.add_css_class("pill")
+        self.studio.set_size_request(130, -1)
         self.studio.connect("clicked", lambda *_args: window.studio_clicked())
         # Studio needs Wine, which the Flatpak does not have yet.
         self.studio.set_visible(not os.path.exists("/.flatpak-info"))
-        buttons.append(self.studio)
-        self.append(buttons)
+        action_bar.pack_end(self.studio)
+
+        toolbar_view.add_bottom_bar(action_bar)
+        self.set_child(toolbar_view)
+        self.refresh()
+
+    def _on_tab_changed(self, stack, _pspec):
+        if getattr(self, "top_box", None) is None:
+            return
+        tab = stack.get_visible_child_name()
+        if tab == "logs":
+            self.logs_view.update()
+        elif tab == "play":
+            running = self.window.session is not None
+            busy = self.window.busy
+            active = running or busy == "starting"
+            if not active:
+                self.top_box.set_visible(False)
+
+    def show_logs(self, log_path=None):
+        if not log_path:
+            log_path = (self.window.session.log_path if self.window.session else None) or self.window.last_log
+        if not log_path or not log_path.exists():
+            _toast(self.window.toasts, _("No log found"))
+            return
+        self.top_box.set_visible(True)
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(True)
+                child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+        self.logs_view.reset(log_path)
+        self.logs_view.update()
+        self.stack.set_visible_child_name("logs")
 
     def _on_play_clicked(self):
         if self.window.session is not None:
@@ -484,34 +554,42 @@ class PlayPage(Gtk.Box):
 
     def refresh_playtime(self):
         show = self.window.settings.get("show_playtime", True)
-        self.playtime_fact.set_visible(show)
+        self.playtime_box.set_visible(show)
         if show:
-            seconds = self.window.settings.get("playtime_seconds", 0)
-            self.playtime_fact.set(None, core.format_playtime(seconds).lower())
+            sec = self.window.settings.get("playtime_seconds", 0)
+            self.playtime_label.set_text(core.format_playtime(sec))
 
     def refresh(self):
         running = self.window.session is not None
         busy = self.window.busy
+        active = running or busy == "starting"
+        viewing_logs = self.stack.get_visible_child_name() == "logs"
+
+        # Show switcher when game is active or currently viewing logs
+        self.top_box.set_visible(active or viewing_logs)
+
+        child = self.switcher.get_first_child()
+        idx = 0
+        while child:
+            if idx == 1:
+                child.set_sensitive(active or bool(self.window.last_log))
+                if not active and not self.window.last_log:
+                    child.set_tooltip_text(_("Game is not running"))
+                else:
+                    child.set_tooltip_text(_("View game logs"))
+            child = child.get_next_sibling()
+            idx += 1
+
+        if not active and not self.window.last_log and viewing_logs:
+            self.stack.set_visible_child_name("play")
 
         version = core.installed_version()
-        self.roblox_fact.set("on" if version else "missing", version or _("not installed"))
-        darling = core.darlingserver_running()
-        self.darling_fact.set("on" if darling else None,
-                              _("running") if darling else _("starts with the game"))
-        signed_in = bool(version) and core.signed_in()
-        self.account_fact.set("on" if signed_in else None,
-                              _("signed in") if signed_in else _("not signed in"))
-
-        if running:
-            state, text = "on", _("playing")
-        elif busy == "starting":
-            state, text = "busy", _("starting")
-        elif busy:
-            state, text = "busy", _("busy")
-        else:
-            state, text = None, _("not running")
-        theme.set_dot(self.live_dot, state)
-        self.live_label.set_label(text)
+        parts = [_("Roblox {version}", version=version) if version else _("Roblox not found")]
+        parts.append(_("Darling running") if core.darlingserver_running()
+                     else _("Darling starts with the game"))
+        if version and not running and not core.signed_in():
+            parts.append(_("Sign in with Quick Login"))
+        self.status.set_description(" · ".join(parts))
 
         if running:
             self.play.set_label(_("Stop Roblox"))
@@ -529,8 +607,8 @@ class PlayPage(Gtk.Box):
             self.play.add_css_class("suggested-action")
             self.play.set_sensitive(not busy)
 
+        self.log_button.set_visible(bool(self.window.last_log) and not running)
         self.refresh_playtime()
-        self.window.refresh_chrome(state, text)
 
 
 class FlagsPage(Adw.PreferencesPage):
@@ -936,6 +1014,18 @@ class SettingsPage(Adw.Bin):
         self.env_page.add(interface)
 
         game = Adw.PreferencesGroup(title=_("Game"))
+        renderer_codes = ("opengl", "vulkan")
+        renderer = Adw.ComboRow(
+            title=_("Renderer"),
+            subtitle=_("Applies on next launch. Vulkan uses Mesa Zink and a hardware Vulkan driver."),
+            model=Gtk.StringList.new([_("OpenGL"), _("Vulkan (Zink, experimental)")]))
+        selected_renderer = settings.get("renderer", "opengl")
+        renderer.set_selected(renderer_codes.index(selected_renderer)
+                              if selected_renderer in renderer_codes else 0)
+        renderer.connect("notify::selected", lambda row, _pspec: window.set_setting(
+            "renderer", renderer_codes[row.get_selected()]))
+        game.add(renderer)
+
         sensitivity = Adw.SpinRow.new_with_range(0.1, 5.0, 0.05)
         sensitivity.set_digits(2)
         sensitivity.set_title(_("Camera sensitivity"))
@@ -1082,7 +1172,6 @@ class SettingsPage(Adw.Bin):
                            ("trace_keys", "Keyboard tracing"),
                            ("fps_log", "Frame rate in the log")]:
             row = Adw.SwitchRow(title=_(title), subtitle=core.TRACE_ENV[key], active=settings[key])
-            row.add_css_class("mono-subtitle")
             row.connect("notify::active", lambda r, _pspec, k=key: window.set_setting(k, r.get_active()))
             diagnostics.add(row)
         logs = _button_row(_("Open logs folder"))
@@ -1163,7 +1252,13 @@ class SettingsPage(Adw.Bin):
         self.flags_page = FlagsPage(window)
         self.stack.add_titled_with_icon(self.flags_page, "flags", _("Fast flags"), "preferences-other-symbolic")
 
-        toolbar_view.add_top_bar(theme.tabs(self.stack))
+        top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top_box.set_margin_top(10)
+        top_box.set_margin_bottom(10)
+        switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        switcher.set_halign(Gtk.Align.CENTER)
+        top_box.append(switcher)
+        toolbar_view.add_top_bar(top_box)
         toolbar_view.set_content(self.stack)
 
         self.set_child(toolbar_view)
@@ -1460,6 +1555,43 @@ def _links():
     if author.GITHUB_URL:
         links.append(("GitHub", "macoblox-github-symbolic", author.GITHUB_URL))
     return links
+
+
+def _page_sidebar(stack):
+    """The sidebar's page list. Adw.ViewSwitcherSidebar needs libadwaita 1.9;
+    older ones (Ubuntu 24.04 has 1.5, Debian 13 1.7) get a plain list of the
+    same pages."""
+    if hasattr(Adw, "ViewSwitcherSidebar"):
+        sidebar = Adw.ViewSwitcherSidebar()
+        sidebar.set_stack(stack)
+        return sidebar
+    names = []
+    rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+    rows.add_css_class("navigation-sidebar")
+    pages = stack.get_pages()
+    for index in range(pages.get_n_items()):
+        page = pages.get_item(index)
+        line = Gtk.Box(spacing=12)
+        line.append(Gtk.Image(icon_name=page.get_icon_name()))
+        line.append(Gtk.Label(label=page.get_title(), xalign=0))
+        rows.append(line)
+        names.append(page.get_name())
+
+    def selected(_rows, row):
+        if row is not None and stack.get_visible_child_name() != names[row.get_index()]:
+            stack.set_visible_child_name(names[row.get_index()])
+
+    def follow(*_args):
+        name = stack.get_visible_child_name()
+        if name in names:
+            row = rows.get_row_at_index(names.index(name))
+            if rows.get_selected_row() is not row:
+                rows.select_row(row)
+
+    rows.connect("row-selected", selected)
+    stack.connect("notify::visible-child-name", follow)
+    follow()
+    return rows
 
 
 def _open_uri(window, uri):
@@ -1804,11 +1936,7 @@ class ModsPage(Adw.Bin):
 class LauncherWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Mac O’ Blox")
-        self.set_default_size(1000, 660)
-        size = re.fullmatch(r"(\d+)x(\d+)", os.environ.get("MACOBLOX_WINDOW_SIZE", ""))
-        if size:  # screenshots
-            self.set_default_size(int(size.group(1)), int(size.group(2)))
-        self.set_size_request(540, 420)
+        self.set_default_size(760, 580)
         self.set_resizable(True)
         self.settings = core.load_settings()
         i18n.set_language(self.settings.get("language", "en"))
@@ -1823,246 +1951,72 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.last_log = self._find_last_log()
         self.pending_uri = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
-        self.backdrop = theme.Backdrop()
-        self._overlay = None
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
-        GLib.timeout_add_seconds(15, self._tick_clock)
         threading.Thread(target=self._check_startup_update, daemon=True).start()
 
     def build(self, page):
-        """(Re)create the interface, e.g. after the language changes: a top
-        bar, and on the desktop below it the play window, the menu window and
-        the window of the page that is open."""
+        """(Re)create the interface, e.g. after the language changes."""
         if getattr(self, "settings_page", None):
             self.settings_page.flush()  # the new page reads the file
         self.toasts = Adw.ToastOverlay()
         self.stack = Adw.ViewStack()
-        self.console = theme.Console()
-        self.stack.add_named(Gtk.ScrolledWindow(child=self.console,
-                                                hscrollbar_policy=Gtk.PolicyType.NEVER), "play")
-        self.settings_page = SettingsPage(self)
-        self.stack.add_named(self.settings_page, "settings")
-        self.mods_page = ModsPage(self)
-        self.stack.add_named(self.mods_page, "mods")
-        self.logs_view = GameLogsView(self)
-        self.stack.add_named(self.logs_view, "logs")
-        self.info_page = InfoPage(self)
-        self.stack.add_named(self.info_page, "info")
-        self.flags_page = self.settings_page.flags_page
-        self.toasts.set_child(self.stack)
-        self.content_win = theme.Win("", self.toasts, padded=False, natural_width=theme.CONTENT_WIDTH)
-        self.content_win.set_hexpand(True)
-        self.content_win.set_vexpand(True)
-        for page_widget in (self.settings_page, self.mods_page, self.info_page):
-            theme.fit_columns(page_widget)
-
         self.play_page = PlayPage(self)
-        self.menu = theme.LinkList()
-        self.menu.add("play", _("console"), lambda: self.show_page("play"))
-        self.menu.add("settings", _("Settings").lower(), lambda: self.show_page("env"), note=f"v{__version__}")
-        self.menu.add("flags", _("Fast flags").lower(), lambda: self.show_page("flags"))
-        self.menu.add("mods", _("Mods").lower(), lambda: self.show_page("mods"))
-        self.menu.add("logs", _("Logs").lower(), self.open_last_log)
-        self.menu.add("info", _("Info").lower(), lambda: self.show_page("info"))
-        self.menu.add_section(_("find us"))
-        for title, _icon, uri in _links():
-            owner = uri.rstrip("/").split("/")[-2] if "github.com" in uri else "server"
-            self.menu.add("link-" + title, title.lower(), lambda u=uri: _open_uri(self, u), note=owner)
+        self.stack.add_titled_with_icon(self.play_page, "play", _("Play"), "media-playback-start-symbolic")
+        self.settings_page = SettingsPage(self)
+        self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
+        self.mods_page = ModsPage(self)
+        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "application-x-addon-symbolic")
+        self.info_page = InfoPage(self)
+        self.stack.add_titled_with_icon(self.info_page, "info", _("Info"), "help-about-symbolic")
+        self.flags_page = self.settings_page.flags_page
 
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, valign=Gtk.Align.START,
-                       margin_top=18, margin_bottom=20, margin_start=24, margin_end=10)
-        left.set_size_request(300, -1)
-        left.append(theme.Win(_("Play").lower(), self.play_page))
-        left.append(theme.Win(_("menu"), self.menu))
-        # Scrolls rather than forcing a tall window on a small screen.
-        left_scroll = Gtk.ScrolledWindow(child=left, hscrollbar_policy=Gtk.PolicyType.NEVER,
-                                         propagate_natural_width=True)
-        left_scroll.set_hexpand(False)  # the labels inside would make it share the width
-        self.content_win.set_margin_bottom(20)
-        self.content_win.set_margin_end(24)
-        desktop = Gtk.Box(vexpand=True)
-        desktop.append(left_scroll)
-        desktop.append(self.content_win)
-        self._left, self._left_scroll, self._desktop = left, left_scroll, desktop
-        self._set_narrow(False)
-
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        root.append(self._top_bar())
-        # Only scrolls in the narrow layout, where the windows are stacked.
-        root.append(Gtk.ScrolledWindow(child=desktop, hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True))
-        if self._overlay is not None:
-            self._overlay.set_child(None)  # the backdrop moves to the new one
-        self._overlay = Gtk.Overlay(child=self.backdrop)
-        self._overlay.add_overlay(root)
-        self._overlay.set_measure_overlay(root, True)
-        if not hasattr(Adw, "BreakpointBin"):  # libadwaita before 1.4
-            self.set_content(self._overlay)
-            return self._shown(page)
-        # Like the site below 860 px: one column of windows that scrolls.
-        adaptive = Adw.BreakpointBin(child=self._overlay)
-        adaptive.set_size_request(540, 420)
-        narrow = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 860px"))
-        narrow.connect("apply", lambda *_args: self._set_narrow(True))
-        narrow.connect("unapply", lambda *_args: self._set_narrow(False))
-        adaptive.add_breakpoint(narrow)
-        self.set_content(adaptive)
-        self._shown(page)
-
-    def _shown(self, page):
-        self.stack.connect("notify::visible-child-name", self._page_changed)
-        self.settings_page.stack.connect("notify::visible-child-name", self._page_changed)
-        self.show_page(page)
-        self._page_changed()
-        self._tick_clock()
-        self.play_page.refresh()
-
-    def _set_narrow(self, narrow):
-        """Side by side on a wide launcher window; stacked in one scrolling
-        column on a narrow one."""
-        policy = Gtk.PolicyType.NEVER if narrow else Gtk.PolicyType.AUTOMATIC
-        self._desktop.set_orientation(Gtk.Orientation.VERTICAL if narrow else Gtk.Orientation.HORIZONTAL)
-        self._left_scroll.set_policy(Gtk.PolicyType.NEVER, policy)
-        self._left_scroll.set_propagate_natural_height(narrow)
-        self._left.set_size_request(-1 if narrow else 300, -1)
-        self._left.set_margin_end(24 if narrow else 10)
-        self._left.set_margin_bottom(0 if narrow else 20)
-        self.content_win.set_margin_start(24 if narrow else 10)
-        self.content_win.set_margin_top(16 if narrow else 18)
-        self.content_win.set_size_request(-1, 500 if narrow else -1)
-        self.content_win.set_halign(Gtk.Align.FILL if narrow else Gtk.Align.START)
-
-    def _top_bar(self):
-        bar = Gtk.Box(css_classes=["topbar"], spacing=6)
-        bar.append(Gtk.WindowControls(side=Gtk.PackType.START))
-        bar.append(Gtk.Label(label="macoblox@darling", css_classes=["bar-host"]))
-        bar.append(Gtk.Box(hexpand=True))
-        state = Gtk.Box(spacing=6, css_classes=["bar-item"])
-        self.bar_dot = theme.dot()
-        self.bar_state = Gtk.Label()
-        state.append(self.bar_dot)
-        state.append(self.bar_state)
-        bar.append(state)
-        self.bar_session = Gtk.Label(css_classes=["bar-mono"], visible=False,
-                                     tooltip_text=_("Time in this game"))
-        bar.append(self.bar_session)
-        self.bar_clock = Gtk.Label(css_classes=["bar-mono", "bright"])
-        bar.append(self.bar_clock)
-        bar.append(Gtk.WindowControls(side=Gtk.PackType.END))
-        return Gtk.WindowHandle(child=bar)
-
-    def _tick_clock(self):
-        self.bar_clock.set_label(time.strftime("%H:%M"))
-        return True
-
-    def _refresh_session_time(self):
-        if self.session and getattr(self, "game_started_at", None):
-            elapsed = max(0, int(time.time() - self.game_started_at))
-            self.bar_session.set_label(f"{elapsed // 3600}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}")
-            self.bar_session.set_visible(True)
-        else:
-            self.bar_session.set_visible(False)
-
-    def show_page(self, name):
-        """Open a page in the right-hand window; "env", "roblox" and "flags"
-        are the tabs of the settings."""
-        if name in ("env", "roblox", "flags"):
+        if page in ("flags", "env", "roblox"):
             self.stack.set_visible_child_name("settings")
-            self.settings_page.set_tab(name)
-        elif name == "logs":
-            self.open_last_log()
-        elif self.stack.get_child_by_name(name):
-            self.stack.set_visible_child_name(name)
+            self.settings_page.set_tab(page)
+        else:
+            self.stack.set_visible_child_name(page)
 
-    def _page_changed(self, *_args):
-        page = self.stack.get_visible_child_name()
-        tab = self.settings_page.stack.get_visible_child_name()
-        self.menu.set_current("flags" if page == "settings" and tab == "flags" else page)
-        titles = {"play": _("console"), "settings": _("Settings").lower(), "mods": _("Mods").lower(),
-                  "logs": _("Logs").lower(), "info": _("Info").lower()}
-        self.content_win.set_title(titles.get(page, page or ""))
-        if page == "logs":
-            self.logs_view.update()
+        # Official Libadwaita Split View layout
+        self.split = Adw.OverlaySplitView()
+        self.split.set_min_sidebar_width(200)
+        self.split.set_max_sidebar_width(260)
+        self.split.set_sidebar_width_fraction(0.28)
+        self.split.set_show_sidebar(self.settings.get("show_sidebar", True))
 
-    def show_logs(self, log_path=None):
-        log_path = log_path or (self.session.log_path if self.session else None) or self.last_log
-        if not log_path or not log_path.exists():
-            _toast(self.toasts, _("No log found"))
-            return
-        self.logs_view.reset(log_path)
-        self.logs_view.update()
-        self.stack.set_visible_child_name("logs")
-        self._page_changed()
+        # Sidebar with the page list
+        sidebar_toolbar = Adw.ToolbarView()
+        sidebar_header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        sidebar_header.set_title_widget(Gtk.Label(label="Mac O’ Blox", css_classes=["heading"]))
+        sidebar_version = Gtk.Label(label=f"v{__version__}", css_classes=["dim-label", "caption"], margin_end=6)
+        sidebar_header.pack_end(sidebar_version)
+        sidebar_toolbar.add_top_bar(sidebar_header)
 
-    def refresh_chrome(self, state=None, text=""):
-        """The top bar, the menu's notes and the console follow the state the
-        play window just worked out."""
-        theme.set_dot(self.bar_dot, state)
-        self.bar_state.set_label(text)
-        self._refresh_session_time()
-        try:
-            flags = len(core.load_fast_flags())
-        except Exception:  # a damaged flags file is the flags page's to report
-            flags = 0
-        self.menu.set_note("flags", str(flags) if flags else "")
-        log = (self.session.log_path if self.session else None) or self.last_log
-        self.menu.rows["logs"].set_sensitive(bool(log))
-        stamp = re.fullmatch(r"launch-\d{4}(\d\d)(\d\d)-(\d\d)(\d\d)\d\d\.log", log.name) if log else None
-        self.menu.set_note("logs", "{}-{} {}:{}".format(*stamp.groups()) if stamp else "")
-        self.console.set_lines(*self._console_lines())
+        sidebar_toolbar.set_content(_page_sidebar(self.stack))
+        self.split.set_sidebar(sidebar_toolbar)
 
-    def _console_lines(self):
-        """(lines, prompt) for the console: what this computer has and what
-        is still missing, each line a check made just now."""
-        lines = []
-        missing = core.missing_tools()
-        if missing:
-            lines.append(("failed", _("missing: {programs}", programs=", ".join(missing))))
-            lines.append((None, _("install them, then press play")))
-        else:
-            lines.append(("ok", _("darling and the build tools are installed")))
-        version = core.installed_version()
-        if version:
-            lines.append(("ok", _("roblox {version} is installed", version=version)))
-        else:
-            lines.append(("wait", _("roblox is not installed yet")))
-        if core.shim_built():
-            lines.append(("ok", _("the shim is built")))
-        else:
-            lines.append(("wait", _("the shim builds on the first start")))
-        if core.darlingserver_running():
-            lines.append(("ok", _("darling is running")))
-        else:
-            lines.append((None, _("darling starts with the game")))
-        player = core.HostAudio._player_command("")
-        if player:
-            server = "PipeWire" if "pw-cat" in player else "PulseAudio"
-            lines.append(("ok", _("sound goes through {server}", server=server)))
-        else:
-            lines.append(("failed", _("no pw-cat or pacat: the game will be silent")))
-        try:
-            gi.require_version("WebKit", "6.0")
-            lines.append(("ok", _("the sign-in window is ready")))
-        except ValueError:
-            lines.append(("wait", _("WebKitGTK 6.0 is not installed: sign in with Quick Login")))
-        if version and core.signed_in():
-            lines.append(("ok", _("signed in to roblox")))
-        elif version:
-            lines.append((None, _("not signed in: sign in inside roblox")))
-        if self.session:
-            lines.append(("ok", _("roblox is running")))
-            prompt = _("playing")
-        elif self.busy == "starting":
-            lines.append(("wait", _("starting roblox…")))
-            prompt = _("starting")
-        elif self.busy:
-            prompt = _("busy")
-        elif missing:
-            prompt = _("install the missing programs first")
-        elif not version:
-            prompt = _("press install roblox")
-        else:
-            prompt = _("press play")
-        return lines, prompt
+        # Content area
+        content_view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+
+        sidebar_toggle = Gtk.Button(icon_name="sidebar-show-symbolic")
+        sidebar_toggle.add_css_class("flat")
+        sidebar_toggle.set_tooltip_text(_("Toggle sidebar"))
+        sidebar_toggle.connect("clicked", lambda *_args: self.toggle_sidebar())
+        header.pack_start(sidebar_toggle)
+
+        content_view.add_top_bar(header)
+        self.toasts.set_child(self.stack)
+        content_view.set_content(self.toasts)
+        content_view.set_hexpand(True)
+        content_view.set_vexpand(True)
+        self.split.set_content(content_view)
+
+        self.set_content(self.split)
+
+    def toggle_sidebar(self):
+        show = not self.split.get_show_sidebar()
+        self.split.set_show_sidebar(show)
+        self.set_setting("show_sidebar", show)
 
     def _check_startup_update(self):
         try:
@@ -2392,8 +2346,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.game_started_at = time.time()
         self.last_playtime_save = time.time()
         self.current_game_info = None
-        self.logs_view.reset(session.log_path)
-        self.logs_view.update()
+        if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+            self.play_page.logs_view.reset(session.log_path)
+            self.play_page.logs_view.update()
         self.play_page.refresh()
         if self.settings.get("discord_rpc", True):
             self._start_rpc()
@@ -2424,9 +2379,9 @@ class LauncherWindow(Adw.ApplicationWindow):
             # Active game: track playtime
             self.settings["playtime_seconds"] = self.settings.get("playtime_seconds", 0) + 1
             self.play_page.refresh_playtime()
-            self._refresh_session_time()
-            if self.stack.get_visible_child_name() == "logs":
-                self.logs_view.update()
+            if hasattr(self, "play_page") and hasattr(self.play_page, "logs_view"):
+                if self.play_page.stack.get_visible_child_name() == "logs":
+                    self.play_page.logs_view.update()
             if time.time() - getattr(self, "last_playtime_save", 0) > 15:
                 self.last_playtime_save = time.time()
                 core.save_settings(self.settings)
@@ -2504,8 +2459,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         log_path = (self.session.log_path if self.session else None) or self.last_log or self._find_last_log()
         if log_path:
             self.last_log = log_path
-            self.show_logs(log_path)
-            return
+            if hasattr(self, "play_page") and hasattr(self.play_page, "show_logs"):
+                self.play_page.show_logs(log_path)
+                return
         self.open_external_log(log_path)
 
     def open_external_log(self, log_path=None):
@@ -2527,7 +2483,6 @@ class LauncherApp(Adw.Application):
     def do_activate(self):
         pending = uri_handoff.peek_pending()
         if not self.window:
-            theme.install()
             Gtk.Window.set_default_icon_name("macoblox")
             Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
                 str(core.PROJECT / "launcher" / "icons"))

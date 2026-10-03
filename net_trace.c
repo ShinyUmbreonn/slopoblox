@@ -1,3 +1,4 @@
+#include "shim_lock.h"
 /* UDP receive safety net and tracing.
  *
  * Roblox's network threads wait for socket readiness with kqueue, using
@@ -583,14 +584,15 @@ static struct {
     unsigned long inode; /* which socket had the number when it was added */
     void *udata;
 } watched[MAX_WATCHED];
-static volatile int watched_lock, watched_count;
+static volatile unsigned int watched_lock;
+static volatile int watched_count;
 
 static volatile long synthesized_by_fd[1024];
 
 static void lock_watched(void) {
-    while (__sync_lock_test_and_set(&watched_lock, 1)) {}
+    macoblox_lock(&watched_lock);
 }
-static void unlock_watched(void) { __sync_lock_release(&watched_lock); }
+static void unlock_watched(void) { macoblox_unlock(&watched_lock); }
 
 static void drop_watch(int slot) { /* with the lock held */
     watched[slot].fd = 0;

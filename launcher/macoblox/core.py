@@ -83,6 +83,7 @@ DEFAULT_SETTINGS = {
     "scroll_sensitivity": 1.5,
     "auto_patch_throttle": True,
     "raw_mouse": True,
+    "renderer": "opengl",
     "hide_menu_bar": False,
     "dns": "system",
     "dns_custom": "",
@@ -940,7 +941,7 @@ SHIM_STAMP = BUILD_DIR / "sources.sha256"
 def _shim_sources_hash():
     """Hash of everything the shim build uses, and of the launcher version."""
     digest = hashlib.sha256(__version__.encode())
-    for path in sorted([*PROJECT.glob("*.c"), *PROJECT.glob("*.m"),
+    for path in sorted([*PROJECT.glob("*.c"), *PROJECT.glob("*.m"), *PROJECT.glob("*.h"),
                         *(PROJECT / "frameworks").glob("*"), BUILD_SCRIPT]):
         try:
             digest.update(path.name.encode() + b"\0" + path.read_bytes())
@@ -1453,7 +1454,10 @@ class RobloxSession:
         QUIT_SENTINEL.unlink(missing_ok=True)
 
     def environment(self):
-        return darling_environment()
+        from . import graphics
+        env = darling_environment()
+        env.update(graphics.renderer_environment(self.settings.get("renderer", "opengl")))
+        return env
 
     def shim_variables(self):
         variables = [
@@ -1468,6 +1472,7 @@ class RobloxSession:
             # failed the same way on /Volumes). NVIDIA's driver ignores it.
             f"MESA_SHADER_CACHE_DIR={CACHE_DIR / 'mesa-shader-cache'}",
             f"MESA_GLSL_CACHE_DIR={CACHE_DIR / 'mesa-shader-cache'}",
+            f"__GL_SHADER_DISK_CACHE_PATH={CACHE_DIR / 'nvidia-shader-cache'}",
             # Roblox keeps its own caches (flag cache, thumbnail temp files)
             # under the prefix's /private/tmp, which does not survive a
             # Darling restart: every launch re-downloaded 23k flags and every
@@ -1475,6 +1480,14 @@ class RobloxSession:
             # place tiles). A host directory makes those caches persistent.
             f"TMPDIR=/Volumes/SystemRoot{CACHE_DIR / 'roblox-tmp'}",
         ]
+        from . import graphics
+        variables.extend(f"{name}={value}" for name, value in
+                         graphics.renderer_environment(self.settings.get("renderer", "opengl")).items())
+        # Vulkan layers run in the host driver, but the client gets its
+        # environment from Darling's guest shell. Forward explicit HUD options.
+        for name in ("MANGOHUD", "MANGOHUD_CONFIG", "MANGOHUD_CONFIGFILE"):
+            if name in os.environ:
+                variables.append(f"{name}={os.environ[name]}")
         vram = host_vram_bytes()
         if vram:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")
@@ -1536,6 +1549,10 @@ class RobloxSession:
                 raise RuntimeError(_("Could not build the shim:\n{output}", output=output))
         env = self.environment()
         ensure_x11(env)
+        renderer_name = "OpenGL"
+        if self.settings.get("renderer", "opengl") == "vulkan":
+            from . import graphics
+            renderer_name = graphics.validate_vulkan(env)
         # A game closed a moment ago may still be shutting down. A new one next
         # to it shared its darlingserver, and when that went both died. Give it
         # time, then end it; crash handlers of earlier games are just ended.
@@ -1568,6 +1585,7 @@ class RobloxSession:
         LOGS.mkdir(parents=True, exist_ok=True)
         # The Mesa shader cache dir must exist before the game opens it.
         (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "nvidia-shader-cache").mkdir(parents=True, exist_ok=True)
         # The guest TMPDIR (Roblox's flag and thumbnail caches) likewise.
         (CACHE_DIR / "roblox-tmp").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
@@ -1575,6 +1593,7 @@ class RobloxSession:
         with open(self.log_path, "wb") as log:
             log.write(f"Mac O’ Blox {__version__}\n".encode())
             log.write(f"Darling: {darling_version(env)}\n".encode())
+            log.write(f"Renderer requested: {renderer_name}\n".encode())
             if leftover:
                 log.write(f"Ended {len(leftover)} Roblox process(es) of an earlier game\n".encode())
             if orphans:

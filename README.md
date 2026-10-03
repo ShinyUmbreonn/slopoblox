@@ -118,6 +118,31 @@ Quad9 or Cloudflare. Only Roblox uses it, the rest of the system keeps its DNS.
 </details>
 
 <details>
+<summary>OpenGL and Vulkan rendering</summary>
+
+**OpenGL** is the default and uses Roblox's own OpenGL renderer with the host
+OpenGL driver. Mac O’ Blox hides the Metal device so Roblox selects this path.
+Client startup was verified on NVIDIA OpenGL 4.1 using the client's GLSL shader
+pack.
+
+In **Settings → Environment → Game → Renderer**, choose **Vulkan (Zink,
+experimental)** and restart Roblox. This uses [Mesa Zink](https://docs.mesa3d.org/drivers/zink.html)
+to run the client's OpenGL renderer through Vulkan on Linux. It requires Mesa
+EGL with Zink and a working hardware Vulkan driver. The launcher checks those
+before starting; if the check fails, select **OpenGL** again.
+
+Vulkan gameplay is experimental. Client startup
+and the MangoHud Vulkan overlay have been tested on an RTX 3060 Ti, with GL
+tracing disabled. Heavy gameplay and other GPUs still need testing. This uses
+the macOS client's OpenGL renderer; Metal and native client Vulkan are separate
+backends.
+
+With [MangoHud](https://github.com/flightlessmango/MangoHud) installed, select
+Vulkan and start the source launcher with `MANGOHUD=1 ./launcher/macoblox-launcher`.
+The launcher also forwards `MANGOHUD_CONFIG` and `MANGOHUD_CONFIGFILE` to Roblox.
+</details>
+
+<details>
 <summary>Roblox Studio</summary>
 
 Press **Roblox Studio** in the launcher. The first time it downloads Wine, DXVK

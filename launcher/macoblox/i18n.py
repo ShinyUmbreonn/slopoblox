@@ -6,6 +6,11 @@ LANGUAGES = {"en": "English", "ru": "Русский"}
 _language = "en"
 
 RU = {
+    "Renderer": "Рендерер",
+    "OpenGL": "OpenGL",
+    "Vulkan (Zink, experimental)": "Vulkan (Zink, экспериментальный)",
+    "Applies on next launch. Vulkan uses Mesa Zink and a hardware Vulkan driver.":
+        "Применяется при следующем запуске. Для Vulkan нужны Mesa Zink и аппаратный драйвер Vulkan.",
     # Pages
     "Play": "Играть",
     "Fast flags": "Фастфлаги",

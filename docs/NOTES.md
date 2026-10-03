@@ -267,7 +267,123 @@ had `NSApplication got exception: -[MTLDev...` before the crash.
   llvmpipe: with the prefix "Failed to create /Volumes", no files; with the
   plain host path the cache fills.
 
-## What to Check Next
+## Changes 2026-10-03: input, stalls, graphics, and GNOME interface
+
+- Restored the GNOME/libadwaita sidebar, header bars, preferences and standard
+  styling from before the custom desktop layout. The launcher follows the
+  system appearance and does not load the custom theme or its fonts.
+- Camera capture still hides the hardware pointer for Xwayland's relative
+  motion. `cursor_overlay.c` displays the current cursor in an input-transparent
+  child window at the lock position, preserving its pixels and hotspot. AppKit
+  hide/unhide requests control the visible copy independently. Focus loss
+  releases capture and removes the copy. All X requests run on the cursor
+  worker; its notification pipe is nonblocking and close-on-exec.
+- Input queue, network-watch and GL bookkeeping locks sleep on a Linux futex
+  after a short spin, so a preempted owner does not leave competing threads
+  spinning indefinitely. The shim builds with optimization and frame pointers.
+- Normal shader compilation no longer immediately queries `GL_COMPILE_STATUS`:
+  that query forces asynchronous driver compilation to finish. The extra check
+  and first-failed-source capture are now enabled only with `MACOBLOX_TRACE_GL=1`.
+  NVIDIA gets a persistent host shader-cache path, like Mesa already did.
+- Preserve one `glGetError` query after AppKit's first `glDrawArrays` call when
+  tracing is off. Without it, isolated startup repeatedly aborts before Roblox
+  initializes its renderer, with both optimized and unoptimized shim builds.
+  The dump shows a null call from an NVIDIA GL worker followed by Darling's
+  signal handler aborting on that native thread. One query lets startup proceed;
+  its underlying driver/runtime interaction remains unresolved. It adds no
+  repeated driver queries to normal draws. Full GL tracing stays optional.
+- Claire's GTX 1060 log (580.178.04) and `5070tiuser.log` (which identifies its
+  GPU as RTX 5070, 615.71.09) both contain `GrassVSUnified` failures with C7011,
+  implicit int-to-uint conversion. A copied client's isolated startup captured
+  the actual failing source: `CB3[(_500 & 63u) * 1 + 0]`. The earlier workaround
+  matched only a particular CB12 expression and missed Grass's CB3 indices.
+  Generated array indices mix unsigned values with signed `1` and `0`, which
+  GLSL 1.50 forbids. `shader_compat.c` removes the redundant ` * 1 + 0` at the
+  end of an array index, preserving both signed and unsigned indices without
+  casts. All 897 extracted sources from client 0.741.0.7411056 compile with
+  this correction on NVIDIA 615.71.09, including the 39 CB12 vertex sources
+  that fail unchanged. The second
+  report also contains a `HeightmapDebugPS` uniform-parser failure and
+  unavailable `DefaultUnifiedPlasticVS`/`DefaultUnifiedFlatOpaqueVS` variants.
+  These are separate unresolved errors; shader compilation alone does not
+  establish that all box artifacts are fixed.
+- Claire's log has repeated five-second timeouts for silver/pulsar/gold pixel
+  beacons. The existing exclusion now includes gold and correctly matches
+  subdomains, case and a trailing DNS dot. Other Roblox hosts stay unchanged.
+- An optional launcher renderer uses host Mesa Zink (OpenGL over Vulkan),
+  selecting Mesa's EGL vendor explicitly even on proprietary NVIDIA. A separate
+  process probes both compatibility and 4.1 core contexts before starting
+  Darling, rejects software Vulkan devices, and reports a useful error instead
+  of silently using CPU rendering. Driver settings are passed into the guest
+  shell too. Metal remains disabled. See [Mesa's Zink documentation](https://docs.mesa3d.org/drivers/zink.html)
+  and [NVIDIA's shader-cache settings](https://http.download.nvidia.com/XFree86/Linux-x86_64/555.58/README/openglenvvariables.html).
+- Verified the default native OpenGL path with a copied client, tracing
+  disabled and Metal hidden. Roblox reported NVIDIA OpenGL 4.1 on the RTX
+  3060 Ti; a temporary file-access probe observed `shaders_glsl3.pack` through
+  `fopen` and `open$NOCANCEL`, with no Metal shader-pack access observed during
+  startup. This confirms selection of Roblox's own OpenGL renderer. The
+  probe, client copy and log remained in `/tmp`.
+- Inspected the supplied [Roblox-Mac-Linux-Port](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/tree/99526af60e0791e0467bc6b2632d9e4fba481104)
+  reference. Its locked-cursor layer confirms the need for a visible software
+  cursor while the Xwayland pointer is hidden. Its experimental Metal-to-Vulkan
+  renderer depends on a separate Darling/Indium build and translator, so it is
+  not a drop-in backend for this runtime. No code was copied from it.
+- Tested the macOS client with `FFlagDebugGraphicsPreferVulkan=True` and its
+  OpenGL preference disabled in a copied `ClientAppSettings.json`. It still
+  selected NVIDIA OpenGL. Roblox's [GraphicsMode enum](https://create.roblox.com/docs/reference/engine/enums/GraphicsMode)
+  includes Vulkan (6), but this test did not enable that backend. The installed
+  bundle contains GLSL and Metal shader packs, and imports OpenGL and Metal.
+- The preference-flag test above does not set `RenderSettings.GraphicsMode`.
+  Subsequently tested the serialized setting directly: a `RenderSettings`
+  item named `Rendering` with `<token name="GraphicsMode">6</token>` in the
+  disposable prefix's `~/Library/Roblox/GlobalSettings_13.xml`, followed by a
+  full client restart. An injected file-access probe covered `open`,
+  `open$NOCANCEL`, `fopen` and the client's imported `fopen$DARWIN_EXTSN`.
+  A guest `/bin/cat` positive control read the exact XML successfully; Player's
+  startup produced no access to that advanced-settings file and still selected
+  NVIDIA OpenGL 4.1. `NoGraphics` (9) also left rendering enabled as a control.
+  This saved-setting route therefore did not configure Player's rendering API
+  in client 0.741.0.7411056. Roblox's [property documentation](https://create.roblox.com/docs/reference/engine/classes/RenderSettings#GraphicsMode)
+  describes Studio rendering settings, PluginSecurity access, a Studio restart
+  requirement, and fallback to Automatic for unsupported modes. Device RTTI in
+  the tested binary includes GL and Metal types, with no Vulkan device type
+  found; this is consistent with the packaged GLSL/Metal assets but is not a
+  complete backend audit. Test files and probes stayed in `/tmp`, and each
+  settings file was restored after the run.
+- Built [metal2vulkan](https://github.com/steelbrain/metal2vulkan/tree/43c46ac)
+  in `/tmp` and translated one fragment AIR module extracted from this client's
+  Metal pack. It emitted reflection and SPIR-V that passed its Vulkan 1.2
+  validator in 0.02 seconds, within a 500 MiB process address-space limit.
+  No shader source was added to this repository. This is shader translation
+  evidence only; implementing Metal objects, commands, resource bindings,
+  synchronization and presentation is separate work, and correct pixels have
+  not been verified for this translation.
+
+Validation: full Mach-O shim/framework cross-build; native contention and
+pipe-saturation tests; shader and telemetry regressions; launcher graphics
+tests; Xvfb cursor tests (pixels, hotspot, input shape, visibility, unlock,
+window destruction); visual inspection of the restored GTK pages. The real
+NVIDIA shader test passed for all 897 extracted client sources. The host Zink
+probe returned RTX 3060 Ti hardware rendering for both context types. In an
+isolated Darling prefix, AppKit context creation and dynamically resolved
+shader submission/compilation passed with both native NVIDIA OpenGL and Zink.
+The copied client also reached its sign-in screen through Zink with GL tracing
+off. MangoHud's Vulkan layer was present in the client, its window displayed
+ZINK / Vulkan / RTX 3060 Ti, and it recorded frame data for ten seconds. The
+roughly 60 FPS sign-in screen is not a heavy-gameplay benchmark; the CSV has
+initial outliers and idle presentations, so its summary is not used to claim
+an overall performance improvement.
+Live gameplay, Xwayland camera capture, intermittent freezes and the reported
+box artifacts still need a retest on the affected systems. The supplied
+MicroProfiler image shows about 144 FPS at capture time, not a long freeze;
+it does not identify the cause of the intermittent pauses.
+
+Run the non-GUI regressions with `bash tests/run.sh`. Optional X11 tests and
+their build commands are documented at the top of `tests/cursor_overlay_test.c`
+and `tests/shader_driver_test.c`. The optional Darling integration check is
+`tests/darling_gl_test.m`.
+
+## Earlier investigation notes
 
 We need a recent startup log from a regular terminal. This will help determine where
 the client is hanging: the loader, NIB loading, window creation, or rendering.
