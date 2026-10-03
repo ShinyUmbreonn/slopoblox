@@ -38,19 +38,58 @@ def missing_vulkan_dependencies():
 
 
 def _system_program(name):
-    # run0 executes these as root: use system directories rather than a
+    # Package managers execute as root: use system directories rather than a
     # launcher process's possibly customized PATH.
     return next((str(Path(root) / name) for root in ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
                  if (Path(root) / name).is_file() and os.access(Path(root) / name, os.X_OK)), None)
 
 
+def _askpass_program():
+    configured = os.environ.get("SUDO_ASKPASS", "")
+    if os.path.isabs(configured) and Path(configured).is_file() and os.access(configured, os.X_OK):
+        return configured
+    for name in ("ksshaskpass", "ssh-askpass"):
+        executable = _system_program(name)
+        if executable:
+            return executable
+    return next((path for path in ("/usr/lib/ssh/ssh-askpass", "/usr/libexec/openssh/ssh-askpass",
+                                  "/usr/lib/openssh/gnome-ssh-askpass", "/usr/lib/gcr-ssh-askpass",
+                                  "/usr/lib/gcr4-ssh-askpass", "/usr/lib/git-core/git-gui--askpass")
+                 if Path(path).is_file() and os.access(path, os.X_OK)), None)
+
+
+def _authenticated_install_command(command):
+    """Choose one available prompt. Never retry after denied authentication."""
+    run0 = _system_program("run0")
+    if run0:
+        # Default interactive polkit authentication enables the desktop prompt.
+        return [run0, "--description=Install Mac O' Blox Vulkan dependencies", "--", *command], {}
+    pkexec = _system_program("pkexec")
+    if pkexec:
+        return [pkexec, *command], {}
+    sudo = _system_program("sudo")
+    if sudo:
+        askpass = _askpass_program()
+        if askpass:
+            # sudo reads the helper's output directly; the launcher never sees
+            # or stores the password.
+            return [sudo, "-A", "--", *command], {"SUDO_ASKPASS": askpass}
+        terminals = (("gnome-terminal", ["--wait", "--"]),
+                     ("konsole", ["--separate", "-e"]),
+                     ("xfce4-terminal", ["--disable-server", "--execute"]),
+                     ("kitty", ["--"]), ("alacritty", ["-e"]),
+                     ("foot", ["--"]), ("xterm", ["-e"]))
+        for name, arguments in terminals:
+            terminal = _system_program(name)
+            if terminal:
+                return [terminal, *arguments, sudo, "--", *command], {}
+    raise RuntimeError("No administrator prompt is available. Install run0 or pkexec, or sudo with a graphical askpass helper or terminal, then select Vulkan again. You can also install Mesa EGL and Zink manually.")
+
+
 def vulkan_install_command():
-    """Only fixed package-manager arguments, never a root shell or GUI."""
+    """Return (argv, environment overrides), using fixed package arguments."""
     if Path("/.flatpak-info").is_file():
         raise RuntimeError("Mesa EGL and Zink come from the Flatpak graphics runtime. Update the Flatpak runtime and try again.")
-    run0 = _system_program("run0")
-    if not run0:
-        raise RuntimeError("run0 is unavailable. Install Mesa EGL and Zink with your distribution's package manager, then select Vulkan again.")
     try:
         release = platform.freedesktop_os_release()
     except OSError:
@@ -63,9 +102,7 @@ def vulkan_install_command():
     for ids, manager, arguments in choices:
         executable = _system_program(manager)
         if executable and (family & ids or not identified):
-            # Default interactive polkit authentication enables the run0
-            # desktop prompt. --no-ask-password would suppress that prompt.
-            return [run0, "--description=Install Mac O' Blox Vulkan dependencies", "--", executable, *arguments]
+            return _authenticated_install_command([executable, *arguments])
     raise RuntimeError("Automatic Vulkan dependency installation supports Arch, Debian/Ubuntu and Fedora. Install Mesa EGL and Zink with your package manager.")
 
 
@@ -74,8 +111,9 @@ def ensure_vulkan_dependencies():
     with _dependency_lock:
         if not missing_vulkan_dependencies():
             return False
-        command = vulkan_install_command()
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        command, auth_environment = vulkan_install_command()
+        result = subprocess.run(command, env={**os.environ, **auth_environment},
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if result.returncode:
             detail = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part.strip())[-1500:]
             raise RuntimeError("Vulkan dependencies were not installed. Authentication may have been cancelled.\n" + detail)

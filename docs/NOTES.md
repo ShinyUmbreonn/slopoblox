@@ -416,7 +416,14 @@ exit status 0. The test is optional because it needs Darling and a display.
 
 Selecting Vulkan checks for Mesa's EGL vendor manifest and the Zink DRI
 library. Missing components trigger package installation on a worker thread,
-using fixed package arguments through `run0` and its polkit prompt. Arch uses
+using fixed package arguments through `run0` and its polkit prompt. If `run0`
+is unavailable, use `pkexec`, then `sudo -A` with a graphical askpass helper,
+then `sudo` in an available terminal. Configured `SUDO_ASKPASS` helpers and
+common KDE, SSH and GNOME helpers are detected; terminal fallbacks include
+GNOME Terminal, Konsole, Xfce Terminal, Kitty, Alacritty, Foot and Xterm.
+Terminal commands wait for installation to finish. The launcher
+does not collect passwords or retry authentication after cancellation or
+failure. All commands use argument lists, without a privileged shell. Arch uses
 `mesa`/`vulkan-icd-loader`; Debian and Ubuntu use `libegl-mesa0`,
 `libgl1-mesa-dri` and `libvulkan1`; Fedora uses `mesa-libEGL`,
 `mesa-dri-drivers` and `vulkan-loader`. The launcher rechecks the files after
@@ -426,6 +433,13 @@ Starting with an existing Vulkan selection also checks these dependencies
 before constructing the renderer environment. Packages already installed do
 not trigger a prompt. Flatpak graphics libraries belong to its runtime, so
 this system package installer does not run inside Flatpak.
+
+Validation: the 19 Python tests and native regression suite pass. The optional
+GTK test verifies that cancellation preserves OpenGL and a successful install
+saves Vulkan. Konsole and Kitty were also exercised with an unprivileged test
+child under Xvfb: both supplied a terminal and waited for completion. Package
+installation and authentication are mocked in these tests; no host graphics
+packages were changed.
 
 Native Wayland was deferred at the user's request. The unfinished prototype
 is saved in the ignored `work/wayland-prototype` directory and is not built or

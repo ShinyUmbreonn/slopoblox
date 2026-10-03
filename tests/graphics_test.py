@@ -30,7 +30,8 @@ class GraphicsTests(unittest.TestCase):
                     patch.object(graphics.Path, "is_file", return_value=False), \
                     patch.object(graphics.platform, "freedesktop_os_release", return_value={"ID": distro}), \
                     patch.object(graphics, "_system_program", side_effect=lambda cmd: "/usr/bin/" + cmd):
-                command = graphics.vulkan_install_command()
+                command, environment = graphics.vulkan_install_command()
+                self.assertEqual(environment, {})
                 self.assertEqual(command[0], "/usr/bin/run0")
                 self.assertEqual(command[3], "/usr/bin/" + manager)
                 self.assertIn(package, command)
@@ -40,30 +41,95 @@ class GraphicsTests(unittest.TestCase):
 
     def test_installer_rechecks_files_and_reports_cancelled_authentication(self):
         with patch.object(graphics, "missing_vulkan_dependencies", side_effect=[["Zink"], []]), \
-                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
+                patch.object(graphics, "vulkan_install_command", return_value=(["run0", "package-manager"], {})), \
                 patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertTrue(graphics.ensure_vulkan_dependencies())
+        for backend in ("run0", "pkexec", "sudo", "terminal"):
+            with self.subTest(backend=backend), \
+                    patch.object(graphics, "missing_vulkan_dependencies", return_value=["Zink"]) as missing, \
+                    patch.object(graphics, "vulkan_install_command", return_value=([backend, "package-manager"], {})) as plan, \
+                    patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 126, "", "Not authorized")) as run:
+                with self.assertRaisesRegex(RuntimeError, "Authentication may have been cancelled"):
+                    graphics.ensure_vulkan_dependencies()
+                plan.assert_called_once()
+                run.assert_called_once()
+                missing.assert_called_once()
         with patch.object(graphics, "missing_vulkan_dependencies", return_value=["Zink"]), \
-                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
-                patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "Not authorized")):
-            with self.assertRaisesRegex(RuntimeError, "Authentication may have been cancelled"):
-                graphics.ensure_vulkan_dependencies()
-        with patch.object(graphics, "missing_vulkan_dependencies", return_value=["Zink"]), \
-                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
+                patch.object(graphics, "vulkan_install_command", return_value=(["terminal", "package-manager"], {})), \
                 patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             with self.assertRaisesRegex(RuntimeError, "still missing: Zink"):
                 graphics.ensure_vulkan_dependencies()
 
-    def test_installer_reports_missing_run0_and_keeps_flatpak_in_its_runtime(self):
+    def test_installer_reports_no_prompt_and_keeps_flatpak_in_its_runtime(self):
         with patch.object(graphics.Path, "is_file", return_value=False), \
-                patch.object(graphics, "_system_program", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "run0 is unavailable"):
+                patch.object(graphics.platform, "freedesktop_os_release", return_value={"ID": "arch"}), \
+                patch.object(graphics, "_system_program", side_effect=lambda cmd: "/usr/bin/pacman" if cmd == "pacman" else None):
+            with self.assertRaisesRegex(RuntimeError, "No administrator prompt is available"):
                 graphics.vulkan_install_command()
         with patch.object(graphics.Path, "is_file", return_value=True), \
                 patch.object(graphics, "_system_program") as system_program:
             with self.assertRaisesRegex(RuntimeError, "Flatpak graphics runtime"):
                 graphics.vulkan_install_command()
             system_program.assert_not_called()
+
+    def test_pkexec_fallback_does_not_try_other_prompts(self):
+        with patch.object(graphics, "_system_program", side_effect=lambda cmd: None if cmd == "run0" else "/usr/bin/" + cmd) as program, \
+                patch.object(graphics, "_askpass_program") as askpass:
+            command, environment = graphics._authenticated_install_command(["/usr/bin/pacman", "-S", "mesa"])
+        self.assertEqual(command, ["/usr/bin/pkexec", "/usr/bin/pacman", "-S", "mesa"])
+        self.assertEqual(environment, {})
+        self.assertEqual([call.args[0] for call in program.call_args_list], ["run0", "pkexec"])
+        askpass.assert_not_called()
+
+    def test_sudo_graphical_fallback_passes_helper_without_changing_process_environment(self):
+        with patch.object(graphics, "_system_program", side_effect=lambda cmd: "/usr/bin/sudo" if cmd == "sudo" else None), \
+                patch.object(graphics, "_askpass_program", return_value="/usr/bin/ksshaskpass"), \
+                patch.dict(graphics.os.environ, {"DISPLAY": ":123"}, clear=True), \
+                patch.object(graphics, "missing_vulkan_dependencies", side_effect=[["Zink"], []]), \
+                patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            command, environment = graphics._authenticated_install_command(["/usr/bin/pacman", "-S", "mesa"])
+            self.assertEqual(command, ["/usr/bin/sudo", "-A", "--", "/usr/bin/pacman", "-S", "mesa"])
+            with patch.object(graphics, "vulkan_install_command", return_value=(command, environment)):
+                self.assertTrue(graphics.ensure_vulkan_dependencies())
+            self.assertEqual(run.call_args.kwargs["env"], {"DISPLAY": ":123", "SUDO_ASKPASS": "/usr/bin/ksshaskpass"})
+            self.assertNotIn("SUDO_ASKPASS", graphics.os.environ)
+            self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_terminal_fallbacks_wait_and_preserve_argument_boundaries(self):
+        terminals = (("gnome-terminal", ["--wait", "--"]), ("konsole", ["--separate", "-e"]),
+                     ("xfce4-terminal", ["--disable-server", "--execute"]), ("kitty", ["--"]),
+                     ("alacritty", ["-e"]), ("foot", ["--"]), ("xterm", ["-e"]))
+        package_command = ["/usr/bin/apt-get", "install", "libegl-mesa0", "libgl1-mesa-dri"]
+        for terminal, arguments in terminals:
+            with self.subTest(terminal=terminal), \
+                    patch.object(graphics, "_system_program", side_effect=lambda cmd: "/usr/bin/" + cmd if cmd in ("sudo", terminal) else None), \
+                    patch.object(graphics, "_askpass_program", return_value=None):
+                command, environment = graphics._authenticated_install_command(package_command)
+            self.assertEqual(command, ["/usr/bin/" + terminal, *arguments, "/usr/bin/sudo", "--", *package_command])
+            self.assertEqual(environment, {})
+
+    def test_askpass_detects_configured_and_installed_executable_helpers(self):
+        with patch.dict(graphics.os.environ, {"SUDO_ASKPASS": "/custom/password helper"}, clear=True), \
+                patch.object(graphics.Path, "is_file", return_value=True), \
+                patch.object(graphics.os, "access", return_value=True), \
+                patch.object(graphics, "_system_program") as program:
+            self.assertEqual(graphics._askpass_program(), "/custom/password helper")
+            program.assert_not_called()
+        with patch.dict(graphics.os.environ, {}, clear=True), \
+                patch.object(graphics, "_system_program", return_value=None), \
+                patch.object(graphics.Path, "is_file", return_value=False):
+            self.assertIsNone(graphics._askpass_program())
+        with patch.dict(graphics.os.environ, {"SUDO_ASKPASS": "/not-executable"}, clear=True), \
+                patch.object(graphics, "_system_program", return_value=None), \
+                patch.object(graphics.Path, "is_file", return_value=True), \
+                patch.object(graphics.os, "access", return_value=False):
+            self.assertIsNone(graphics._askpass_program())
+        with patch.dict(graphics.os.environ, {}, clear=True), \
+                patch.object(graphics, "_system_program", return_value=None), \
+                patch.object(graphics.Path, "is_file", autospec=True,
+                             side_effect=lambda path: str(path) == "/usr/lib/gcr4-ssh-askpass"), \
+                patch.object(graphics.os, "access", return_value=True):
+            self.assertEqual(graphics._askpass_program(), "/usr/lib/gcr4-ssh-askpass")
 
     def test_default_preserves_host_driver_selection(self):
         self.assertEqual(graphics.renderer_environment("opengl"), {})

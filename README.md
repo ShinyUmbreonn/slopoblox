@@ -130,10 +130,13 @@ experimental)** and restart Roblox. This uses [Mesa Zink](https://docs.mesa3d.or
 to run the client's OpenGL renderer through Vulkan on Linux. It requires Mesa
 EGL with Zink and a working hardware Vulkan driver. If Mesa EGL or Zink is
 missing, source installations on Arch, Debian/Ubuntu and Fedora install the
-required packages after you authorize the **run0** desktop prompt. Cancelling
-the prompt keeps the previous renderer selected. A system with no `run0` shows
-instructions for installing the dependencies manually. Flatpak graphics
-libraries come from its runtime; update that runtime if they are missing.
+required packages after you authorize an administrator prompt. The launcher
+prefers **run0**; if unavailable, it uses **pkexec**, then **sudo** with a
+graphical password helper, then **sudo** in an available terminal. Cancelling
+authentication stops installation and keeps the previous renderer selected.
+If no supported prompt is available, install the dependencies manually.
+Flatpak graphics libraries come from its runtime; update that runtime if they
+are missing.
 The launcher checks hardware Vulkan support before starting; if that check
 fails, select **OpenGL** again.
 

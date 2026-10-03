@@ -1017,7 +1017,7 @@ class SettingsPage(Adw.Bin):
         renderer_codes = ("opengl", "vulkan")
         renderer = Adw.ComboRow(
             title=_("Renderer"),
-            subtitle=_("Applies on next launch. Missing Mesa EGL/Zink packages need run0 authentication."),
+            subtitle=_("Applies on next launch. Missing Mesa EGL/Zink packages need administrator authentication."),
             model=Gtk.StringList.new([_("OpenGL"), _("Vulkan (Zink, experimental)")]))
         selected_renderer = settings.get("renderer", "opengl")
         renderer.set_selected(renderer_codes.index(selected_renderer)
@@ -1032,7 +1032,7 @@ class SettingsPage(Adw.Bin):
                 window.set_setting("renderer", selected)
                 return
             row.set_sensitive(False)
-            _toast(window.toasts, _("Installing Vulkan dependencies… Authorize the run0 prompt to continue."))
+            _toast(window.toasts, _("Installing Vulkan dependencies… Authorize the administrator prompt to continue."))
 
             def installed(_result, error):
                 row.set_sensitive(True)
