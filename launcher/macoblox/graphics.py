@@ -7,10 +7,82 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
+import threading
 
 RENDERERS = ("opengl", "vulkan")
+_dependency_lock = threading.Lock()
+
+
+def mesa_egl_manifest():
+    return next((Path(root) / "glvnd/egl_vendor.d/50_mesa.json"
+                 for root in ("/usr/share", "/usr/local/share", "/etc", "/app/share")
+                 if (Path(root) / "glvnd/egl_vendor.d/50_mesa.json").is_file()), None)
+
+
+def missing_vulkan_dependencies():
+    missing = []
+    if mesa_egl_manifest() is None:
+        missing.append("Mesa EGL")
+    roots = ("/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib",
+             "/usr/local/lib64", "/app/lib", "/app/lib/x86_64-linux-gnu",
+             "/usr/lib/x86_64-linux-gnu/GL/default/lib", "/usr/lib/GL/default/lib")
+    extra = os.environ.get("LIBGL_DRIVERS_PATH", "").split(":")
+    paths = [Path(root) / "dri/zink_dri.so" for root in roots]
+    paths.extend(Path(root) / "zink_dri.so" for root in extra if root)
+    if not any(path.is_file() for path in paths):
+        missing.append("Zink")
+    return missing
+
+
+def _system_program(name):
+    # run0 executes these as root: use system directories rather than a
+    # launcher process's possibly customized PATH.
+    return next((str(Path(root) / name) for root in ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+                 if (Path(root) / name).is_file() and os.access(Path(root) / name, os.X_OK)), None)
+
+
+def vulkan_install_command():
+    """Only fixed package-manager arguments, never a root shell or GUI."""
+    if Path("/.flatpak-info").is_file():
+        raise RuntimeError("Mesa EGL and Zink come from the Flatpak graphics runtime. Update the Flatpak runtime and try again.")
+    run0 = _system_program("run0")
+    if not run0:
+        raise RuntimeError("run0 is unavailable. Install Mesa EGL and Zink with your distribution's package manager, then select Vulkan again.")
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    family = {release.get("ID", ""), *release.get("ID_LIKE", "").split()}
+    choices = (({"arch"}, "pacman", ["-S", "--needed", "--noconfirm", "mesa", "vulkan-icd-loader"]),
+               ({"debian", "ubuntu"}, "apt-get", ["install", "-y", "--no-install-recommends", "libegl-mesa0", "libgl1-mesa-dri", "libvulkan1"]),
+               ({"fedora", "rhel"}, "dnf", ["install", "-y", "mesa-libEGL", "mesa-dri-drivers", "vulkan-loader"]))
+    identified = any(family & ids for ids, _manager, _arguments in choices)
+    for ids, manager, arguments in choices:
+        executable = _system_program(manager)
+        if executable and (family & ids or not identified):
+            # Default interactive polkit authentication enables the run0
+            # desktop prompt. --no-ask-password would suppress that prompt.
+            return [run0, "--description=Install Mac O' Blox Vulkan dependencies", "--", executable, *arguments]
+    raise RuntimeError("Automatic Vulkan dependency installation supports Arch, Debian/Ubuntu and Fedora. Install Mesa EGL and Zink with your package manager.")
+
+
+def ensure_vulkan_dependencies():
+    """Install only when files are missing; check again after authentication."""
+    with _dependency_lock:
+        if not missing_vulkan_dependencies():
+            return False
+        command = vulkan_install_command()
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if result.returncode:
+            detail = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part.strip())[-1500:]
+            raise RuntimeError("Vulkan dependencies were not installed. Authentication may have been cancelled.\n" + detail)
+        missing = missing_vulkan_dependencies()
+        if missing:
+            raise RuntimeError("Installation finished, but these dependencies are still missing: " + ", ".join(missing))
+        return True
 
 
 def mangohud_environment(renderer, enabled=False):
@@ -50,9 +122,7 @@ def renderer_environment(renderer):
         raise ValueError(f"Unknown renderer: {renderer}")
     # GLVND would otherwise choose NVIDIA's EGL implementation, ignoring
     # Mesa's driver override entirely. These are host paths, also in Flatpak.
-    manifests = [Path(root) / "glvnd/egl_vendor.d/50_mesa.json"
-                 for root in ("/usr/share", "/usr/local/share", "/etc", "/app/share")]
-    manifest = next((path for path in manifests if path.is_file()), None)
+    manifest = mesa_egl_manifest()
     if manifest is None:
         raise RuntimeError("Vulkan (Zink) needs Mesa EGL and Zink. Install them or select OpenGL in Settings.")
     return {

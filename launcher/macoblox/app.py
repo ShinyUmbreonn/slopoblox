@@ -1017,13 +1017,37 @@ class SettingsPage(Adw.Bin):
         renderer_codes = ("opengl", "vulkan")
         renderer = Adw.ComboRow(
             title=_("Renderer"),
-            subtitle=_("Applies on next launch. Vulkan uses Mesa Zink and a hardware Vulkan driver."),
+            subtitle=_("Applies on next launch. Missing Mesa EGL/Zink packages need run0 authentication."),
             model=Gtk.StringList.new([_("OpenGL"), _("Vulkan (Zink, experimental)")]))
         selected_renderer = settings.get("renderer", "opengl")
         renderer.set_selected(renderer_codes.index(selected_renderer)
                               if selected_renderer in renderer_codes else 0)
-        renderer.connect("notify::selected", lambda row, _pspec: window.set_setting(
-            "renderer", renderer_codes[row.get_selected()]))
+        def select_renderer(row, _pspec):
+            selected = renderer_codes[row.get_selected()]
+            if selected == "opengl":
+                window.set_setting("renderer", selected)
+                return
+            from . import graphics
+            if not graphics.missing_vulkan_dependencies():
+                window.set_setting("renderer", selected)
+                return
+            row.set_sensitive(False)
+            _toast(window.toasts, _("Installing Vulkan dependencies… Authorize the run0 prompt to continue."))
+
+            def installed(_result, error):
+                row.set_sensitive(True)
+                if error:
+                    row.handler_block(renderer_handler)
+                    row.set_selected(renderer_codes.index(window.settings.get("renderer", "opengl")))
+                    row.handler_unblock(renderer_handler)
+                    _error_dialog(window, _("Could not install Vulkan dependencies"), str(error))
+                else:
+                    window.set_setting("renderer", "vulkan")
+                    _toast(window.toasts, _("Vulkan dependencies installed"))
+
+            self._in_thread(graphics.ensure_vulkan_dependencies, installed)
+
+        renderer_handler = renderer.connect("notify::selected", select_renderer)
         game.add(renderer)
 
         mangohud = Adw.SwitchRow(

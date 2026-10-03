@@ -1549,6 +1549,9 @@ class RobloxSession:
             ok, output = build_shim()
             if not ok:
                 raise RuntimeError(_("Could not build the shim:\n{output}", output=output))
+        if self.settings.get("renderer", "opengl") == "vulkan":
+            from . import graphics
+            graphics.ensure_vulkan_dependencies()
         env = self.environment()
         ensure_x11(env)
         renderer_name = "OpenGL"

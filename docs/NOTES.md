@@ -412,6 +412,28 @@ in a disposable Darling prefix. Before the fix its first camera lock raises
 the reported exception; after the fix 100 lock/unlock cycles complete with
 exit status 0. The test is optional because it needs Darling and a display.
 
+### Vulkan dependency installation
+
+Selecting Vulkan checks for Mesa's EGL vendor manifest and the Zink DRI
+library. Missing components trigger package installation on a worker thread,
+using fixed package arguments through `run0` and its polkit prompt. Arch uses
+`mesa`/`vulkan-icd-loader`; Debian and Ubuntu use `libegl-mesa0`,
+`libgl1-mesa-dri` and `libvulkan1`; Fedora uses `mesa-libEGL`,
+`mesa-dri-drivers` and `vulkan-loader`. The launcher rechecks the files after
+installation and saves the Vulkan selection only on success. Cancelled
+authentication or an unsuccessful install restores the previous selection.
+Starting with an existing Vulkan selection also checks these dependencies
+before constructing the renderer environment. Packages already installed do
+not trigger a prompt. Flatpak graphics libraries belong to its runtime, so
+this system package installer does not run inside Flatpak.
+
+Native Wayland was deferred at the user's request. The unfinished prototype
+is saved in the ignored `work/wayland-prototype` directory and is not built or
+published. Its direct Wayland window and EGL surface initialized, but client
+presentation stayed black; the native Vulkan test also failed to select a
+physical device. These results do not establish working native Wayland
+support. The existing X11/Xwayland game backend remains in use.
+
 ## Earlier investigation notes
 
 We need a recent startup log from a regular terminal. This will help determine where

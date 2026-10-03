@@ -128,8 +128,14 @@ pack.
 In **Settings → Environment → Game → Renderer**, choose **Vulkan (Zink,
 experimental)** and restart Roblox. This uses [Mesa Zink](https://docs.mesa3d.org/drivers/zink.html)
 to run the client's OpenGL renderer through Vulkan on Linux. It requires Mesa
-EGL with Zink and a working hardware Vulkan driver. The launcher checks those
-before starting; if the check fails, select **OpenGL** again.
+EGL with Zink and a working hardware Vulkan driver. If Mesa EGL or Zink is
+missing, source installations on Arch, Debian/Ubuntu and Fedora install the
+required packages after you authorize the **run0** desktop prompt. Cancelling
+the prompt keeps the previous renderer selected. A system with no `run0` shows
+instructions for installing the dependencies manually. Flatpak graphics
+libraries come from its runtime; update that runtime if they are missing.
+The launcher checks hardware Vulkan support before starting; if that check
+fails, select **OpenGL** again.
 
 Vulkan gameplay is experimental. Client startup
 and the MangoHud Vulkan overlay have been tested on an RTX 3060 Ti, with GL

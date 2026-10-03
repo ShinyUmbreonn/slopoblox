@@ -8,6 +8,63 @@ from macoblox import core, graphics
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_vulkan_dependency_check_identifies_each_missing_component(self):
+        with patch.object(graphics, "mesa_egl_manifest", return_value=None), \
+                patch.object(graphics.Path, "is_file", return_value=False):
+            self.assertEqual(graphics.missing_vulkan_dependencies(), ["Mesa EGL", "Zink"])
+        with patch.object(graphics, "mesa_egl_manifest", return_value="/mesa.json"), \
+                patch.object(graphics.Path, "is_file", return_value=False):
+            self.assertEqual(graphics.missing_vulkan_dependencies(), ["Zink"])
+
+    def test_dependency_install_skips_authentication_when_already_installed(self):
+        with patch.object(graphics, "missing_vulkan_dependencies", return_value=[]), \
+                patch.object(graphics.subprocess, "run") as run:
+            self.assertFalse(graphics.ensure_vulkan_dependencies())
+            run.assert_not_called()
+
+    def test_installer_uses_run0_authentication_without_a_shell(self):
+        releases = (("arch", "pacman", "mesa"), ("ubuntu", "apt-get", "libgl1-mesa-dri"),
+                    ("fedora", "dnf", "mesa-dri-drivers"))
+        for distro, manager, package in releases:
+            with self.subTest(distro=distro), \
+                    patch.object(graphics.Path, "is_file", return_value=False), \
+                    patch.object(graphics.platform, "freedesktop_os_release", return_value={"ID": distro}), \
+                    patch.object(graphics, "_system_program", side_effect=lambda cmd: "/usr/bin/" + cmd):
+                command = graphics.vulkan_install_command()
+                self.assertEqual(command[0], "/usr/bin/run0")
+                self.assertEqual(command[3], "/usr/bin/" + manager)
+                self.assertIn(package, command)
+                self.assertNotIn("--no-ask-password", command)
+                self.assertNotIn("-Sy", command)
+                self.assertNotIn("sh", command)
+
+    def test_installer_rechecks_files_and_reports_cancelled_authentication(self):
+        with patch.object(graphics, "missing_vulkan_dependencies", side_effect=[["Zink"], []]), \
+                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
+                patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertTrue(graphics.ensure_vulkan_dependencies())
+        with patch.object(graphics, "missing_vulkan_dependencies", return_value=["Zink"]), \
+                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
+                patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "Not authorized")):
+            with self.assertRaisesRegex(RuntimeError, "Authentication may have been cancelled"):
+                graphics.ensure_vulkan_dependencies()
+        with patch.object(graphics, "missing_vulkan_dependencies", return_value=["Zink"]), \
+                patch.object(graphics, "vulkan_install_command", return_value=["run0", "package-manager"]), \
+                patch.object(graphics.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            with self.assertRaisesRegex(RuntimeError, "still missing: Zink"):
+                graphics.ensure_vulkan_dependencies()
+
+    def test_installer_reports_missing_run0_and_keeps_flatpak_in_its_runtime(self):
+        with patch.object(graphics.Path, "is_file", return_value=False), \
+                patch.object(graphics, "_system_program", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "run0 is unavailable"):
+                graphics.vulkan_install_command()
+        with patch.object(graphics.Path, "is_file", return_value=True), \
+                patch.object(graphics, "_system_program") as system_program:
+            with self.assertRaisesRegex(RuntimeError, "Flatpak graphics runtime"):
+                graphics.vulkan_install_command()
+            system_program.assert_not_called()
+
     def test_default_preserves_host_driver_selection(self):
         self.assertEqual(graphics.renderer_environment("opengl"), {})
         self.assertEqual(core.DEFAULT_SETTINGS["renderer"], "opengl")

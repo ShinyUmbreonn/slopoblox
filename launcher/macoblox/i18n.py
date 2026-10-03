@@ -12,6 +12,12 @@ RU = {
     "Renderer": "Рендерер",
     "OpenGL": "OpenGL",
     "Vulkan (Zink, experimental)": "Vulkan (Zink, экспериментальный)",
+    "Installing Vulkan dependencies… Authorize the run0 prompt to continue.":
+        "Устанавливаются зависимости Vulkan… Подтвердите запрос run0 для продолжения.",
+    "Could not install Vulkan dependencies": "Не удалось установить зависимости Vulkan",
+    "Vulkan dependencies installed": "Зависимости Vulkan установлены",
+    "Applies on next launch. Missing Mesa EGL/Zink packages need run0 authentication.":
+        "Применяется при следующем запуске. Для установки недостающих Mesa EGL/Zink нужна авторизация run0.",
     "Applies on next launch. Vulkan uses Mesa Zink and a hardware Vulkan driver.":
         "Применяется при следующем запуске. Для Vulkan нужны Mesa Zink и аппаратный драйвер Vulkan.",
     # Pages
