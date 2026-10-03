@@ -137,9 +137,13 @@ tracing disabled. Heavy gameplay and other GPUs still need testing. This uses
 the macOS client's OpenGL renderer; Metal and native client Vulkan are separate
 backends.
 
-With [MangoHud](https://github.com/flightlessmango/MangoHud) installed, select
-Vulkan and start the source launcher with `MANGOHUD=1 ./launcher/macoblox-launcher`.
+With [MangoHud](https://github.com/flightlessmango/MangoHud) installed, enable
+**Settings → Environment → Game → MangoHud overlay** and restart Roblox.
+It works with both OpenGL and Vulkan (Zink) and is off by default. You can also
+start the source launcher with `MANGOHUD=1 ./launcher/macoblox-launcher`.
 The launcher also forwards `MANGOHUD_CONFIG` and `MANGOHUD_CONFIGFILE` to Roblox.
+For the Flatpak, install the matching MangoHud extension with
+`flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//25.08`.
 </details>
 
 <details>
@@ -160,7 +164,7 @@ installed on the system. Download `MacOBlox-*.flatpak` from the
 [latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
 
 ```bash
-flatpak install --user MacOBlox-0.16-x86_64.flatpak
+flatpak install --user MacOBlox-0.17-x86_64.flatpak
 ```
 
 It keeps its own Darling prefix, so sign in to Roblox again there. Roblox Studio

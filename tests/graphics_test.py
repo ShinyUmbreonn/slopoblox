@@ -63,6 +63,45 @@ class GraphicsTests(unittest.TestCase):
         self.assertEqual(env["MANGOHUD_CONFIG"], "fps,frametime,gpu_name")
         self.assertEqual(env["MANGOHUD_CONFIGFILE"], "/tmp/hud config.conf")
 
+    def test_mangohud_disabled_by_default(self):
+        self.assertFalse(core.DEFAULT_SETTINGS["mangohud"])
+        with patch.dict(graphics.os.environ, {}, clear=True):
+            self.assertEqual(graphics.mangohud_environment("opengl"), {})
+            self.assertEqual(graphics.mangohud_environment("vulkan"), {})
+
+    def test_mangohud_opengl_uses_bridge_and_preserves_settings(self):
+        settings = {"MANGOHUD": "0", "MANGOHUD_CONFIG": "fps,frametime",
+                    "MANGOHUD_CONFIGFILE": "/tmp/hud config.conf"}
+        with patch.dict(graphics.os.environ, settings, clear=True), \
+                patch.object(graphics.Path, "is_file", return_value=True):
+            env = graphics.mangohud_environment("opengl", True)
+        self.assertEqual(env["MANGOHUD"], "1")
+        self.assertTrue(env["MACOBLOX_MANGOHUD_OPENGL"].endswith("libMangoHud_opengl.so"))
+        self.assertEqual(env["MANGOHUD_CONFIG"], settings["MANGOHUD_CONFIG"])
+        self.assertEqual(env["MANGOHUD_CONFIGFILE"], settings["MANGOHUD_CONFIGFILE"])
+        self.assertNotIn("LD_PRELOAD", env)
+
+    def test_mangohud_vulkan_does_not_load_opengl_hooks(self):
+        with patch.dict(graphics.os.environ, {}, clear=True), \
+                patch.object(graphics.Path, "is_file", return_value=False):
+            self.assertEqual(graphics.mangohud_environment("vulkan", True), {"MANGOHUD": "1"})
+            with self.assertRaisesRegex(RuntimeError, "Install MangoHud or turn it off"):
+                graphics.mangohud_environment("opengl", True)
+
+    def test_mangohud_toggle_reaches_host_and_guest(self):
+        session = object.__new__(core.RobloxSession)
+        session.settings = dict(core.DEFAULT_SETTINGS, mangohud=True)
+        session.web_socket = session.dns = session.audio = None
+        with patch.dict(core.os.environ, {}, clear=True), \
+                patch.object(graphics.Path, "is_file", return_value=True), \
+                patch.object(core, "host_vram_bytes", return_value=0), \
+                patch.object(core, "icon_argb_file", side_effect=OSError):
+            host = session.environment()
+            guest = dict(item.split("=", 1) for item in session.shim_variables())
+        for name in ("MANGOHUD", "MACOBLOX_MANGOHUD_OPENGL"):
+            self.assertEqual(host[name], guest[name])
+        self.assertEqual(guest["MANGOHUD"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,11 +5,42 @@ to Vulkan on Linux; Darling's incomplete Metal path stays disabled.
 """
 import ctypes
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 RENDERERS = ("opengl", "vulkan")
+
+
+def mangohud_environment(renderer, enabled=False):
+    """Enable the Vulkan layer or the shim's direct host EGL overlay hook.
+
+    Avoid OpenGL LD_PRELOAD: Darling strips it from host commands, and
+    forwarding MangoHud's dlsym hook to the guest can select software GL.
+    Explicit terminal options remain available alongside the Settings switch.
+    """
+    variables = {name: os.environ[name] for name in
+                 ("MANGOHUD", "MANGOHUD_CONFIG", "MANGOHUD_CONFIGFILE") if name in os.environ}
+    if enabled:
+        variables["MANGOHUD"] = "1"
+    if variables.get("MANGOHUD") == "1" and renderer == "opengl":
+        roots = ("/usr/lib/mangohud", "/usr/lib64/mangohud",
+                 "/usr/lib/x86_64-linux-gnu/mangohud", "/usr/local/lib/mangohud",
+                 "/usr/local/lib64/mangohud", "/app/lib/mangohud",
+                 "/app/lib/x86_64-linux-gnu/mangohud",
+                 "/usr/lib/extensions/vulkan/MangoHud/lib/mangohud",
+                 "/usr/lib/extensions/vulkan/MangoHud/lib/x86_64-linux-gnu",
+                 str(Path.home() / ".local/share/MangoHud/usr/lib/mangohud"))
+        libraries = [Path(root) / "libMangoHud_opengl.so" for root in roots]
+        custom = os.environ.get("MANGOHUD_OPENGL_LIBS")
+        if custom:
+            libraries[:0] = [Path(path) for path in custom.split(":") if path]
+        library = next((path for path in libraries if path.is_file()), None)
+        if library is None:
+            raise RuntimeError("MangoHud's OpenGL library is missing. Install MangoHud or turn it off in Settings.")
+        variables["MACOBLOX_MANGOHUD_OPENGL"] = str(library)
+    return variables
 
 
 def renderer_environment(renderer):

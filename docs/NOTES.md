@@ -383,6 +383,19 @@ their build commands are documented at the top of `tests/cursor_overlay_test.c`
 and `tests/shader_driver_test.c`. The optional Darling integration check is
 `tests/darling_gl_test.m`.
 
+### Release 0.17 follow-up
+
+- Added a persistent, default-off MangoHud switch in the Game settings.
+  Vulkan uses its implicit layer; native OpenGL loads the host EGL overlay
+  hooks through Darling's ELF bridge, including context cleanup. Regular
+  host preloading did not reach Player, while guest preloading selected
+  llvmpipe on the tested NVIDIA system. The direct hook displayed the overlay
+  while preserving the NVIDIA renderer. MangoHud configuration variables and
+  the existing terminal activation remain supported. See [MangoHud's EGL hooks](https://github.com/flightlessmango/MangoHud/blob/master/src/gl/inject_egl.cpp).
+- Removed `-g` from the shim link command after a user reported Clang failing
+  to spawn `dsymutil` on Linux. Optimization and frame pointers remain enabled;
+  normal builds no longer require Apple's debug-symbol tool.
+
 ## Earlier investigation notes
 
 We need a recent startup log from a regular terminal. This will help determine where

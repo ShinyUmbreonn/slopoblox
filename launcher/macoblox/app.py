@@ -1026,6 +1026,14 @@ class SettingsPage(Adw.Bin):
             "renderer", renderer_codes[row.get_selected()]))
         game.add(renderer)
 
+        mangohud = Adw.SwitchRow(
+            title=_("MangoHud overlay"),
+            subtitle=_("Show FPS, frametimes and CPU/GPU usage. Requires MangoHud; applies on next launch."),
+            active=settings.get("mangohud", False))
+        mangohud.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "mangohud", row.get_active()))
+        game.add(mangohud)
+
         sensitivity = Adw.SpinRow.new_with_range(0.1, 5.0, 0.05)
         sensitivity.set_digits(2)
         sensitivity.set_title(_("Camera sensitivity"))

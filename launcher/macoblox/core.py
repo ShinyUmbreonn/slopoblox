@@ -84,6 +84,7 @@ DEFAULT_SETTINGS = {
     "auto_patch_throttle": True,
     "raw_mouse": True,
     "renderer": "opengl",
+    "mangohud": False,
     "hide_menu_bar": False,
     "dns": "system",
     "dns_custom": "",
@@ -1457,6 +1458,8 @@ class RobloxSession:
         from . import graphics
         env = darling_environment()
         env.update(graphics.renderer_environment(self.settings.get("renderer", "opengl")))
+        env.update(graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
+                                               self.settings.get("mangohud", False)))
         return env
 
     def shim_variables(self):
@@ -1483,11 +1486,10 @@ class RobloxSession:
         from . import graphics
         variables.extend(f"{name}={value}" for name, value in
                          graphics.renderer_environment(self.settings.get("renderer", "opengl")).items())
-        # Vulkan layers run in the host driver, but the client gets its
-        # environment from Darling's guest shell. Forward explicit HUD options.
-        for name in ("MANGOHUD", "MANGOHUD_CONFIG", "MANGOHUD_CONFIGFILE"):
-            if name in os.environ:
-                variables.append(f"{name}={os.environ[name]}")
+        # Host graphics libraries see the guest environment after exec.
+        variables.extend(f"{name}={value}" for name, value in
+                         graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
+                                                       self.settings.get("mangohud", False)).items())
         vram = host_vram_bytes()
         if vram:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")

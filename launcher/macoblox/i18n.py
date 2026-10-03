@@ -6,6 +6,9 @@ LANGUAGES = {"en": "English", "ru": "Русский"}
 _language = "en"
 
 RU = {
+    "MangoHud overlay": "Оверлей MangoHud",
+    "Show FPS, frametimes and CPU/GPU usage. Requires MangoHud; applies on next launch.":
+        "FPS, время кадра и загрузка CPU/GPU. Требуется MangoHud; применяется при следующем запуске.",
     "Renderer": "Рендерер",
     "OpenGL": "OpenGL",
     "Vulkan (Zink, experimental)": "Vulkan (Zink, экспериментальный)",
