@@ -396,6 +396,22 @@ and `tests/shader_driver_test.c`. The optional Darling integration check is
   to spawn `dsymutil` on Linux. Optimization and frame pointers remain enabled;
   normal builds no longer require Apple's debug-symbol tool.
 
+### Camera-lock report after 0.17
+
+A report from the older 0.16 build contained 8,395 repetitions of
+`-[RBXWindow windowHandle]: unrecognized selector` during mouse input.
+The camera-lock and custom-cursor hooks mistakenly requested an X11 handle
+from the Cocoa window. Resolve its `platformWindow` first, checking both
+selectors before using the native handle. This fixes the repeated exceptions
+that prevented capture from becoming active. The report has no fatal signal
+or crash stack, so it does not establish the cause of the separately reported
+crash at the end of the launch.
+
+`tests/darling_cursor_lock_test.m` exercises a real Cocoa/platform window pair
+in a disposable Darling prefix. Before the fix its first camera lock raises
+the reported exception; after the fix 100 lock/unlock cycles complete with
+exit status 0. The test is optional because it needs Darling and a display.
+
 ## Earlier investigation notes
 
 We need a recent startup log from a regular terminal. This will help determine where

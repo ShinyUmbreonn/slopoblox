@@ -1978,16 +1978,27 @@ static void* macoblox_set_window_icon_thread(void* unused) {
     return 0;
 }
 
+static unsigned long macoblox_native_window_handle(id window) {
+    /* NSWindow/RBXWindow is the Cocoa object. Only its platformWindow has
+     * Darling's X11 windowHandle; sending it to RBXWindow raises an exception
+     * on every attempted camera lock, before the lock can become active. */
+    SEL responds = sel_registerName("respondsToSelector:");
+    SEL native = sel_registerName("platformWindow");
+    if (!window || !((signed char (*)(id, SEL, SEL))objc_msgSend)(window, responds, native))
+        return 0;
+    id platform = ((id (*)(id, SEL))objc_msgSend)(window, native);
+    if (!platform || !((signed char (*)(id, SEL, SEL))objc_msgSend)(
+                         platform, responds,
+                         sel_registerName("windowHandle")))
+        return 0;
+    return ((unsigned long (*)(id, SEL))objc_msgSend)(
+        platform, sel_registerName("windowHandle"));
+}
+
 static void macoblox_set_window_icon(id window) {
     if (!getenv("MACOBLOX_ICON_ARGB") || macoblox_icon_window)
         return;
-    id platform = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("platformWindow"));
-    if (!platform || !((signed char (*)(id, SEL, SEL))objc_msgSend)(
-                         platform, sel_registerName("respondsToSelector:"),
-                         sel_registerName("windowHandle")))
-        return;
-    macoblox_icon_window = ((unsigned long (*)(id, SEL))objc_msgSend)(
-        platform, sel_registerName("windowHandle"));
+    macoblox_icon_window = macoblox_native_window_handle(window);
     if (!macoblox_icon_window)
         return;
     extern int pthread_create(void**, const void*, void* (*)(void*), void*);
@@ -3209,8 +3220,7 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
                                            anchor.y != macoblox_lock_anchor.y;
             macoblox_lock_anchor = anchor;
         }
-        unsigned long handle = window
-            ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
+        unsigned long handle = macoblox_native_window_handle(window);
         __atomic_store_n(&macoblox_cursor_lock_window, handle, __ATOMIC_RELEASE);
         macoblox_pointer_grabbed = 1;
         macoblox_set_x_cursor_hidden(1);
@@ -3711,8 +3721,7 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
         id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
         if (!window && app)
             window = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("mainWindow"));
-        unsigned long handle = window
-            ? ((unsigned long (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowHandle")) : 0;
+        unsigned long handle = macoblox_native_window_handle(window);
         if (handle) {
             macoblox_window_cursor = cursor;
             macoblox_window_cursor_handle = handle;
