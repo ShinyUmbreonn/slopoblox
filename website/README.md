@@ -1,18 +1,27 @@
 # Mac O’ Blox website
 
-A static promotional site for `macoblox.aubree.wtf`, published through Sites.
-The source is mirrored under `website/` on the MacOBlox repository's separate
-`website` branch. The application release and `main` branch are independent.
+A static promotional site for `macoblox.aubree.wtf`, published through GitHub
+Pages from the MacOBlox repository's separate `website` branch. The application
+release and `main` branch are independent.
 
 ## Files and hosting
 
 `dist/` is the complete public site. There is no package installation or build
-step. Serve that directory with any static host. Sites uses the identity and
-static directory in `.openai/hosting.json`.
+step. Serve that directory with any static host. The GitHub Actions workflow
+at `.github/workflows/website.yml` publishes only `website/dist`, triggered by
+website changes pushed to the `website` branch.
 
 For local viewing, run `python3 -m http.server 8080 --directory dist`.
-To publish edits, use Sites' normal source workflow and the existing project
-ID. Do not register a new Site for this source.
+To publish edits, commit and push them to the `website` branch. GitHub Pages
+must use **GitHub Actions** as its source, with the `github-pages` environment
+allowing the `website` branch. There is no deployment workflow on `main`.
+
+## Custom domain
+
+Set the repository's Pages custom domain to `macoblox.aubree.wtf`. In the
+`aubree.wtf` DNS zone, point the `macoblox` CNAME at `aubree-lat.github.io`.
+Enable Enforce HTTPS once GitHub has issued the certificate. Sites-specific
+verification records are not needed for GitHub Pages.
 
 ## Brand and dependencies
 
