@@ -8,7 +8,7 @@ function selectPreview(tab, focus = false) {
     item.tabIndex = selected ? 0 : -1;
     document.getElementById(item.getAttribute('aria-controls')).hidden = !selected;
   }
-  document.getElementById('preview-title').textContent = tab.id === 'tab-roblox' ? 'ROBLOXPLAYER / LINUX' : 'MACOBLOX / LAUNCHER';
+  document.getElementById('preview-title').textContent = tab.id === 'tab-roblox' ? 'Roblox' : 'Launcher';
   if (focus) tab.focus();
 }
 for (const tab of tabs) {
@@ -35,7 +35,7 @@ if (copyButton && navigator.clipboard && window.isSecureContext) {
       copyButton.textContent = 'Copied';
       copyStatus.textContent = 'Command copied. Paste it into your terminal to start.';
       clearTimeout(resetTimer);
-      resetTimer = setTimeout(() => { copyButton.textContent = 'Copy'; }, 3000);
+      resetTimer = setTimeout(() => { copyButton.textContent = 'Copy command'; }, 3000);
     } catch {
       copyStatus.textContent = 'Clipboard unavailable. Select and copy the command above.';
     }

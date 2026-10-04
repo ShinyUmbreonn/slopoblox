@@ -31,12 +31,13 @@ verification records are not needed for GitHub Pages.
   its particle speed patch. Vanta is MIT licensed; p5.js 1.1.9 is LGPL licensed.
 - Local Archivo and JetBrains Mono fonts retain their OFL notices.
 - Wordmark and screenshots come from the MacOBlox project's existing public
-  branding and Flatpak screenshot assets. Images are displayed in grayscale.
+  branding and Flatpak screenshot assets. Images retain their original colors.
 - License texts and upstream source references are in `dist/assets/licenses/`.
 
 ## Updating the release
 
-The release badge and Flatpak links currently point to `v0.19`. Update those
-links when preparing a new project release. Install commands always point to
+The Flatpak download and checksum links currently point to `v0.19`. Update
+those links when preparing a new project release. The latest-release link
+always follows the current release. Install commands always point to
 the application repository's `main` branch. No telemetry or external font
 requests are used. The background can be paused and respects reduced motion.
