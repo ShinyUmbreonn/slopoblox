@@ -2,7 +2,6 @@
 (function () {
   'use strict';
   const element = document.getElementById('wallpaper');
-  const toggle = document.getElementById('motion-toggle');
   const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
   if (!element || !window.VANTA?.TOPOLOGY || !window.p5) return;
   let effect;
@@ -18,11 +17,7 @@
     if (!sketch) return;
     if (document.hidden || paused) sketch.noLoop();
     else { effect.resize(); sketch.loop(); }
-    toggle.setAttribute('aria-pressed', String(paused));
-    toggle.textContent = paused ? 'Resume background' : 'Pause background';
   }
-  toggle.hidden = false;
-  toggle.addEventListener('click', () => { clearTimeout(settle); paused = !paused; apply(); });
   document.addEventListener('visibilitychange', apply);
   preference.addEventListener('change', event => {
     clearTimeout(settle);

@@ -40,4 +40,5 @@ The Flatpak download and checksum links currently point to `v0.19`. Update
 those links when preparing a new project release. The latest-release link
 always follows the current release. Install commands always point to
 the application repository's `main` branch. No telemetry or external font
-requests are used. The background can be paused and respects reduced motion.
+requests are used. The background respects reduced motion and pauses while
+the page is hidden.

@@ -27,10 +27,9 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html { scroll-padding-top: 64px; }
+html { scroll-padding-top: 24px; }
 body {
   margin: 0;
-  padding-top: 40px;
   background: #000;
   color: var(--text);
   font: 400 1rem/1.6 Archivo, sans-serif;
@@ -55,34 +54,6 @@ button, a { -webkit-tap-highlight-color: transparent; }
   background: var(--accent);
 }
 .skip-link:focus { top: 8px; }
-
-.desktop-bar {
-  position: fixed;
-  inset: 0 0 auto;
-  z-index: 10;
-  height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 0 24px;
-  border-bottom: 1px solid var(--border);
-  background: rgba(10, 10, 10, .88);
-  backdrop-filter: blur(18px);
-  font: 400 13px/1 var(--mono);
-}
-.bar-title { color: var(--text); }
-.desktop-bar nav { display: flex; align-items: center; gap: 1.25rem; color: var(--dim); }
-.desktop-bar a { display: flex; align-items: center; min-height: 40px; }
-#motion-toggle {
-  min-height: 40px;
-  padding: 0;
-  border: 0;
-  color: var(--dim);
-  background: transparent;
-  font: inherit;
-}
-#motion-toggle:hover { color: var(--accent); }
 
 .desktop {
   position: relative;
@@ -131,6 +102,7 @@ h1 { margin: 0 0 .75rem; font-size: clamp(1.8rem, 2.3vw, 2.5rem); font-weight: 6
 .feature-list { margin: 1.25rem 0 0; padding-left: 1.15rem; font-size: 15px; }
 .feature-list li + li { margin-top: .35rem; }
 .feature-list li::marker { color: var(--dim); }
+.about-actions { margin-top: 1.25rem; }
 
 .command-box { padding: 1rem; border: 1px solid var(--border); background: var(--chrome); }
 .command-box code { display: block; overflow-wrap: anywhere; font: 400 14px/1.8 var(--mono); }
@@ -213,13 +185,6 @@ h1 { margin: 0 0 .75rem; font-size: clamp(1.8rem, 2.3vw, 2.5rem); font-weight: 6
 }
 
 @media (max-width: 760px) {
-  body { padding-top: 44px; }
-  .desktop-bar { height: 44px; padding: 0 16px; font-size: 12px; }
-  .desktop-bar nav { gap: .85rem; }
-  .desktop-bar a, #motion-toggle { min-height: 44px; }
-  #motion-toggle { font-size: 0; }
-  #motion-toggle::after { content: "pause"; font: 400 12px/1 var(--mono); }
-  #motion-toggle[aria-pressed="true"]::after { content: "resume"; }
   .desktop { grid-template-columns: minmax(0, 1fr); width: calc(100% - 32px); margin-top: 20px; gap: 16px; }
   .desktop { grid-template-areas: "about" "screenshots" "install" "help"; }
   .wordmark { width: 260px; }
@@ -228,8 +193,6 @@ h1 { margin: 0 0 .75rem; font-size: clamp(1.8rem, 2.3vw, 2.5rem); font-weight: 6
 }
 
 @media (max-width: 380px) {
-  .desktop-bar nav { gap: .6rem; }
-  .desktop-bar nav > a:last-of-type { display: none; }
   .install-actions .button { flex: 1 1 auto; }
 }
 
