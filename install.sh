@@ -57,13 +57,43 @@ distribution_name() {
   printf '%s' "${PRETTY_NAME:-Linux}"
 }
 
+# Prefer the host family over stray package managers in PATH. Recognize
+# immutable hosts before dnf/pacman so we never mutate their base image.
+detect_package_manager() {
+  local ID='' ID_LIKE='' family manager
+  [[ ! -r /etc/os-release ]] || . /etc/os-release
+  family=" $ID $ID_LIKE "
+  if [[ -e /run/ostree-booted || -e /etc/NIXOS || -e /etc/transactional-update.conf ]]; then
+    printf '%s' manual; return
+  fi
+  case "$ID" in
+    nixos|guix|steamos|microos|aeon|kalpa) printf '%s' manual; return ;;
+  esac
+  case "$family" in
+    *" arch "*) manager=pacman ;;
+    *" debian "*|*" ubuntu "*) manager=apt-get ;;
+    *" suse "*|*" opensuse "*|*" opensuse-tumbleweed "*|*" opensuse-leap "*) manager=zypper ;;
+    *" alpine "*) manager=apk ;;
+    *" gentoo "*) manager=emerge ;;
+    *" void "*) manager=xbps-install ;;
+    *" solus "*) manager=eopkg ;;
+    *" fedora "*|*" rhel "*|*" centos "*) manager=dnf ;;
+    *) manager='' ;;
+  esac
+  if [[ -n $manager ]] && command -v "$manager" >/dev/null; then
+    printf '%s' "$manager"; return
+  fi
+  for manager in zypper apk xbps-install eopkg emerge pacman apt-get dnf yum; do
+    if command -v "$manager" >/dev/null; then printf '%s' "$manager"; return; fi
+  done
+  printf '%s' manual
+}
+
 setup_plan() {
   local operation='Install' dependencies='your package manager'
   is_installed && operation='Update'
-  if command -v pacman >/dev/null; then dependencies='pacman and the AUR'
-  elif command -v apt-get >/dev/null; then dependencies='apt'
-  elif command -v dnf >/dev/null; then dependencies='dnf'
-  fi
+  dependencies=$(detect_package_manager)
+  [[ $dependencies != pacman ]] || dependencies='pacman and the AUR'
   printf '  %sSetup plan%s\n\n' "$BOLD" "$RESET"
   printf '    1. Prepare Darling and the system tools (%s).\n' "$dependencies"
   printf '    2. %s the Mac O\047 Blox launcher.\n' "$operation"
@@ -149,7 +179,7 @@ install_arch() {
   # Only packages that are not installed at all: asking pacman for an
   # installed but outdated one (pipewire-audio 1.6.8 with 1.6.9 in the repo)
   # makes it a partial upgrade that breaks on pinned dependencies.
-  local wanted=(git base-devel clang lld unzip python python-gobject gtk4 libadwaita webkitgtk-6.0 sdl2-compat wayland pkgconf)
+  local wanted=(git curl base-devel clang lld unzip python python-gobject gtk4 libadwaita webkitgtk-6.0 sdl2-compat wayland pkgconf)
   command -v pw-cat >/dev/null || wanted+=(pipewire-audio)
   local missing
   missing=$(pacman -T "${wanted[@]}" || true)
@@ -159,19 +189,6 @@ install_arch() {
     sudo pacman -S --needed --noconfirm $missing ||
       die "pacman could not install them. Update the system with 'sudo pacman -Syu' and run this again."
   fi
-  command -v darling >/dev/null && return
-  say "Installing Darling from the AUR (darling-bin)"
-  if command -v paru >/dev/null; then
-    paru -S --needed --noconfirm --skipreview darling-bin
-  elif command -v yay >/dev/null; then
-    yay -S --needed --noconfirm --answerdiff None --answerclean None darling-bin
-  else
-    local build
-    build=$(mktemp -d)
-    git clone --depth 1 https://aur.archlinux.org/darling-bin.git "$build/darling-bin"
-    (cd "$build/darling-bin" && makepkg -si --noconfirm)
-    rm -rf "$build"
-  fi
 }
 
 install_debian() {
@@ -179,26 +196,238 @@ install_debian() {
   sudo apt-get update
   sudo apt-get install -y git curl unzip clang lld pipewire-bin python3 python3-gi \
     gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0 libsdl2-dev libwayland-dev pkg-config
-  command -v darling >/dev/null && return
-  # Release v0.1.YYYYMMDD has its Debian packages (built for Ubuntu 24.04)
-  # as debs_YYYYMMDD.zip.
-  local build
-  say "Installing Darling $DARLING_TAG"
-  build=$(mktemp -d)
-  curl -fL --progress-bar -o "$build/debs.zip" \
-    "https://github.com/darlinghq/darling/releases/download/$DARLING_TAG/debs_${DARLING_TAG##*.}.zip"
-  if ! printf '%s  %s\n' "$DARLING_DEBS_SHA256" "$build/debs.zip" | sha256sum -c --quiet -; then
-    rm -rf "$build"
-    die "The Darling download does not match its checksum. Try again later."
-  fi
-  unzip -q "$build/debs.zip" -d "$build"
-  sudo apt-get install -y "$build"/debs_*/*.deb
-  rm -rf "$build"
 }
 
 install_fedora() {
   say "Installing tools (dnf)"
-  sudo dnf install -y git clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita webkitgtk6.0 SDL2-devel wayland-devel pkgconf-pkg-config
+  sudo dnf install -y git curl clang lld unzip pipewire-utils python3 python3-gobject gtk4 libadwaita webkitgtk6.0 SDL2-devel wayland-devel pkgconf-pkg-config
+}
+
+# Launcher dependencies; Darling is handled centrally after validation.
+install_opensuse() {
+  say "Installing tools (zypper)"
+  sudo zypper --non-interactive install git curl unzip clang lld pipewire-tools \
+    python3 python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 \
+    typelib-1_0-WebKit-6_0 libSDL2-devel wayland-devel pkg-config
+}
+
+install_alpine() {
+  say "Installing tools (apk); Darling needs an Alpine-specific source build"
+  sudo apk add git curl unzip clang lld pipewire-tools python3 py3-gobject3 \
+    gtk4.0 libadwaita webkit2gtk-6.0 sdl2-dev wayland-dev pkgconf
+}
+
+install_gentoo() {
+  say "Installing tools (emerge); enable introspection and GTK 4 WebKit support in Portage"
+  sudo emerge --noreplace dev-vcs/git net-misc/curl app-arch/unzip \
+    llvm-core/clang llvm-core/lld media-video/pipewire dev-lang/python \
+    dev-python/pygobject gui-libs/gtk:4 gui-libs/libadwaita \
+    net-libs/webkit-gtk:6 media-libs/libsdl2 dev-libs/wayland dev-util/pkgconf
+}
+
+install_void() {
+  say "Installing tools (xbps-install)"
+  sudo xbps-install -Sy git curl unzip clang lld pipewire python3 python3-gobject \
+    gtk4 libadwaita webkitgtk6 SDL2-devel wayland-devel pkg-config
+}
+
+install_solus() {
+  say "Installing tools (eopkg)"
+  sudo eopkg install -y git curl unzip clang lld pipewire python3 python-gobject \
+    gtk4 libadwaita webkit-gtk sdl2-devel wayland-devel pkg-config
+}
+
+install_tools() {
+  case $(detect_package_manager) in
+    pacman) install_arch ;;
+    apt-get) install_debian ;;
+    dnf) install_fedora ;;
+    yum)
+      say "Installing tools (yum); older enterprise releases may lack GTK 4/WebKit 6"
+      sudo yum install -y git curl clang lld unzip pipewire-utils python3 python3-gobject \
+        gtk4 libadwaita webkitgtk6.0 SDL2-devel wayland-devel pkgconf-pkg-config ;;
+    zypper) install_opensuse ;;
+    apk) install_alpine ;;
+    emerge) install_gentoo ;;
+    xbps-install) install_void ;;
+    eopkg) install_solus ;;
+    manual)
+      say "Manual dependencies required on this host (including immutable Linux, NixOS and Guix)."
+      say "Install Darling, git, clang, lld, unzip, PipeWire, Python 3/PyGObject, GTK 4, libadwaita, WebKit 6, SDL2, Wayland and pkg-config using your host's supported method."
+      ;;
+  esac
+}
+
+# Only offer compilation after the configured repositories have been checked.
+try_darling_package() {
+  local manager=$1
+  case $manager in
+    pacman) pacman -Si darling >/dev/null 2>&1 || return 1
+      sudo pacman -S --needed --noconfirm darling || return 1 ;;
+    apt-get) apt-cache show darling >/dev/null 2>&1 || return 1
+      sudo apt-get install -y darling || return 1 ;;
+    dnf|yum) "$manager" list --available darling >/dev/null 2>&1 || return 1
+      sudo "$manager" install -y darling || return 1 ;;
+    zypper) zypper --non-interactive search --match-exact --type package darling | awk '$3 == "darling" {found=1} END {exit !found}' || return 1
+      sudo zypper --non-interactive install darling || return 1 ;;
+    apk) apk search -x darling | rg_darling_match || return 1
+      sudo apk add darling || return 1 ;;
+    xbps-install) xbps-query -R darling >/dev/null 2>&1 || return 1
+      sudo xbps-install -y darling || return 1 ;;
+    emerge) emerge --pretend --quiet app-emulation/darling >/dev/null 2>&1 || return 1
+      # Portage packages may themselves compile: ask before invoking emerge.
+      confirm_darling_build || die "Darling compilation declined. Setup stopped."
+      sudo emerge --noreplace app-emulation/darling || return 1 ;;
+    eopkg) eopkg info darling >/dev/null 2>&1 || return 1
+      sudo eopkg install -y darling || return 1 ;;
+    *) return 1 ;;
+  esac
+  hash -r
+  command -v darling >/dev/null
+}
+
+rg_darling_match() { awk '/^darling-[0-9]/ {found=1} END {exit !found}'; }
+
+confirm_darling_build() {
+  local answer=''
+  say "Darling needs compilation on $(distribution_name)."
+  say "This installs build dependencies and Darling into /usr/local using sudo."
+  say "Allow several hours, at least 4 GiB RAM and about 25 GiB free disk space."
+  say "The build uses the pinned $DARLING_TAG release, 64-bit components and a saved log."
+  # Never consume piped installer text, and --yes does not bypass this prompt.
+  if ! (: </dev/tty) 2>/dev/null; then
+    die "Source compilation requires confirmation in a terminal. Rerun interactively."
+  fi
+  printf '  Compile Darling and continue? [y/N] ' >/dev/tty
+  IFS= read -r answer </dev/tty || return 1
+  [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]
+}
+
+install_darling_build_dependencies() {
+  case $1 in
+    apt-get) sudo apt-get install -y build-essential cmake clang bison flex xz-utils git-lfs \
+      libfuse-dev libudev-dev libcap2-bin libglu1-mesa-dev libcairo2-dev libgl-dev \
+      libtiff-dev libfreetype-dev libxml2-dev libegl-dev libfontconfig-dev libbsd-dev \
+      libxrandr-dev libxcursor-dev libgif-dev libpulse-dev libavformat-dev libavcodec-dev \
+      libswresample-dev libdbus-1-dev libxkbfile-dev libssl-dev llvm-dev libelf-dev \
+      libvulkan-dev libcurl4-openssl-dev libedit-dev ;;
+    pacman) sudo pacman -S --needed --noconfirm make cmake clang flex bison icu fuse \
+      pkgconf fontconfig cairo libtiff mesa glu llvm libbsd libxkbfile libxcursor \
+      libxext libxkbcommon libxrandr ffmpeg git-lfs ;;
+    dnf|yum) sudo "$1" install -y make gcc gcc-c++ cmake clang bison flex git-lfs \
+      dbus-devel glibc-devel fuse-devel systemd-devel elfutils-libelf-devel cairo-devel \
+      freetype-devel libjpeg-turbo-devel fontconfig-devel libglvnd-devel mesa-libGL-devel \
+      mesa-libEGL-devel mesa-libGLU-devel libtiff-devel libxml2-devel libbsd-devel \
+      libXcursor-devel libXrandr-devel giflib-devel pulseaudio-libs-devel libxkbfile-devel \
+      openssl-devel llvm-devel libcap-devel libavcodec-free-devel libavformat-free-devel ;;
+    zypper) sudo zypper --non-interactive install make gcc gcc-c++ cmake clang bison flex \
+      git-lfs fuse-devel systemd-devel libelf-devel cairo-devel freetype2-devel \
+      fontconfig-devel Mesa-libGL-devel Mesa-libEGL-devel glu-devel libxml2-devel \
+      libbsd-devel libXcursor-devel libXrandr-devel giflib-devel libpulse-devel \
+      libxkbfile-devel libopenssl-devel llvm-devel libcap-devel libtiff-devel \
+      libjpeg-devel dbus-1-devel libavcodec-devel libavformat-devel libswresample-devel ;;
+    apk) sudo apk add build-base cmake clang bison flex xz fuse-dev libcap-dev git-lfs \
+      python3 glu-dev cairo-dev mesa-dev tiff-dev freetype-dev libxml2-dev fontconfig-dev \
+      libbsd-dev libxrandr-dev libxcursor-dev giflib-dev pulseaudio-dev ffmpeg-dev \
+      dbus-dev libxkbfile-dev openssl-dev linux-headers llvm-dev xdg-user-dirs ;;
+    xbps-install) sudo xbps-install -y base-devel cmake clang bison flex xz git-lfs \
+      fuse-devel libcap-devel eudev-libudev-devel glu-devel cairo-devel MesaLib-devel \
+      tiff-devel freetype-devel libxml2-devel fontconfig-devel libbsd-devel \
+      libXrandr-devel libXcursor-devel giflib-devel libpulseaudio-devel ffmpeg-devel \
+      dbus-devel libxkbfile-devel openssl-devel llvm-devel ;;
+    emerge) sudo emerge --noreplace dev-build/cmake llvm-core/clang llvm-core/llvm \
+      sys-devel/bison sys-devel/flex dev-vcs/git-lfs sys-fs/fuse:0 sys-libs/libcap \
+      virtual/libudev media-libs/glu x11-libs/cairo media-libs/mesa media-libs/tiff \
+      media-libs/freetype dev-libs/libxml2 media-libs/fontconfig dev-libs/libbsd \
+      x11-libs/libXrandr x11-libs/libXcursor media-libs/giflib media-libs/libpulse \
+      media-video/ffmpeg sys-apps/dbus x11-libs/libxkbfile dev-libs/openssl ;;
+    eopkg) sudo eopkg install -y -c system.devel || return 1
+      sudo eopkg install -y cmake clang llvm-devel bison flex git-lfs fuse-devel \
+        libcap-devel systemd-devel mesalib-devel cairo-devel libtiff-devel freetype2-devel \
+        libxml2-devel fontconfig-devel libbsd-devel libxrandr-devel libxcursor-devel \
+        giflib-devel pulseaudio-devel ffmpeg-devel dbus-devel libxkbfile-devel openssl-devel ;;
+    *) die "Automatic source installation is unavailable on this host; use https://docs.darlinghq.org/build-instructions.html with your host's supported installation method." ;;
+  esac
+}
+
+build_darling_source() {
+  local manager=$1 build log jobs=${DARLING_BUILD_JOBS:-2}
+  [[ $jobs =~ ^[1-9][0-9]*$ ]] || die "DARLING_BUILD_JOBS must be a positive integer."
+  install_darling_build_dependencies "$manager" || die "Could not install Darling build dependencies. Check enabled repositories and package names for your distro, then rerun."
+  mkdir -p -- "$CACHE_HOME/macoblox/installer"
+  build=$(umask 077; mktemp -d "$CACHE_HOME/macoblox/installer/darling-source-XXXXXX")
+  log=$build/build.log
+  say "Building Darling; sources and log: $build"
+  # Keep failed builds for diagnosis. Every stage has an explicit failure
+  # check; functions invoked from conditional contexts cannot rely on set -e.
+  GIT_CLONE_PROTECTION_ACTIVE=false git clone --recursive --branch "$DARLING_TAG" \
+    https://github.com/darlinghq/darling.git "$build/source" >"$log" 2>&1 ||
+    die "Darling source download failed. Log: $log"
+  git -C "$build/source" lfs install --local >>"$log" 2>&1 || die "Git LFS initialization failed. Log: $log"
+  git -C "$build/source" lfs pull >>"$log" 2>&1 || die "Git LFS download failed. Log: $log"
+  cmake -S "$build/source" -B "$build/build" -DTARGET_i386=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr/local >>"$log" 2>&1 ||
+    die "Darling configuration failed; check distro build dependencies. Log: $log"
+  cmake --build "$build/build" --parallel "$jobs" >>"$log" 2>&1 ||
+    die "Darling compilation failed. Log: $log"
+  sudo cmake --install "$build/build" >>"$log" 2>&1 || die "Darling installation failed. Log: $log"
+  export PATH="/usr/local/bin:$PATH"
+  hash -r
+  command -v darling >/dev/null || die "Build completed but darling was not installed. Log: $log"
+  say "Darling installed. Build files retained at $build"
+}
+
+# Retain the existing checksum-verified upstream Debian binary option.
+try_darling_debs() {
+  local build
+  build=$(mktemp -d)
+  say "Trying Darling $DARLING_TAG upstream Debian packages"
+  if ! curl -fL --progress-bar -o "$build/debs.zip" \
+    "https://github.com/darlinghq/darling/releases/download/$DARLING_TAG/debs_${DARLING_TAG##*.}.zip"; then
+    rm -rf -- "$build"; return 1
+  fi
+  if ! printf '%s  %s\n' "$DARLING_DEBS_SHA256" "$build/debs.zip" | sha256sum -c --quiet -; then
+    rm -rf -- "$build"
+    die "The Darling download does not match its checksum. Setup stopped."
+  fi
+  if ! unzip -q "$build/debs.zip" -d "$build"; then rm -rf -- "$build"; return 1; fi
+  if ! sudo apt-get install -y "$build"/debs_*/*.deb; then rm -rf -- "$build"; return 1; fi
+  rm -rf -- "$build"
+  hash -r
+  command -v darling >/dev/null
+}
+
+ensure_darling() {
+  command -v darling >/dev/null && return 0
+  local manager
+  manager=$(detect_package_manager)
+  [[ $manager != manual ]] || die "Install Darling using your immutable/NixOS/Guix host's supported method."
+  say "Checking configured repositories for Darling"
+  if try_darling_package "$manager"; then return 0; fi
+  if [[ $manager == apt-get ]] && try_darling_debs; then return 0; fi
+  say "No usable Darling package was installed from the configured repositories."
+  confirm_darling_build || die "Darling compilation declined. Setup stopped."
+  build_darling_source "$manager"
+}
+
+validate_tools() {
+  local tool
+  for tool in git clang ld.lld unzip python3 pw-cat pkg-config; do
+    command -v "$tool" >/dev/null || {
+      if [[ $tool == darling ]]; then
+        die "Darling is not installed. Follow https://docs.darlinghq.org/build-instructions.html for your distro (Alpine needs its specific instructions), then rerun this installer."
+      fi
+      die "$tool is missing. Install it using your distribution's supported method and rerun this installer."
+    }
+  done
+  pkg-config --exists sdl2 wayland-client ||
+    die "SDL2/Wayland development files are missing. Install their development packages and rerun."
+  python3 - <<'PYTHON' || die "Python bindings for GTK 4, Adwaita 1 or WebKit 6 are missing. Check your distro packages/Portage USE flags and rerun."
+import gi
+for namespace, version in [('Gtk', '4.0'), ('Adw', '1'), ('WebKit', '6.0')]:
+    gi.require_version(namespace, version)
+    __import__('gi.repository', fromlist=[namespace]).__getattr__(namespace)
+PYTHON
 }
 
 do_install() {
@@ -206,26 +435,9 @@ do_install() {
   [[ ! -e $DIR || -d $DIR/.git ]] ||
     die "$DIR already exists without a Git checkout. Move it aside before installing."
   step 1 "Prepare the system tools"
-  [[ -r /etc/os-release ]] && . /etc/os-release
-  local family=" ${ID:-} ${ID_LIKE:-} "
-  case "$family" in
-    *" arch "*) install_arch ;;
-    *" debian "* | *" ubuntu "*) install_debian ;;
-    *" fedora "*) install_fedora ;;
-    *)
-      # Derivatives that do not say what they are based on (LeagueArchy has
-      # no ID_LIKE): go by the package manager.
-      if command -v pacman >/dev/null; then install_arch
-      elif command -v apt-get >/dev/null; then install_debian
-      elif command -v dnf >/dev/null; then install_fedora
-      else say "Unknown distribution, install Darling, clang, lld, unzip, PipeWire, PyGObject, GTK 4 and libadwaita yourself"
-      fi ;;
-  esac
-  for tool in git clang ld.lld unzip; do
-    command -v "$tool" >/dev/null || die "$tool is not installed. Install git, clang, lld and unzip with your package manager and run this again."
-  done
-  command -v darling >/dev/null ||
-    die "Darling is not installed. Build it with https://docs.darlinghq.org/build-instructions.html and run this again."
+  install_tools
+  validate_tools
+  ensure_darling
 
   step 2 "Prepare Mac O' Blox"
   if [[ -d $DIR/.git ]]; then
