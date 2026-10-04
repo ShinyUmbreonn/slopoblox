@@ -108,6 +108,22 @@ backup_checkout_changes() {
   say "Local changes saved to ${backup/#$HOME/\~}"
 }
 
+# The website lives on main for hosting, but is not part of an app install.
+# Partial fetches omit blobs until checkout requests them; sparse checkout
+# keeps hosting paths from requesting those blobs or entering the worktree.
+configure_launcher_checkout() {
+  git -C "$DIR" config remote.origin.promisor true
+  git -C "$DIR" config remote.origin.partialclonefilter blob:none
+  git -C "$DIR" sparse-checkout set --no-cone --stdin <<'PATTERNS'
+/*
+!/website/
+!/.github/
+!/vercel.json
+!/.vercel/
+!/.vercelignore
+PATTERNS
+}
+
 setup_success() {
   local version
   version=$(installed_version)
@@ -224,13 +240,18 @@ do_install() {
 
     # Fetch first, then preserve local repairs before replacing tracked files.
     # Session data, downloads and backups stay in the checkout unchanged.
-    git -C "$DIR" fetch origin main
+    git -C "$DIR" config remote.origin.promisor true
+    git -C "$DIR" config remote.origin.partialclonefilter blob:none
+    git -C "$DIR" fetch --filter=blob:none origin main
     backup_checkout_changes
+    configure_launcher_checkout
     git -C "$DIR" reset --hard origin/main
 
   else
     say "Downloading Mac O' Blox"
-    git clone --depth 1 "$REPO" "$DIR"
+    git clone --filter=blob:none --no-checkout --depth 1 --single-branch --branch main "$REPO" "$DIR"
+    configure_launcher_checkout
+    git -C "$DIR" reset --hard HEAD
   fi
   step 3 "Build the compatibility libraries"
   say "This can take a few minutes."

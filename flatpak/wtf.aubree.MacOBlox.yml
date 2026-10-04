@@ -66,6 +66,11 @@ modules:
         path: ..
         skip:
           - .git
+          - .github
+          - website
+          - vercel.json
+          - .vercel
+          - .vercelignore
           - RobloxPlayer.app
           - build
           - backups

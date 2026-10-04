@@ -41,6 +41,8 @@ are options too:
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
 ```
 
+Installer and launcher updates exclude `website/` and its hosting configuration.
+
 Uninstalling keeps Darling and its prefix, `~/.darling`, which holds your Roblox
 sign-in; `--purge` (or **Uninstall everything** in the menu) deletes that too.
 
@@ -79,7 +81,17 @@ sudo dnf install clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita 
 **2. Mac O’ Blox**
 
 ```bash
-git clone https://github.com/aubree-lat/MacOBlox ~/.local/share/MacOBlox
+git clone --filter=blob:none --no-checkout --depth 1 --single-branch --branch main \
+  https://github.com/aubree-lat/MacOBlox ~/.local/share/MacOBlox
+git -C ~/.local/share/MacOBlox sparse-checkout set --no-cone --stdin <<'PATTERNS'
+/*
+!/website/
+!/.github/
+!/vercel.json
+!/.vercel/
+!/.vercelignore
+PATTERNS
+git -C ~/.local/share/MacOBlox reset --hard HEAD
 ~/.local/share/MacOBlox/launcher/install.sh
 ```
 </details>

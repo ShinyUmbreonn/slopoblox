@@ -1,27 +1,29 @@
 # Mac O’ Blox website
 
-A static promotional site for `macoblox.aubree.wtf`, published through GitHub
-Pages from the MacOBlox repository's separate `website` branch. The application
-release and `main` branch are independent.
+A static promotional site for `macoblox.aubree.wtf`. Website and application
+source share the repository's `main` branch. Installer and launcher updates
+exclude the website and hosting configuration; Flatpak builds also skip them.
 
 ## Files and hosting
 
 `dist/` is the complete public site. There is no package installation or build
-step. Serve that directory with any static host. The GitHub Actions workflow
-at `.github/workflows/website.yml` publishes only `website/dist`, triggered by
-website changes pushed to the `website` branch.
+step. Serve that directory with any static host. Repository-root `vercel.json`
+selects the Other framework, skips install and build commands, and serves only
+`website/dist`. `.vercelignore` limits Vercel CLI uploads to website source and
+hosting configuration.
 
 For local viewing, run `python3 -m http.server 8080 --directory dist`.
-To publish edits, commit and push them to the `website` branch. GitHub Pages
-must use **GitHub Actions** as its source, with the `github-pages` environment
-allowing the `website` branch. There is no deployment workflow on `main`.
+For Vercel, import `aubree-lat/MacOBlox` with the repository root (`./`) as the
+Root Directory and `main` as the Production Branch. The checked-in config
+supplies Framework Preset **Other**, empty Build/Install Commands, and Output
+Directory `website/dist`. Push website edits to `main` to publish through the
+connected Vercel project. See [Vercel's configuration documentation](https://vercel.com/docs/project-configuration/vercel-json).
 
 ## Custom domain
 
-Set the repository's Pages custom domain to `macoblox.aubree.wtf`. In the
-`aubree.wtf` DNS zone, point the `macoblox` CNAME at `aubree-lat.github.io`.
-Enable Enforce HTTPS once GitHub has issued the certificate. Sites-specific
-verification records are not needed for GitHub Pages.
+Add `macoblox.aubree.wtf` under the Vercel project's Domains settings. Replace
+the previous GitHub Pages CNAME with the DNS record shown by Vercel for that
+domain. GitHub Pages and Sites verification records are not used by this host.
 
 ## Brand and dependencies
 

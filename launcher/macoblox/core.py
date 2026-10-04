@@ -239,6 +239,15 @@ def latest_version():
 REPO_URL = "https://github.com/aubree-lat/MacOBlox.git"
 RELEASES_URL = "https://github.com/aubree-lat/MacOBlox/releases/latest"
 LAUNCHER_RELEASE_URL = "https://api.github.com/repos/aubree-lat/MacOBlox/releases/latest"
+# Keep these patterns aligned with install.sh. Hosting files stay on main,
+# while partial app fetches only materialize blobs selected by this checkout.
+LAUNCHER_SPARSE_PATTERNS = """/*
+!/website/
+!/.github/
+!/vercel.json
+!/.vercel/
+!/.vercelignore
+"""
 
 
 def parse_version_tuple(ver):
@@ -258,8 +267,9 @@ def check_launcher_update():
     return has_update, tag, html_url
 
 
-def _git(*args):
-    return subprocess.run(["git", "-C", str(PROJECT), *args], capture_output=True, text=True)
+def _git(*args, input=None):
+    return subprocess.run(["git", "-C", str(PROJECT), *args], input=input,
+                          capture_output=True, text=True)
 
 
 def update_launcher(progress=None):
@@ -277,10 +287,17 @@ def update_launcher(progress=None):
     origin = _git("remote", "get-url", "origin").stdout.strip()
     if origin in ("https://github.com/narezy/MacOBlox", "https://github.com/narezy/MacOBlox.git"):
         _git("remote", "set-url", "origin", REPO_URL)
-    pull = _git("pull", "--ff-only")
-    if pull.returncode != 0:
-        raise RuntimeError(_("Could not update the files in {path}:\n{output}",
-                             path=PROJECT, output=(pull.stderr or pull.stdout).strip()))
+    for arguments, patterns in (
+        (("config", "remote.origin.promisor", "true"), None),
+        (("config", "remote.origin.partialclonefilter", "blob:none"), None),
+        (("sparse-checkout", "set", "--no-cone", "--stdin"), LAUNCHER_SPARSE_PATTERNS),
+        (("fetch", "--filter=blob:none", "origin", "main"), None),
+        (("merge", "--ff-only", "origin/main"), None),
+    ):
+        result = _git(*arguments, input=patterns)
+        if result.returncode != 0:
+            raise RuntimeError(_("Could not update the files in {path}:\n{output}",
+                                 path=PROJECT, output=(result.stderr or result.stdout).strip()))
 
     if progress:
         progress(0.6, _("Building shim…"))
