@@ -26,10 +26,16 @@ its Windows version through Wine. English and Russian.
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
 ```
 
-It installs Darling and everything else, then puts **Mac O’ Blox** in the app
-menu. Open it, press **Install Roblox**, then **Play**. Run the same command
-again for a small menu to update or uninstall. Without a terminal, or for
-scripts, the choices are options too:
+The installer welcomes you and explains the packages, destination and setup
+steps before you begin. It prepares Darling and adds **Mac O’ Blox** to the
+app menu. Open it for a first-time guide that downloads Roblox, prepares its
+app environment, and explains how to sign in. Existing Roblox installations
+open the launcher directly; **Setup guide** in its menu reopens the guide.
+
+Run the same command again to update or uninstall. Updates save local source
+changes in `~/.local/share/MacOBlox-backups` (or your XDG data directory) and
+keep settings and sign-in. Without a terminal, or for scripts, the choices
+are options too:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
@@ -173,7 +179,7 @@ installed on the system. Download `MacOBlox-*.flatpak` from the
 [latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
 
 ```bash
-flatpak install --user MacOBlox-0.17-x86_64.flatpak
+flatpak install --user MacOBlox-0.18-x86_64.flatpak
 ```
 
 It keeps its own Darling prefix, so sign in to Roblox again there. Roblox Studio

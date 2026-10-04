@@ -15,6 +15,7 @@ from pathlib import Path  # noqa: E402
 
 from . import __version__, author, core, discord, dns, i18n, mods, studio, uri as uri_handoff  # noqa: E402
 from .i18n import _  # noqa: E402
+from .setup import SetupWizard  # noqa: E402
 
 APP_ID = "wtf.aubree.MacOBlox"
 
@@ -974,6 +975,7 @@ class SettingsPage(Adw.Bin):
     def __init__(self, window):
         super().__init__()
         self.window = window
+        self._checking_updates = False
         settings = window.settings
 
         toolbar_view = Adw.ToolbarView()
@@ -1049,6 +1051,17 @@ class SettingsPage(Adw.Bin):
 
         renderer_handler = renderer.connect("notify::selected", select_renderer)
         game.add(renderer)
+
+        backend_codes = ["x11", "wayland"]
+        backend = Adw.ComboRow(
+            title=_("Window backend"),
+            subtitle=_("Native Wayland is experimental and incomplete. Applies on next launch."),
+            model=Gtk.StringList.new([_("X11 / Xwayland"), _("Native Wayland (experimental)")]))
+        selected_backend = settings.get("display_backend", "x11")
+        backend.set_selected(backend_codes.index(selected_backend) if selected_backend in backend_codes else 0)
+        backend.connect("notify::selected", lambda row, _pspec: window.set_setting(
+            "display_backend", backend_codes[row.get_selected()]))
+        game.add(backend)
 
         mangohud = Adw.SwitchRow(
             title=_("MangoHud overlay"),
@@ -1378,33 +1391,54 @@ class SettingsPage(Adw.Bin):
 
         self._in_thread(lambda: core.update_launcher(progress), done)
 
-    def check_updates(self, install=False):
+    def check_updates(self, install=False, on_progress=None, on_complete=None):
         """Looks for a newer client; with install=True also installs it
-        (the first install from the Play page)."""
+        using the same asynchronous workflow as first-launch setup."""
+        if self._checking_updates:
+            return False
+        if install and not self.window.begin("updating"):
+            return False
+        self._checking_updates = True
         self.update_button.set_sensitive(False)
         self.update_button.set_label(_("Checking…"))
 
         def done(result, error):
+            self._checking_updates = False
             self.update_button.set_sensitive(True)
             if error:
                 self.update_button.set_label(_("Check for updates"))
-                _toast(self.window.toasts, _("Could not check: {error}", error=error))
+                if install:
+                    self.window.end()
+                if on_complete:
+                    on_complete(error)
+                else:
+                    _toast(self.window.toasts, _("Could not check: {error}", error=error))
                 return
             version, upload = result
             if version == core.installed_version():
                 self.update_button.set_label(_("Check for updates"))
-                _toast(self.window.toasts, _("The latest version is installed"))
+                if install:
+                    # A previous attempt may have downloaded Roblox but failed
+                    # during preparation. Retry preparation without downloading
+                    # or replacing that already-current bundle again.
+                    self.install_update(upload, on_progress=on_progress, on_complete=on_complete,
+                                        _claimed=True, _prepare_only=True)
+                else:
+                    _toast(self.window.toasts, _("The latest version is installed"))
                 return
             self._set_update_action(_("Update to {version}", version=version),
                                     lambda: self.install_update(upload))
             if install:
-                self.install_update(upload)
+                self.install_update(upload, on_progress=on_progress, on_complete=on_complete,
+                                    _claimed=True)
 
         self._in_thread(core.latest_version, done)
+        return True
 
-    def install_update(self, upload):
-        if not self.window.begin("updating"):
-            return
+    def install_update(self, upload, on_progress=None, on_complete=None,
+                       _claimed=False, _prepare_only=False):
+        if not _claimed and not self.window.begin("updating"):
+            return False
         self.update_button.set_sensitive(False)
         self.progress.set_visible(True)
         shown = [-1.0, ""]
@@ -1414,8 +1448,12 @@ class SettingsPage(Adw.Bin):
             if fraction - shown[0] < 0.005 and text[:12] == shown[1][:12] and fraction < 1:
                 return
             shown[:] = [fraction, text]
-            GLib.idle_add(self.progress.set_fraction, fraction)
-            GLib.idle_add(self.progress.set_text, text)
+            def show_progress():
+                self.progress.set_fraction(fraction)
+                self.progress.set_text(text)
+                if on_progress:
+                    on_progress(fraction, text)
+            GLib.idle_add(show_progress)
 
         def done(backup, error):
             self.window.end()
@@ -1424,7 +1462,9 @@ class SettingsPage(Adw.Bin):
             self.progress.set_visible(False)
             self.version_row.set_subtitle(core.installed_version() or _("not found"))
             self.window.play_page.refresh()
-            if error:
+            if on_complete:
+                on_complete(error)
+            elif error:
                 _error_dialog(self.window, _("Update failed"), str(error) or repr(error))
             else:
                 _toast(self.window.toasts, _("Roblox updated, the old version is in backups/") if backup
@@ -1436,7 +1476,9 @@ class SettingsPage(Adw.Bin):
         running = self.window.session is not None
 
         def work():
-            backup = core.update_roblox(upload, progress)
+            backup = None
+            if not _prepare_only:
+                backup = core.update_roblox(upload, lambda fraction, text: progress(fraction * 0.93, text))
             progress(0.94, _("Rebuilding the shim…"))
             ok, output = core.build_shim()
             if not ok:
@@ -1448,6 +1490,7 @@ class SettingsPage(Adw.Bin):
             return backup
 
         self._in_thread(work, done)
+        return True
 
     def logout(self):
         dialog = Adw.AlertDialog(
@@ -1982,9 +2025,14 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.quit_when_idle = False  # the window was closed during an operation
         self.last_log = self._find_last_log()
         self.pending_uri = None
+        self.setup_active = False
+        setup_action = Gio.SimpleAction.new("setup", None)
+        setup_action.connect("activate", lambda *_args: self.show_setup())
+        self.add_action(setup_action)
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
-        threading.Thread(target=self._check_startup_update, daemon=True).start()
+        if not self.setup_active:
+            threading.Thread(target=self._check_startup_update, daemon=True).start()
 
     def build(self, page):
         """(Re)create the interface, e.g. after the language changes."""
@@ -2029,6 +2077,10 @@ class LauncherWindow(Adw.ApplicationWindow):
         # Content area
         content_view = Adw.ToolbarView()
         header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append(_("Setup guide"), "win.setup")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
+                                       tooltip_text=_("Launcher menu")))
 
         sidebar_toggle = Gtk.Button(icon_name="sidebar-show-symbolic")
         sidebar_toggle.add_css_class("flat")
@@ -2043,7 +2095,40 @@ class LauncherWindow(Adw.ApplicationWindow):
         content_view.set_vexpand(True)
         self.split.set_content(content_view)
 
-        self.set_content(self.split)
+        self.setup = SetupWizard(self)
+        self.content_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                                       transition_duration=150)
+        self.content_stack.add_named(self.split, "launcher")
+        self.content_stack.add_named(self.setup, "setup")
+        self.set_content(self.content_stack)
+        if page == "setup" or (not core.installed_version() and not self.settings.get("setup_complete", False)):
+            self.show_setup()
+        else:
+            self.setup_active = False
+            self.content_stack.set_visible_child_name("launcher")
+
+    def show_setup(self, page="welcome"):
+        if self.session or self.busy:
+            _toast(self.toasts, _("Close Roblox first") if self.session else
+                   _("Please wait, the launcher is busy"))
+            return
+        self.setup_active = True
+        self.content_stack.set_visible_child_name("setup")
+        self.setup.show(page)
+
+    def dismiss_setup(self):
+        if self.setup.installing:
+            return
+        self.setup_active = False
+        self.content_stack.set_visible_child_name("launcher")
+
+    def complete_setup(self, launch=False):
+        self.set_setting("setup_complete", True)
+        self.dismiss_setup()
+        self.stack.set_visible_child_name("play")
+        self.play_page.refresh()
+        if launch:
+            self.play_clicked()
 
     def toggle_sidebar(self):
         show = not self.split.get_show_sidebar()
@@ -2122,7 +2207,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.get_application().quit()
             return
         self.play_page.refresh()
-        if self.pending_uri and core.installed_version():
+        if self.pending_uri and core.installed_version() and not self.setup_active:
             pending = self.pending_uri
             GLib.idle_add(self.handle_uri, pending)
 
@@ -2151,11 +2236,12 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def play_clicked(self):
         if core.installed_version():
-            self.launch()
+            if self.pending_uri:
+                self.handle_uri(self.pending_uri)
+            else:
+                self.launch()
         else:
-            self.stack.set_visible_child_name("settings")
-            self.settings_page.set_tab("roblox")
-            self.settings_page.check_updates(install=True)
+            self.show_setup("overview")
 
     def handle_uri(self, browser_uri):
         """Start Roblox with an opaque browser handoff when it is ready."""
@@ -2164,14 +2250,12 @@ class LauncherWindow(Adw.ApplicationWindow):
         # so the newest handoff is the one that starts the client.
         browser_uri = uri_handoff.peek_pending() or browser_uri
         self.pending_uri = browser_uri
-        if self.session or self.busy:
+        if self.session or self.busy or self.setup_active:
             # The pending file remains in place.  A later activation or the
             # end of the current operation will retry this exact argument.
             return
         if not core.installed_version():
-            self.stack.set_visible_child_name("settings")
-            self.settings_page.set_tab("roblox")
-            self.settings_page.check_updates(install=True)
+            self.show_setup("overview")
             return
         # Keep the file until RobloxSession has started successfully.  If
         # Darling or the shim fails, the browser handoff can still be retried.

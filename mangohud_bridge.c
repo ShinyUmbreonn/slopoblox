@@ -1,5 +1,8 @@
 /* Darling calls EGL through Mach-O trampolines. Load MangoHud's host EGL
  * hooks directly, without its process-wide OpenGL dlsym/preload hooks. */
+#include "graphics_context.h"
+extern void macoblox_frame_presented(void *, void *, unsigned int);
+extern void macoblox_forget_gl_context(void *);
 extern void *dlsym(void *, const char *);
 extern char *getenv(const char *);
 extern long write(int, const void *, unsigned long);
@@ -42,15 +45,21 @@ static unsigned int macoblox_hud_swap(void *display, void *surface) {
     }
     /* A concurrent first swap can proceed normally while loading the overlay.
      * Publication only happens after all function pointers are initialized. */
-    if (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE) == 2 && hud_swap)
-        return hud_swap(display, surface);
-    return eglSwapBuffers(display, surface);
+    unsigned int result = __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) == 2 && hud_swap
+        ? hud_swap(display, surface) : eglSwapBuffers(display, surface);
+    macoblox_record_egl_swap(result);
+    macoblox_frame_presented(display, surface, result);
+    return result;
 }
 
 static unsigned int macoblox_hud_destroy(void *display, void *context) {
-    if (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE) == 2 && hud_destroy)
-        return hud_destroy(display, context);
-    return eglDestroyContext(display, context);
+    unsigned int result = __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) == 2 && hud_destroy
+        ? hud_destroy(display, context) : eglDestroyContext(display, context);
+    if (result) {
+        macoblox_forget_egl_context(context);
+        macoblox_forget_gl_context(context);
+    }
+    return result;
 }
 
 #define INTERPOSE(replacement, original) \

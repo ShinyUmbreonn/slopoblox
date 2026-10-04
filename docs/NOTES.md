@@ -441,12 +441,270 @@ child under Xvfb: both supplied a terminal and waited for completion. Package
 installation and authentication are mocked in these tests; no host graphics
 packages were changed.
 
-Native Wayland was deferred at the user's request. The unfinished prototype
-is saved in the ignored `work/wayland-prototype` directory and is not built or
-published. Its direct Wayland window and EGL surface initialized, but client
-presentation stayed black; the native Vulkan test also failed to select a
-physical device. These results do not establish working native Wayland
-support. The existing X11/Xwayland game backend remains in use.
+Native Wayland was initially deferred and saved in `work/wayland-prototype`.
+The October 3 work below promotes that progress to an explicit experimental
+option; X11/Xwayland remains the default.
+
+## Repairs 2026-10-03
+
+The affected installation uses client 0.741.0.7411056, NVIDIA RTX 3060 Ti,
+driver 615.71.09, and a Wayland desktop with Xwayland. Findings came from the
+latest launch log, the browser crash's system core, source inspection, and
+isolated Darling runs. The user's installed login and Darling prefix were
+not used as test containers. Authenticated tests used authorized copies in
+`/tmp`.
+
+### Input freezes and lost mouse lock
+
+- Raw mouse reports called Darling's synchronous modifier-state query on
+  every report. Its unbounded X event drain could also keep processing new
+  mouse reports without returning to the game. Cache modifiers from ordered
+  key/button events, query on focus activation, accumulate motion deltas, and
+  return after at most 128 events or 2 ms. Preserve key/button transitions,
+  the last core motion in a batch, and every raw delta.
+- Focus loss discarded the game's capture request. Keep requested capture
+  separate from the active grab, release it on focus loss, and restore it
+  after Darling activates the game window. An explicit unlock while
+  unfocused cancels restoration.
+- Correct the XInput cookie ABI, require XI 2.1 for raw motion, recover pointer
+  input if a previously healthy raw stream stops, and correct right/middle
+  drag event types. Scroll sensitivity was applied twice; apply it once.
+- The X11 close-message parser read incorrect offsets on LP64 and compared
+  an atom through an incompatible function declaration. Use the actual
+  `WM_PROTOCOLS`/`WM_DELETE_WINDOW` fields, and only signal game shutdown for
+  the matching Roblox window.
+
+### Private Servers/browser crash and graphics
+
+- The actual browser core faults at `O2DataProviderCopyData`, called by
+  Darling's `CATexImage2DCGImage` from `CARenderer`. An empty layer supplied a
+  null image/data provider. Safely upload a transparent pixel for empty
+  layers, check dimensions/stride, release copied image data, and restore GL
+  unpack state. Hook the renderer before its private internal uploader; a
+  dyld interposer alone cannot intercept that internal call.
+- `WebPreferences setPlugInsEnabled:` had the wrong Objective-C argument
+  signature. Implement its setter/getter with the actual BOOL ABI.
+- Browser bridge connections and writes must not block the game thread.
+  Bound queues, timeout pending requests, run timers in modal/tracking modes,
+  clear incomplete frames after disconnect, and deliver errors when a send
+  fails. Closed pages and invalid requests no longer create stray web views.
+- Bind desktop EGL separately on each rendering thread. Copy the terminated
+  CGL attribute list before passing it to Darling, propagate actual EGL
+  failures, and roll back CGL context/surface state on failed binding.
+  Restore the previous context after layer rendering, including a null
+  previous context. The initial NVIDIA draw safeguard applies per context.
+- GPU strings now have stable storage; X subwindow colormaps use the correct
+  screen without leaking. FPS accounting uses successful presentations per
+  surface. Expensive GL trace queries stop when the trace limit is reached.
+  A successful later swap-interval change invalidates that drawable's cached
+  forced-zero interval, so the next frame reapplies the launcher's vsync
+  setting. Failed changes preserve both the cache and the EGL error.
+- Report a conservative budget for the selected GPU from measured VRAM and
+  current use. Unknown memory falls back to 512 MiB. Do not invent 8 GiB or
+  report the memory of a different, larger adapter. Thread stack adjustment
+  copies caller attributes and preserves caller-provided stacks.
+- The Zink preflight now renders, reads back and presents to a real window
+  with Darling's screen visual, tests compatibility and core profiles, and
+  tests shared objects on a fresh rendering thread. A pbuffer alone missed
+  failures in that presentation path.
+- `HeightmapDebugPS` failed before GL compilation: the client's literal
+  `uniform vec4` scan expects every matching declaration to be a numbered
+  CB buffer, but two shader variants also declare ordinary MaterialLUT and
+  ColorLUT arrays. The verified GLSL pack repair changes four spaces to tabs,
+  preserving GLSL tokens, names, sizes, all pack metadata and source offsets.
+  Its RBXS v11 tables, 2,736 descriptors and 897 shared source ranges were
+  inspected and validated. A complete SHA-256 manifest permits only the
+  known pack and these four changes; unsupported or modified packs remain
+  untouched. Repairs are applied atomically on launch/update. A copied-client
+  hardware Zink game join passed with zero Heightmap parser errors, compared
+  with four errors per unpatched launch. Both repaired source variants also
+  compiled after the client's CB-to-std140 rewrite on a real Mesa GL driver.
+
+### Leaving a game
+
+The latest user log shows about 6.6 seconds between starting the menu render
+job and binding its workspace; the Replicator itself is destroyed in about
+0.47 seconds. All four existing transport patches were already applied, so
+the remaining delay cannot be attributed to an unpatched fallback connection.
+Replace heuristic binary searches with a complete, versioned SHA-256
+manifest and atomic replacement. Unsupported client versions are left
+unchanged; unexpected edits cannot result in partial patching.
+
+Earlier authenticated isolated runs returned to a menu in about 18 ms, but
+the test probe's recurring four-second timer could mask a missed wakeup.
+Those runs do not establish a fix. The user confirms the pause occurs on
+every leave.
+
+After removing the probe timer, real native desktop input through Home →
+Game Details → Play → Escape/Leave/confirmation reproduced menu binding
+delays of 2.392 and 2.442 seconds. The first run had no debugger attachment;
+the second had two brief, address-only stack captures. Later frame gaps of
+14.7 and 20.8 seconds occurred while the existing WebBridge timer continued
+at 50 ticks/second and the main event loop stayed active. No slow NSGL
+make-current/update/flush calls or drawable transitions were recorded.
+The active menu worker was in DateTime ISO 8601 parsing, locale month-name
+formatting, `strftime_l`/`tzset`, and Darling's file-close kqueue bookkeeping;
+a network worker was also in that bookkeeping. Its map walk scanned the full
+hard file-descriptor limit under a shared lock. In a matched, passive real-UI
+comparison, repairing both runtime copies reduced leave-to-menu binding from
+2.178 seconds to 15 ms. The transition's 2,103 close callbacks then consumed
+7.719 ms, compared with about 1.9 seconds before. A later 12.531-second frame
+gap still occurred; the complete leave pause remains under investigation.
+
+The same native desktop run opened the actual Private Servers browser page,
+rendered the server list and subscription dialog, and closed the browser
+without exiting Roblox. No server was created or purchased. Warm right
+mouse motion continued rendering at roughly 286–314 FPS with no frame gap
+over 100 ms during the sampled windows.
+
+The final comparison matches the user's audio, MangoHud, 1000 FPS cap,
+quality settings and DNS, with private copies of the 2.64 GB persistent
+temporary cache and the installed SQLite/OTA cache. The fixture supplies no
+launch URL: native desktop input follows the actual experience-details UI
+route and joins once. Warm five-second samples average roughly 320 FPS,
+with maximum gaps of 5–52 ms. These are functional measurements in the test
+scene, not a heavy-gameplay benchmark. The user's cache remains untouched.
+
+The event queue also had a separately reproduced wakeup defect: a background
+`[NSApp postEvent:atStart:]` appended an event while the main run loop kept
+waiting. A plain `CFRunLoopWakeUp` did not make `runMode:beforeDate:` return
+after a handled source. The queue now signals a source in the main loop's
+common modes; repeated posts share one pending signal, and main-thread posts
+avoid wakeup IPC. Coalesced motion posts use the same notification path.
+`tests/run_darling_event_wakeup.sh` measured delivery in 0.54–0.71 ms for
+background and timer posts in default, tracking and modal modes. The old
+code waited about 801 ms until the fixture's explicit fallback source fired.
+Raw/fallback input flood, focus and coalescing regressions still pass.
+The real menu pause remains a separate investigation: passive counters have
+observed continued event polling and 50 browser timer callbacks per second
+during a reproduced frameless interval, with no background event posts.
+
+### Darling kqueue cleanup
+
+The audited libkqueue map stores kqueues by file descriptor. Every ordinary
+successful close visits its active kqueues so READ/WRITE watches can be
+removed before that descriptor is reused. Its original walker scans the
+entire hard descriptor limit, including empty slots. The real client had
+five occupied slots, highest descriptor 145, in a map whose inclusive last
+descriptor was 1,048,575. Passive measurement during a reproduced leave
+counted 1,882 close callbacks taking 1,815.6 ms in the first three reporting
+buckets. This identifies a cost in the initial menu-binding delay; the later
+frameless phase is measured separately.
+
+`launcher/macoblox/darling_patches.py` prepares app-prefix copies of these
+known x86_64 implementations:
+
+| Library | Complete original SHA-256 | Complete repaired SHA-256 |
+| --- | --- | --- |
+| `usr/lib/libSystem.B.dylib` (244,532 bytes; active client path) | `f2caa3b1f39895d7b5c8853907ed73c9a93030b6460a3183318b5cb95b6caf32` | `1dc68f4c778d557358ea04a5728d5ebecaddc7623fe12f14cd4366ea5251a76b` |
+| `usr/lib/system/libsystem_c.dylib` (2,975,108 bytes; separate implementation) | `b1a578ba173b705843e113f99348623f8923a57424ee2aac13c13617677ac6e3` | `a59c162be3a316fcfb25d7a9dcde43c90466ac70c24897642da53b8b1731e692` |
+
+The repaired map appends a zero-initialized scan bound and extends it only
+after a successful insertion. Walks visit through the greatest successfully
+inserted descriptor, capped by the allocated capacity. The allocation also
+includes the last valid descriptor: Darling's NOFILE value is inclusive,
+and its lookup/insertion functions already accept that descriptor. Removing
+entries retains the historical bound. The existing kqueue callbacks, watch
+deletion, reference counts and global/per-kqueue locks remain in use. The
+audited map has no free implementation or call; its storage lasts for the
+process lifetime.
+
+The complete container hash, x86_64 Mach-O layout, patch symbols, original
+instruction hashes, region boundaries and complete repaired hash must all
+match. Staging and installation require the library family for the intended
+relative path and the exact planned result; a recognized library cannot be
+substituted under the other library's filename. The i386 slice and container
+metadata are unchanged. Unknown builds,
+partial patches, custom prefix overrides and symlinks are preserved. Copies
+are written atomically, retain permissions and are checked again before
+replacement; the installed Darling source library is read-only.
+
+`darling_sparse_map.c` documents the ISC-licensed reference behavior;
+`darling_sparse_map.S` provides the exact position-independent replacement
+instructions while preserving the original functions' frames and epilog
+offsets for their unwind metadata. Native C/assembly fixtures cover aliases,
+deletion, descriptor reuse, callbacks changing later entries, failed CAS,
+inclusive boundaries and invalid bounds. Python fixtures validate the Mach-O
+planner, generated assembly bytes, idempotent copies, preserved overrides,
+failed replacement cleanup and concurrent changes. The standalone Mach-O
+fixture `tests/darling_kqueue_test.c` exercises actual shared watches, close
+cleanup and descriptor reuse, with a bounded alarm and a close benchmark.
+The copied-prefix fixture passed these checks: 100 ordinary open/closes
+took 109.482 ms with stock libraries, 110.493 ms with only libc repaired,
+and 14.357 ms with the active libSystem implementation also repaired. The
+libc-only result confirms why the active library must be repaired. The
+fixture's optional final-descriptor case also passed at descriptor
+1,048,575. It raises only its own soft NOFILE to the unchanged hard limit,
+avoiding Darling's reserved driver descriptor; no limit change is persisted
+to the client. The subsequent real-client comparison reduced initial menu
+binding from 2.178 seconds to 15 ms and reduced the transition's close
+callbacks to 7.719 ms in total. A later frameless interval remains separate;
+these measurements do not establish a fix for the complete leave pause.
+
+### Darling ulock error returns
+
+The exported Darling `__ulock_wait` and `__ulock_wake` wrappers mishandle
+`ULF_NO_ERRNO`. A standalone native fixture confirmed that a 1 ms timeout
+returned `-1` and changed errno to 2108, instead of returning `-60` while
+preserving errno. Invalid-operation waits and wakes similarly returned
+`-1`/2070 instead of `-22` with unchanged errno. Ordinary error calls and
+the changed-value success path behaved correctly.
+
+`darling_fixes.c` now interposes thin adapters from `ulock_compat.h`: when
+NO_ERRNO is requested, call the original ordinary-error API with that flag
+cleared, convert its `-1` into the negative Darwin errno, then restore the
+caller's errno. Other calls pass through directly. The original futex
+implementation, timeout units, wake selection and successful return values
+are retained. Host mock tests cover forwarding, error conversion, success
+and errno preservation; `tests/darling_ulock_test.c` provides the bounded
+native regression fixture. The actual Mach-O fixture injected with the
+repaired full shim passed all six assertions in a separate prefix without
+authentication data; the prefix stopped normally afterward.
+
+The client's TBB wait code requests NO_ERRNO and compares the return with
+`-60`. It also rechecks its deadline and generation before every wait, so
+this ABI defect alone does not establish the cause of the remaining visible
+menu pause. The sampled asset workers were waiting on empty work queues.
+
+### Experimental backends
+
+Settings now offers **Native Wayland (experimental)**, explicitly opt-in.
+The Linux helper uses SDL2's Wayland driver, a native EGL window, a bounded
+event queue, clipboard/cursor plumbing and requested-versus-active capture.
+It is built when SDL2/Wayland development packages are available. Native EGL
+window presentation and a shared Zink context passed on this desktop, but
+full Roblox presentation, scaling, input methods and compositor compatibility
+remain unfinished. The user deferred that work; use the default X11 option
+for normal play.
+
+The playable Vulkan option still uses Zink. The macOS client has Metal and
+OpenGL backends; turning on a Vulkan preference did not create a native
+Vulkan renderer. A separate [Metal-to-Vulkan prototype](../experimental/metal/README.md)
+now translates two current client shaders, validates their SPIR-V and
+descriptor bindings, builds a Vulkan pipeline on RTX 3060 Ti, draws to an
+image and verifies all 256 red pixels by readback. This draw uses Vulkan
+without OpenGL/Zink. Reproducible source, content pins and the licensed Indium
+patch are included; generated client shader assets are not. Missing Metal
+methods, resource/compute cases and window presentation keep it experimental
+and prevent using it for normal gameplay.
+
+### Validation
+
+- Full Mach-O shim/framework and Linux Wayland-helper builds succeeded.
+- `bash tests/run.sh`: 11 native fixtures and 44 Python tests passed.
+- Real Darling/Xvfb input fixtures passed with raw input enabled and disabled:
+  a 128-report flood completed in under 0.4 ms, retained all deltas, freed
+  every cookie and made no per-report modifier queries. Focus restoration,
+  cancellation, silence fallback, right/middle drag and immediate raw motion
+  after paired Shift press/release transitions passed.
+- Real Darling/Zink layer rendering with an empty parent and populated child
+  completed twice without the reproduced null-provider crash.
+- Real RTX 3060 Ti Zink window preflight passed for both profiles and shared
+  thread contexts. The authenticated game join and UI leave above succeeded.
+
+Intermittent gameplay lag spikes still need a sustained before/after
+measurement; the successful functional checks do not establish their complete
+removal.
 
 ## Earlier investigation notes
 

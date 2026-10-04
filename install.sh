@@ -5,7 +5,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
 #
-# In a terminal it shows a small menu; without one it installs. The choices
+# In a terminal it guides setup; without one it installs. The choices
 # also work as options (with curl: ... | bash -s -- --uninstall), see --help.
 #
 # Everything runs inside main(), called on the last line, so a download cut
@@ -44,8 +44,88 @@ case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
   *) POINTER='>' BULLET='-' ON='*' OFF='-' KEYS='up/down move, enter choose, q quit' ;;
 esac
 
-say() { printf '%s==>%s %s\n' "$ACCENT" "$RESET" "$*"; }
+say() { printf '  %s%s%s %s\n' "$ACCENT" "$BULLET" "$RESET" "$*"; }
 die() { printf '%sError:%s %s\n' "$BAD" "$RESET" "$*" >&2; exit 1; }
+UPDATE_BACKUP=''
+INSTALL_LOG=''
+
+step() { printf '\n%s[%s/4] %s%s\n' "$BOLD" "$1" "$2" "$RESET"; }
+
+distribution_name() {
+  local PRETTY_NAME='' ID='' ID_LIKE=''
+  [[ ! -r /etc/os-release ]] || . /etc/os-release
+  printf '%s' "${PRETTY_NAME:-Linux}"
+}
+
+setup_plan() {
+  local operation='Install' dependencies='your package manager'
+  is_installed && operation='Update'
+  if command -v pacman >/dev/null; then dependencies='pacman and the AUR'
+  elif command -v apt-get >/dev/null; then dependencies='apt'
+  elif command -v dnf >/dev/null; then dependencies='dnf'
+  fi
+  printf '  %sSetup plan%s\n\n' "$BOLD" "$RESET"
+  printf '    1. Prepare Darling and the system tools (%s).\n' "$dependencies"
+  printf '    2. %s the Mac O\047 Blox launcher.\n' "$operation"
+  printf '    3. Build its compatibility libraries.\n'
+  printf '    4. Add the app menu entry and macoblox command.\n\n'
+  printf '  Computer    %s (%s)\n' "$(distribution_name)" "$(uname -m)"
+  printf '  Destination %s\n' "${DIR/#$HOME/\~}"
+  printf '  %sSystem packages may ask for your sudo password.%s\n' "$DIM" "$RESET"
+  if is_installed; then
+    printf '  %sUpdates keep settings, Roblox, Studio and existing backups.%s\n' "$DIM" "$RESET"
+    printf '  %sLocal source changes are backed up before replacement.%s\n' "$DIM" "$RESET"
+  else
+    printf '  %sFirst launch guides Roblox installation and sign-in.%s\n' "$DIM" "$RESET"
+  fi
+}
+
+# Keep recovery material outside the checkout. A reset can remove untracked
+# files that obstruct incoming tracked paths; back those up too, and leave
+# other untracked/ignored files in place instead of using git clean.
+backup_checkout_changes() {
+  local list_dir relative backup
+  list_dir=$(mktemp -d)
+  git -C "$DIR" diff --name-only -z HEAD > "$list_dir/tracked"
+  git -C "$DIR" ls-files --others --exclude-standard -z > "$list_dir/untracked"
+  if [[ ! -s $list_dir/tracked && ! -s $list_dir/untracked ]]; then
+    rm -rf -- "$list_dir"
+    return
+  fi
+  backup=$(umask 077; mkdir -p -- "$DATA_HOME/MacOBlox-backups";
+    mktemp -d "$DATA_HOME/MacOBlox-backups/update-$(date -u +%Y%m%d-%H%M%S)-XXXXXX")
+  git -C "$DIR" rev-parse HEAD > "$backup/revision"
+  git -C "$DIR" diff --binary HEAD > "$backup/tracked.patch"
+  cp -- "$list_dir/tracked" "$backup/tracked-paths"
+  cp -- "$list_dir/untracked" "$backup/untracked-paths"
+  while IFS= read -r -d '' relative; do
+    [[ -e $DIR/$relative || -L $DIR/$relative ]] || continue
+    mkdir -p -- "$backup/files/$(dirname -- "$relative")"
+    cp -a -- "$DIR/$relative" "$backup/files/$relative"
+  done < <(cat -- "$list_dir/tracked" "$list_dir/untracked")
+  rm -rf -- "$list_dir"
+  UPDATE_BACKUP=$backup
+  say "Local changes saved to ${backup/#$HOME/\~}"
+}
+
+setup_success() {
+  local version
+  version=$(installed_version)
+  printf '\n%s%s Setup complete%s\n' "$GOOD" "$ON" "$RESET"
+  printf '  Mac O\047 Blox%s is ready in your app menu.\n' "${version:+ $version}"
+  printf '\n  %sNext steps%s\n' "$BOLD" "$RESET"
+  printf '    1. Open Mac O\047 Blox from the app menu, or run macoblox.\n'
+  if [[ -d $DIR/RobloxPlayer.app ]]; then
+    printf '    2. Launch Roblox from the launcher.\n'
+    printf '    3. Sign in if needed, then choose a game.\n'
+  else
+    printf '    2. Follow its welcome screen to install Roblox.\n'
+    printf '    3. Sign in to Roblox and choose a game.\n'
+  fi
+  [[ -z $UPDATE_BACKUP ]] || printf '\n  Source backup: %s\n' "${UPDATE_BACKUP/#$HOME/\~}"
+  [[ -z $INSTALL_LOG ]] || printf '  Build log: %s\n' "${INSTALL_LOG/#$HOME/\~}"
+  printf '\n'
+}
 
 # ------------------------------------------------------------------ install
 
@@ -53,7 +133,7 @@ install_arch() {
   # Only packages that are not installed at all: asking pacman for an
   # installed but outdated one (pipewire-audio 1.6.8 with 1.6.9 in the repo)
   # makes it a partial upgrade that breaks on pinned dependencies.
-  local wanted=(git base-devel clang lld unzip python python-gobject gtk4 libadwaita webkitgtk-6.0)
+  local wanted=(git base-devel clang lld unzip python python-gobject gtk4 libadwaita webkitgtk-6.0 sdl2-compat wayland pkgconf)
   command -v pw-cat >/dev/null || wanted+=(pipewire-audio)
   local missing
   missing=$(pacman -T "${wanted[@]}" || true)
@@ -82,7 +162,7 @@ install_debian() {
   say "Installing tools (apt)"
   sudo apt-get update
   sudo apt-get install -y git curl unzip clang lld pipewire-bin python3 python3-gi \
-    gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
+    gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0 libsdl2-dev libwayland-dev pkg-config
   command -v darling >/dev/null && return
   # Release v0.1.YYYYMMDD has its Debian packages (built for Ubuntu 24.04)
   # as debs_YYYYMMDD.zip.
@@ -102,11 +182,14 @@ install_debian() {
 
 install_fedora() {
   say "Installing tools (dnf)"
-  sudo dnf install -y git clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita webkitgtk6.0
+  sudo dnf install -y git clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita webkitgtk6.0 SDL2-devel wayland-devel pkgconf-pkg-config
 }
 
 do_install() {
   [[ $(uname -m) == x86_64 ]] || die "Darling runs only on x86_64."
+  [[ ! -e $DIR || -d $DIR/.git ]] ||
+    die "$DIR already exists without a Git checkout. Move it aside before installing."
+  step 1 "Prepare the system tools"
   [[ -r /etc/os-release ]] && . /etc/os-release
   local family=" ${ID:-} ${ID_LIKE:-} "
   case "$family" in
@@ -122,13 +205,14 @@ do_install() {
       else say "Unknown distribution, install Darling, clang, lld, unzip, PipeWire, PyGObject, GTK 4 and libadwaita yourself"
       fi ;;
   esac
-  for tool in clang ld.lld unzip; do
-    command -v "$tool" >/dev/null || die "$tool is not installed. Install clang, lld and unzip with your package manager and run this again."
+  for tool in git clang ld.lld unzip; do
+    command -v "$tool" >/dev/null || die "$tool is not installed. Install git, clang, lld and unzip with your package manager and run this again."
   done
   command -v darling >/dev/null ||
     die "Darling is not installed. Build it with https://docs.darlinghq.org/build-instructions.html and run this again."
 
-    if [[ -d $DIR/.git ]]; then
+  step 2 "Prepare Mac O' Blox"
+  if [[ -d $DIR/.git ]]; then
     say "Updating Mac O' Blox"
 
     # Checkouts from before the move to this fork still point at the original
@@ -138,25 +222,28 @@ do_install() {
         git -C "$DIR" remote set-url origin "$REPO" ;;
     esac
 
-    # Mac O' Blox owns this checkout. Discard local changes and files before
-    # updating so an old/modified installation can never block an update.
-    say "Removing old local changes"
+    # Fetch first, then preserve local repairs before replacing tracked files.
+    # Session data, downloads and backups stay in the checkout unchanged.
     git -C "$DIR" fetch origin main
+    backup_checkout_changes
     git -C "$DIR" reset --hard origin/main
-    git -C "$DIR" clean -fd
 
   else
     say "Downloading Mac O' Blox"
     git clone --depth 1 "$REPO" "$DIR"
   fi
-  say "Building the Roblox shim"
-  local output
-  if ! output=$("$DIR/build_debug_shim.sh" 2>&1); then
-    printf '%s\n' "$output" >&2
-    die "Could not build the shim. Send the text above to the Discord: https://discord.gg/jCjHYYNq48"
+  step 3 "Build the compatibility libraries"
+  say "This can take a few minutes."
+  mkdir -p -- "$CACHE_HOME/macoblox/installer"
+  INSTALL_LOG=$(umask 077; mktemp "$CACHE_HOME/macoblox/installer/build-$(date -u +%Y%m%d-%H%M%S)-XXXXXX.log")
+  if ! "$DIR/build_debug_shim.sh" > "$INSTALL_LOG" 2>&1; then
+    tail -n 40 -- "$INSTALL_LOG" >&2
+    die "Build failed. Full log: $INSTALL_LOG. Help: https://discord.gg/jCjHYYNq48"
   fi
+  say "Compatibility libraries built."
+  step 4 "Add the launcher to your desktop"
   "$DIR/launcher/install.sh"
-  say "Done. Open Mac O' Blox from the app menu, press Install Roblox, then Play."
+  setup_success
 }
 
 # ---------------------------------------------------------------- uninstall
@@ -225,14 +312,21 @@ do_uninstall() {
 # Drawn on the terminal's alternate screen, which gets its old contents back
 # when the menu closes.
 MENU_ON=''
+MENU_SCREEN=''
 menu_open() {
   MENU_ON=1
-  printf '\033[?1049h\033[?25l' >/dev/tty
+  if [[ ${TERM:-dumb} != dumb ]]; then
+    MENU_SCREEN=1
+    printf '\033[?1049h\033[?25l' >/dev/tty
+  fi
 }
 menu_close() {
   [[ -n $MENU_ON ]] || return 0
   MENU_ON=''
-  printf '\033[?25h\033[?1049l' >/dev/tty
+  if [[ -n $MENU_SCREEN ]]; then
+    MENU_SCREEN=''
+    printf '\033[?25h\033[?1049l' >/dev/tty
+  fi
 }
 
 banner() {
@@ -255,6 +349,26 @@ choose() {
   local text=$1
   shift
   local count=$# index=0 key rest item label hint i
+  if [[ -z $MENU_SCREEN ]]; then
+    {
+      banner
+      printf '\n%b\n\n' "$text"
+      i=1
+      for item; do
+        printf '  %s. %s  %s\n' "$i" "${item%%|*}" "${item#*|}"
+        i=$((i + 1))
+      done
+    } >/dev/tty
+    while :; do
+      printf '\n  Choose 1-%s [1], or q to quit: ' "$count" >/dev/tty
+      IFS= read -r key </dev/tty || { CHOICE=-1; return; }
+      [[ -n $key ]] || key=1
+      case $key in
+        q | Q) CHOICE=-1; return ;;
+        [1-9]) if ((key <= count)); then CHOICE=$((key - 1)); return; fi ;;
+      esac
+    done
+  fi
   while :; do
     {
       printf '\033[H\033[2J\n'
@@ -293,15 +407,48 @@ choose() {
 }
 
 menu_main() {
-  local status first="Install|Darling, the tools, the launcher and its menu entry"
+  local text first="Start setup|Review what will be installed"
   if is_installed; then
-    status="  ${GOOD}${ON}${RESET} Mac O' Blox $(installed_version) is installed in ${DIR/#$HOME/\~}"
-    first="Update|the latest version, rebuilt"
+    text="  ${BOLD}Welcome back to Mac O' Blox${RESET}
+
+  ${GOOD}${ON}${RESET} Version $(installed_version) is installed.
+  Keep your launcher and compatibility libraries up to date.
+  ${DIM}${DIR/#$HOME/\~}${RESET}"
+    first="Update Mac O' Blox|Review the update plan"
   else
-    status="  ${DIM}${OFF} Not installed yet${RESET}"
+    text="  ${BOLD}Welcome to Mac O' Blox${RESET}
+  ${DIM}First setup · 1 of 3${RESET}
+
+  Play the macOS Roblox client on your Linux desktop.
+  We'll prepare the launcher, Darling and the system tools.
+  The launcher will guide you through installing Roblox and signing in."
   fi
-  choose "  ${BOLD}The real macOS Roblox client on Linux, through Darling.${RESET}\n\n$status" \
-    "$first" "Uninstall|remove Mac O' Blox from this computer" "Quit|"
+  choose "$text" "$first" "Uninstall|Remove Mac O' Blox from this computer" "Quit|"
+}
+
+menu_install() {
+  local operation='Install'
+  is_installed && operation='Update'
+  while :; do
+    choose "  ${BOLD}Setup · 2 of 3${RESET}
+
+$(setup_plan)" "Continue|Confirm this setup plan" "Back|Return to the welcome screen"
+    [[ $CHOICE == 0 ]] || return 1
+    choose "  ${BOLD}Ready to ${operation,,} Mac O' Blox${RESET}
+  ${DIM}Setup · 3 of 3${RESET}
+
+  Destination: ${DIR/#$HOME/\~}
+  Setup downloads the launcher and builds the compatibility libraries.
+  You'll see progress for each step. System packages may request sudo.
+
+  ${DIM}Begin when you're ready.${RESET}" \
+      "$operation Mac O' Blox|Begin setup" "Back|Review the plan again"
+    case $CHOICE in
+      0) return 0 ;;
+      1) ;;
+      *) return 1 ;;
+    esac
+  done
 }
 
 # The uninstall screen. Sets PURGE; false for "back".
@@ -337,7 +484,10 @@ usage() {
 Mac O' Blox installer
 
   install.sh               a menu in a terminal; without one, install or update
-  install.sh --install     install or update
+  install.sh --install     review the setup plan, then install or update
+  install.sh --update      same as --install
+  install.sh --install --yes
+                           install or update without setup prompts
   install.sh --uninstall   remove Mac O' Blox (asks first, unless --yes)
   install.sh --uninstall --purge
                            also delete Darling's prefix, ${PREFIX/#$HOME/\~} (your Roblox sign-in)
@@ -348,10 +498,10 @@ USAGE
 }
 
 main() {
-  local action='' assume_yes='' arg
+  local action='' assume_yes='' reviewed='' arg
   for arg in "$@"; do
     case $arg in
-      --install) action=install ;;
+      --install | --update) action=install ;;
       --uninstall) action=uninstall ;;
       --purge) PURGE=1 ;;
       -y | --yes) assume_yes=1 ;;
@@ -367,20 +517,32 @@ main() {
   local terminal=''
   [[ -t 0 && -t 1 ]] && terminal=1
 
-  if [[ -z $action && -n $terminal ]]; then
+  if [[ -z $action && -n $terminal && -z $assume_yes ]]; then
     trap 'menu_close' EXIT
     trap 'menu_close; exit 130' INT TERM
     menu_open
     while [[ -z $action ]]; do
       menu_main
       case $CHOICE in
-        0) action=install ;;
+        0) if menu_install; then action=install; reviewed=1; fi ;;
         1) if menu_uninstall; then action=uninstall; fi ;;
         *) action=quit ;;
       esac
     done
     menu_close
     [[ $action == quit ]] || banner
+  elif [[ $action == install && -n $terminal && -z $assume_yes ]]; then
+    trap 'menu_close' EXIT
+    trap 'menu_close; exit 130' INT TERM
+    menu_open
+    if ! menu_install; then
+      menu_close
+      say "Setup cancelled."
+      return 0
+    fi
+    reviewed=1
+    menu_close
+    banner
   elif [[ $action == uninstall && -z $assume_yes ]]; then
     [[ -n $terminal ]] || die "Not uninstalling without a terminal to ask in; add --yes."
     local answer='' what="Mac O' Blox"
@@ -394,7 +556,13 @@ main() {
   fi
 
   case ${action:-install} in
-    install) do_install ;;
+    install)
+      if [[ -z $reviewed ]]; then
+        banner
+        printf '\n'
+        setup_plan
+      fi
+      do_install ;;
     uninstall) do_uninstall "$PURGE" ;;
     quit) ;;
   esac

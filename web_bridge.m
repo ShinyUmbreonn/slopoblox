@@ -38,12 +38,16 @@ extern BOOL class_addMethod(Class, SEL, IMP, const char *);
 static id webViewAllocWithZone(id cls, SEL selector, void *zone);
 extern id objc_getAssociatedObject(id, const void *);
 extern void objc_setAssociatedObject(id, const void *, id, unsigned long);
+extern id objc_storeWeak(id *, id);
+extern id objc_loadWeakRetained(id *);
+extern void objc_destroyWeak(id *);
 extern char *getenv(const char *);
 extern unsigned long strlen(const char *);
 extern void *memchr(const void *, int, unsigned long);
 extern int socket(int, int, int);
 extern int connect(int, const void *, unsigned int);
 extern int setsockopt(int, int, int, const void *, unsigned int);
+extern int getsockopt(int, int, int, void *, unsigned int *);
 extern int fcntl(int, int, ...);
 extern long read(int, void *, unsigned long);
 extern long write(int, const void *, unsigned long);
@@ -56,14 +60,22 @@ extern void dispatch_async(void *, void (^)(void));
 #define errno (*__error())
 #define EAGAIN 35
 #define EINTR 4
+#define EINPROGRESS 36
+#define EALREADY 37
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define SOL_SOCKET 0xffff
 #define SO_NOSIGPIPE 0x1022
+#define SO_ERROR 0x1007
 #define F_GETFL 3
 #define F_SETFL 4
 #define O_NONBLOCK 4
 struct sockaddr_un { unsigned char sun_len, sun_family; char sun_path[104]; };
+struct pollfd { int fd; short events, revents; };
+extern int poll(struct pollfd *, unsigned int, int);
+#define POLLOUT 4
+#define POLLERR 8
+#define POLLHUP 16
 extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id, long, BOOL, const void *);
 
 @interface NSObject { Class isa; }
@@ -88,6 +100,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 @end
 @interface NSMutableArray : NSArray
 + (id)array; - (void)addObject:(id)object; - (void)removeObjectAtIndex:(NSUInteger)index;
+- (void)removeAllObjects;
 @end
 @interface NSDictionary : NSObject
 + (id)dictionary;
@@ -113,7 +126,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 + (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)options error:(id *)error;
 @end
 @interface NSDate : NSObject
-+ (id)dateWithTimeIntervalSince1970:(double)seconds; - (double)timeIntervalSince1970;
++ (id)date; + (id)dateWithTimeIntervalSince1970:(double)seconds; - (double)timeIntervalSince1970;
 @end
 @interface NSError : NSObject
 + (id)errorWithDomain:(NSString *)domain code:(NSInteger)code userInfo:(NSDictionary *)info;
@@ -134,7 +147,12 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 @end
 @interface NSTimer : NSObject
 + (id)scheduledTimerWithTimeInterval:(double)seconds target:(id)target selector:(SEL)selector userInfo:(id)info repeats:(BOOL)repeats;
++ (id)timerWithTimeInterval:(double)seconds target:(id)target selector:(SEL)selector userInfo:(id)info repeats:(BOOL)repeats;
 @end
+@interface NSRunLoop : NSObject
++ (id)mainRunLoop; - (void)addTimer:(id)timer forMode:(id)mode;
+@end
+extern NSString *NSRunLoopCommonModes;
 @interface NSFileManager : NSObject
 + (id)defaultManager; - (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)directory;
 @end
@@ -178,32 +196,56 @@ extern NSApplication *NSApp;
 #define OBJC_ASSOCIATION_RETAIN_NONATOMIC 1
 
 static int connection = -1;
+static BOOL connecting;
+static double connectDeadline, retryAfter;
 static NSMutableData *received;
 static NSMutableArray *outgoing;
 static NSWindow *gameWindow;
 static NSMutableDictionary *views, *callbacks;
 static long nextView, nextRequest;
 static void receiveMessage(NSDictionary *message);
+static void failRequests(id view, NSString *reason);
+
+static double bridgeTime(void) { return [[NSDate date] timeIntervalSince1970]; }
+static void initializeBridge(void) {
+    if (!received) received = [NSMutableData new];
+    if (!outgoing) outgoing = [NSMutableArray new];
+    if (!views) views = [NSMutableDictionary new];
+    if (!callbacks) callbacks = [NSMutableDictionary new];
+}
+static void disconnectBridge(NSString *reason) {
+    if (connection >= 0) close(connection);
+    connection = -1;
+    connecting = NO;
+    retryAfter = bridgeTime() + 1.0;
+    /* Frames belong to one stream. A suffix from a partial write must never
+     * be replayed on a new connection as though it were a complete JSON line. */
+    [received setLength:0];
+    [outgoing removeAllObjects];
+    failRequests(nil, reason);
+}
 
 static const char *socketPath(void) {
     const char *path = getenv("MACOBLOX_WEB_SOCKET");
     return path && *path ? path : 0;
 }
 
-static void sendMessage(NSDictionary *message) {
+static BOOL sendMessage(NSDictionary *message) {
     if (!socketPath())
-        return;
+        return NO;
     if (![NSThread isMainThread]) {
         dispatch_async(&_dispatch_main_q, ^{ sendMessage(message); });
-        return;
+        return YES;
     }
+    initializeBridge();
     NSData *json = [NSJSONSerialization dataWithJSONObject:message options:0 error:0];
-    if (!json || [json length] > 1024 * 1024)
-        return;
+    if (!json || [json length] > 1024 * 1024 || [outgoing count] >= 128)
+        return NO;
     NSMutableData *line = [json mutableCopy];
     [line appendBytes:"\n" length:1];
     [outgoing addObject:line];
     [line release];
+    return YES;
 }
 
 // The visible page and its toolbar are laid out by the launcher's window;
@@ -236,16 +278,22 @@ static void closeHostedView(id self, SEL selector) {
         class_addMethod(object_getClass((id)webView), sel_registerName("allocWithZone:"),
                         (IMP)webViewAllocWithZone, "@@:^v");
     dispatch_async(&_dispatch_main_q, ^{
-        received = [NSMutableData new];
-        outgoing = [NSMutableArray new];
-        views = [NSMutableDictionary new];
-        callbacks = [NSMutableDictionary new];
-        [NSTimer scheduledTimerWithTimeInterval:0.02 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
+        initializeBridge();
+        id timer = [NSTimer timerWithTimeInterval:0.02 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
         write(2, "[MacOBlox Web] Embedded pages open in the launcher's browser window\n", 68);
     });
 }
 + (void)tick:(id)timer {
     (void)timer;
+    initializeBridge();
+    double now = bridgeTime();
+    NSArray *keys = [callbacks allKeys];
+    for (NSUInteger i = 0; i < [keys count]; i++) {
+        id key = [keys objectAtIndex:i];
+        if ([callbacks[key][@"deadline"] doubleValue] <= now)
+            receiveMessage(@{@"event": @"reply", @"request": key, @"error": @"The embedded browser request timed out."});
+    }
     static BOOL adapted = NO;
     if (!adapted) {
         Method layout = class_getInstanceMethod(objc_getClass("EmbeddedWebView"), sel_registerName("setupConstraints"));
@@ -258,6 +306,7 @@ static void closeHostedView(id self, SEL selector) {
         }
     }
     if (connection < 0) {
+        if (now < retryAfter) return;
         const char *path = socketPath();
         struct sockaddr_un address = {0, AF_UNIX, {0}};
         if (!path || strlen(path) >= sizeof address.sun_path)
@@ -268,14 +317,38 @@ static void closeHostedView(id self, SEL selector) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0)
             return;
-        if (connect(fd, &address, sizeof address)) {
+        int flags = fcntl(fd, F_GETFL);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
             close(fd);
             return;
         }
         int yes = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof yes);
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        int result = connect(fd, &address, sizeof address);
+        if (result && errno != EINPROGRESS && errno != EALREADY) {
+            close(fd);
+            retryAfter = now + 1.0;
+            return;
+        }
         connection = fd;
+        connecting = result != 0;
+        connectDeadline = now + 5.0;
+    }
+    if (connecting) {
+        struct pollfd state = {connection, POLLOUT, 0};
+        int result = poll(&state, 1, 0);
+        if (now >= connectDeadline || result < 0 || (state.revents & (POLLERR | POLLHUP))) {
+            disconnectBridge(@"The embedded browser connection failed.");
+            return;
+        }
+        if (result == 0 || !(state.revents & POLLOUT)) return;
+        int error = 0;
+        unsigned int size = sizeof error;
+        if (getsockopt(connection, SOL_SOCKET, SO_ERROR, &error, &size) || error) {
+            disconnectBridge(@"The embedded browser connection failed.");
+            return;
+        }
+        connecting = NO;
     }
     if (!gameWindow) {
         NSArray *windows = [NSApp windows];
@@ -295,8 +368,7 @@ static void closeHostedView(id self, SEL selector) {
         if (n < 0 && (errno == EAGAIN || errno == EINTR))
             break;
         if (n <= 0) {
-            close(connection);
-            connection = -1;
+            disconnectBridge(@"The embedded browser disconnected.");
             return;
         }
         NSRange done = {0, (NSUInteger)n};
@@ -308,10 +380,8 @@ static void closeHostedView(id self, SEL selector) {
     long n;
     while ((n = read(connection, buffer, sizeof buffer)) > 0)
         [received appendBytes:buffer length:(NSUInteger)n];
-    if (n == 0 || [received length] > 1024 * 1024) {
-        close(connection);
-        connection = -1;
-        [received setLength:0];
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR) || [received length] > 1024 * 1024) {
+        disconnectBridge(@"The embedded browser disconnected.");
         return;
     }
     for (;;) {
@@ -376,8 +446,7 @@ int macoblox_web_open_url(id url) {
     NSString *scheme = [[url scheme] lowercaseString];
     if (!socketPath() || connection < 0 || !([scheme isEqual:@"https"] || [scheme isEqual:@"http"]) || ![[url host] length])
         return 0;
-    sendMessage(@{@"op": @"load", @"view": @0, @"url": text});
-    return 1;
+    return sendMessage(@{@"op": @"load", @"view": @0, @"url": text});
 }
 
 // ---------------------------------------------------------------- AppKit gaps
@@ -443,17 +512,32 @@ static BOOL validUserAgent(NSString *agent) {
             return NO;
     return YES;
 }
-static long request(NSMutableDictionary *message, void (^completion)(id, NSError *)) {
-    long number = ++nextRequest;
+static void enqueueRequest(long number, NSMutableDictionary *message, void (^completion)(id, NSError *)) {
+    initializeBridge();
     if (completion) {
         id block = (id)_Block_copy(completion);
-        [callbacks setObject:block forKey:@(number)];
+        callbacks[@(number)] = @{@"block": block, @"deadline": @(bridgeTime() + 15.0),
+                                  @"view": message[@"view"] ?: @0};
         _Block_release(block);
     }
     [message setObject:@(number) forKey:@"request"];
-    sendMessage(message);
+    if (!sendMessage(message))
+        receiveMessage(@{@"event": @"reply", @"request": @(number), @"error": @"The embedded browser request could not be sent."});
+}
+static long request(NSMutableDictionary *message, void (^completion)(id, NSError *)) {
+    long number = __atomic_add_fetch(&nextRequest, 1, __ATOMIC_RELAXED);
+    if ([NSThread isMainThread]) enqueueRequest(number, message, completion);
+    else dispatch_async(&_dispatch_main_q, ^{ enqueueRequest(number, message, completion); });
     [message release];
     return number;
+}
+static void failRequests(id view, NSString *reason) {
+    NSArray *keys = [callbacks allKeys];
+    for (NSUInteger i = 0; i < [keys count]; i++) {
+        id key = [keys objectAtIndex:i];
+        if (!view || [callbacks[key][@"view"] isEqual:view])
+            receiveMessage(@{@"event": @"reply", @"request": key, @"error": reason});
+    }
 }
 
 @interface NSButton (MacOBloxWebTint)
@@ -619,6 +703,7 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
 - (id)initWithFrame:(NSRect)frame configuration:(id)configuration {
     self = [super initWithFrame:frame];
     if (self) {
+        initializeBridge();
         _id = ++nextView;
         _configuration = [configuration retain];
         views[@(_id)] = self;
@@ -626,10 +711,10 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
     return self;
 }
 - (id)configuration { return _configuration; }
-- (void)setNavigationDelegate:(id)delegate { _navigationDelegate = delegate; }
-- (id)navigationDelegate { return _navigationDelegate; }
-- (void)setUIDelegate:(id)delegate { _UIDelegate = delegate; }
-- (id)UIDelegate { return _UIDelegate; }
+- (void)setNavigationDelegate:(id)delegate { objc_storeWeak(&_navigationDelegate, delegate); }
+- (id)navigationDelegate { return [objc_loadWeakRetained(&_navigationDelegate) autorelease]; }
+- (void)setUIDelegate:(id)delegate { objc_storeWeak(&_UIDelegate, delegate); }
+- (id)UIDelegate { return [objc_loadWeakRetained(&_UIDelegate) autorelease]; }
 - (NSURL *)URL { return _URL; }
 - (NSString *)title { return _title; }
 - (BOOL)isLoading { return _loading; }
@@ -653,29 +738,48 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
 }
 - (void)setUserAgent:(NSString *)agent { [self setCustomUserAgent:agent]; }
 - (id)loadRequest:(NSURLRequest *)urlRequest {
+    BOOL delivered = YES;
     id controller = [_configuration userContentController];
     NSDictionary *handlers = stateFor(controller)[@"handlers"];
     NSArray *names = handlers ? [(id)handlers allKeys] : [NSArray array];
     for (NSUInteger i = 0; i < [names count]; i++)
-        sendMessage(@{@"op": @"handler", @"view": @(_id), @"name": [names objectAtIndex:i]});
+        delivered &= sendMessage(@{@"op": @"handler", @"view": @(_id), @"name": [names objectAtIndex:i]});
     NSArray *scripts = stateFor(controller)[@"scripts"];
     for (NSUInteger i = 0; i < [scripts count]; i++) {
         NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:stateFor([scripts objectAtIndex:i])];
         m[@"op"] = @"script";
         m[@"view"] = @(_id);
-        sendMessage(m);
+        delivered &= sendMessage(m);
     }
     [_navigation release];
     _navigation = [NSObject new];
-    id title = [_navigationDelegate respondsToSelector:@selector(title)] ? [_navigationDelegate title] : nil;
+    id delegate = [self navigationDelegate];
+    id title = [delegate respondsToSelector:@selector(title)] ? [delegate title] : nil;
     NSString *url = [[urlRequest URL] absoluteString];
-    if (!url)
-        return _navigation;
-    sendMessage(@{@"op": @"load", @"view": @(_id), @"url": url,
+    if (url) {
+        delivered &= sendMessage(@{@"op": @"load", @"view": @(_id), @"url": url,
                   @"headers": [urlRequest allHTTPHeaderFields] ?: [NSDictionary dictionary],
                   @"panelTitle": [title isKindOfClass:[NSString class]] ? title : @"",
-                  @"delegate": @([_navigationDelegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)]),
+                  @"delegate": @([delegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)]),
                   @"agent": [self userAgent]});
+    } else {
+        delivered = NO;
+    }
+    _loading = delivered;
+    if (!delivered) {
+        id navigation = _navigation;
+        dispatch_async(&_dispatch_main_q, ^{
+            // Another load or a closed view supersedes this navigation.
+            if (views[@(_id)] != self || _navigation != navigation)
+                return;
+            _loading = NO;
+            id currentDelegate = [self navigationDelegate];
+            if ([currentDelegate respondsToSelector:@selector(webView:didFailProvisionalNavigation:withError:)])
+                [currentDelegate webView:self didFailProvisionalNavigation:navigation
+                    withError:[NSError errorWithDomain:@"MacOBloxWeb" code:1
+                        userInfo:@{NSLocalizedDescriptionKey: @"The embedded page could not be sent to the browser."}]];
+        });
+    }
     return _navigation;
 }
 - (void)evaluateJavaScript:(NSString *)script completionHandler:(void (^)(id, NSError *))completion {
@@ -698,9 +802,10 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
         return;
     [self retain];
     sendMessage(@{@"op": @"close", @"view": @(_id)});
-    _navigationDelegate = nil;
-    _UIDelegate = nil;
+    [self setNavigationDelegate:nil];
+    [self setUIDelegate:nil];
     [views removeObjectForKey:@(_id)];
+    failRequests(@(_id), @"The embedded page was closed.");
     [self release];
 }
 - (void)removeFromSuperview {
@@ -709,6 +814,8 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
     [super removeFromSuperview];
 }
 - (void)dealloc {
+    objc_destroyWeak(&_navigationDelegate);
+    objc_destroyWeak(&_UIDelegate);
     [_configuration release]; [_URL release]; [_title release]; [_navigation release];
     [super dealloc];
 }
@@ -727,7 +834,7 @@ static void receiveMessage(NSDictionary *message) {
         id key = message[@"request"];
         if (!key)
             return;
-        void (^block)(id, NSError *) = (void (^)(id, NSError *))_Block_copy([callbacks objectForKey:key]);
+        void (^block)(id, NSError *) = (void (^)(id, NSError *))_Block_copy(callbacks[key][@"block"]);
         [callbacks removeObjectForKey:key];
         if (block) {
             NSError *error = message[@"error"]
@@ -741,7 +848,7 @@ static void receiveMessage(NSDictionary *message) {
     MacOBloxWebView *view = views[message[@"view"]];
     if (!view)
         return;
-    id delegate = view->_navigationDelegate;
+    id delegate = [view navigationDelegate];
     if ([type isEqual:@"state"]) {
         [view->_URL release];
         view->_URL = [[NSURL URLWithString:message[@"url"]] retain];
@@ -752,6 +859,7 @@ static void receiveMessage(NSDictionary *message) {
         view->_loading = [message[@"loading"] boolValue];
     } else if ([type isEqual:@"load"]) {
         long stage = [message[@"stage"] longValue];
+        view->_loading = stage != 3;
         if (stage == 0 && [delegate respondsToSelector:@selector(webView:didStartProvisionalNavigation:)])
             [delegate webView:view didStartProvisionalNavigation:view->_navigation];
         if (stage == 2 && [delegate respondsToSelector:@selector(webView:didCommitNavigation:)])
@@ -785,8 +893,10 @@ static void receiveMessage(NSDictionary *message) {
     } else if ([type isEqual:@"closed"]) {
         if ([delegate respondsToSelector:@selector(closeButtonAction:)])
             [delegate closeButtonAction:nil];
-    } else if ([type isEqual:@"error"] && [delegate respondsToSelector:@selector(webView:didFailProvisionalNavigation:withError:)]) {
-        [delegate webView:view didFailProvisionalNavigation:view->_navigation
+    } else if ([type isEqual:@"error"]) {
+        view->_loading = NO;
+        if ([delegate respondsToSelector:@selector(webView:didFailProvisionalNavigation:withError:)])
+            [delegate webView:view didFailProvisionalNavigation:view->_navigation
                 withError:[NSError errorWithDomain:@"MacOBloxWeb" code:1
                                           userInfo:@{NSLocalizedDescriptionKey: message[@"message"] ?: @"The page could not be loaded."}]];
     }

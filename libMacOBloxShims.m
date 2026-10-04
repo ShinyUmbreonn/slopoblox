@@ -1,6 +1,8 @@
 #include "telemetry_hosts.h"
 #include "shim_lock.h"
 #include "worker_wake.h"
+#include "graphics_context.h"
+#include "x_modifier_state.h"
 typedef struct objc_class *Class;
 typedef struct objc_object { Class isa; } *id;
 typedef struct objc_selector *SEL;
@@ -36,6 +38,10 @@ extern long _dyld_get_image_vmaddr_slide(unsigned int image_index);
 static void write_str(const char* s);
 static void print_hex(unsigned long long val);
 static void print_num(long long val);
+extern int macoblox_wayland_enabled(void);
+extern int macoblox_wayland_captured(void);
+extern id macoblox_wayland_display(void);
+extern int macoblox_wayland_associate(unsigned int);
 
 // A MACOBLOX_* switch: on when set to anything but "" or "0".
 static int macoblox_env_on(const char* name) {
@@ -327,6 +333,7 @@ DYLD_INTERPOSE(macoblox_glCompileShader, glCompileShader);
 extern void* pthread_self(void);
 extern unsigned int pthread_mach_thread_np(void*);
 extern int CGLCreateContext(void*, void*, void**);
+extern int CGLChoosePixelFormat(const int*, void**, int*);
 extern int CGLSetCurrentContext(void*);
 extern int CGLContextMakeCurrentAndAttachToWindow(void*, void*);
 extern int CGLFlushDrawable(void*);
@@ -362,7 +369,30 @@ static void* macoblox_cgl_egl_surface(void* cgl) {
 }
 
 static volatile long macoblox_cgl_create_count;
+static int macoblox_CGLChoosePixelFormat(const int* attributes, void** result, int* count) {
+    int* terminated = macoblox_copy_pixel_attributes(attributes);
+    if (!terminated) {
+        if (result) *result = 0;
+        if (count) *count = 0;
+        return attributes ? 10016 /* kCGLBadAlloc */ : 10000 /* kCGLBadAttribute */;
+    }
+    int error = CGLChoosePixelFormat(attributes, result, count);
+    if (!error && result && *result && terminated) {
+        // Darling's CGL copy omits the final zero, but its descriptor scans
+        // until zero. Replace that owned allocation with the complete list.
+        void** format = (void**)*result;
+        free(format[1]);
+        format[1] = terminated;
+    } else {
+        free(terminated);
+    }
+    return error;
+}
+DYLD_INTERPOSE(macoblox_CGLChoosePixelFormat, CGLChoosePixelFormat);
+
 static int macoblox_CGLCreateContext(void* format, void* share, void** result) {
+    // Darling initializes its EGL display inside this call. The EGL context
+    // wrapper binds desktop GL after that initialization, on this thread.
     if (macoblox_trace_cgl_enabled() && format) {
         // struct _CGLPixelFormatObj { GLuint retain_count; CGLPixelFormatAttribute* attributes; }
         int* attributes = ((int**)format)[1];
@@ -395,7 +425,11 @@ DYLD_INTERPOSE(macoblox_CGLCreateContext, CGLCreateContext);
 
 static volatile long macoblox_cgl_set_current_count;
 static int macoblox_CGLSetCurrentContext(void* context) {
+    macoblox_context_change change;
+    if (!macoblox_begin_context_change(&change))
+        return 10004;
     int error = CGLSetCurrentContext(context);
+    error = macoblox_finish_context_change(&change, error);
     if (macoblox_trace_cgl_enabled() &&
         macoblox_trace_cgl_should_log(&macoblox_cgl_set_current_count)) {
         macoblox_trace_cgl_prefix("CGLSetCurrentContext",
@@ -414,8 +448,16 @@ DYLD_INTERPOSE(macoblox_CGLSetCurrentContext, CGLSetCurrentContext);
 
 static volatile long macoblox_cgl_attach_count;
 static int macoblox_CGLContextMakeCurrentAndAttachToWindow(void* context,
-                                                           void* window) {
+                                                          void* window) {
+    if (!context)
+        return 10004;
+    macoblox_context_change change;
+    if (!macoblox_begin_context_change(&change))
+        return 10004;
+    change.surface_slot = &((void**)context)[10];
+    change.previous_surface = *change.surface_slot;
     int error = CGLContextMakeCurrentAndAttachToWindow(context, window);
+    error = macoblox_finish_context_change(&change, error);
     if (macoblox_trace_cgl_enabled() &&
         macoblox_trace_cgl_should_log(&macoblox_cgl_attach_count)) {
         macoblox_trace_cgl_prefix("CGLContextMakeCurrentAndAttachToWindow",
@@ -438,6 +480,8 @@ DYLD_INTERPOSE(macoblox_CGLContextMakeCurrentAndAttachToWindow,
 extern void macoblox_frame_presenting(void* cgl_context);
 static volatile long macoblox_cgl_flush_drawable_count;
 static int macoblox_CGLFlushDrawable(void* context) {
+    if (!context)
+        return 10004;
     if (macoblox_trace_cgl_enabled() &&
         macoblox_trace_cgl_should_log(&macoblox_cgl_flush_drawable_count)) {
         macoblox_trace_cgl_prefix("CGLFlushDrawable",
@@ -451,7 +495,8 @@ static int macoblox_CGLFlushDrawable(void* context) {
         write_str("\n");
     }
     macoblox_frame_presenting(context);
-    return CGLFlushDrawable(context);
+    unsigned long serial = macoblox_egl_swap_serial();
+    return macoblox_finish_cgl_swap(serial, CGLFlushDrawable(context));
 }
 DYLD_INTERPOSE(macoblox_CGLFlushDrawable, CGLFlushDrawable);
 
@@ -459,10 +504,9 @@ static volatile long macoblox_egl_make_current_count;
 static unsigned int macoblox_eglMakeCurrent(void* display, void* draw,
                                             void* read, void* context) {
     unsigned int result = eglMakeCurrent(display, draw, read, context);
+    macoblox_record_egl_binding(result, context);
     if (macoblox_trace_cgl_enabled() &&
         macoblox_trace_cgl_should_log(&macoblox_egl_make_current_count)) {
-        unsigned int (*egl_error)(void) =
-            (unsigned int (*)(void))dlsym(RTLD_DEFAULT, "eglGetError");
         macoblox_trace_cgl_prefix("eglMakeCurrent",
                                   &macoblox_egl_make_current_count);
         write_str(" display=");
@@ -474,7 +518,7 @@ static unsigned int macoblox_eglMakeCurrent(void* display, void* draw,
         write_str(" result=");
         print_num(result);
         write_str(" error=");
-        print_hex(result || !egl_error ? 0x3000 : egl_error());
+        print_hex((unsigned int)macoblox_egl_binding_error());
         write_str("\n");
     }
     return result;
@@ -665,6 +709,10 @@ static int macoblox_should_skip_foreign_window_command(int learn_renderer) {
 }
 
 static void macoblox_trace_window_draw(unsigned int mode, int count) {
+    // Once the bounded capture is complete, avoid driver queries on every
+    // later draw. Diagnostic logging must not keep synchronizing gameplay.
+    if (__atomic_load_n(&macoblox_gl_traced_window_draws, __ATOMIC_RELAXED) >= 16)
+        return;
     unsigned int (*get_error)(void) =
         (unsigned int (*)(void))dlsym(RTLD_NEXT, "glGetError");
     unsigned int draw_error = get_error ? get_error() : 0;
@@ -895,9 +943,7 @@ static void macoblox_glDrawArrays(unsigned int mode, int first, int count) {
         // Keep the initial AppKit draw's error check without enabling tracing
         // on every draw. Removing this single query reproduces an early
         // NVIDIA worker abort under Darling, with both -O0 and -O2 builds.
-        static volatile int initial_draw_checked;
-        if (!initial_draw_checked &&
-            __sync_bool_compare_and_swap(&initial_draw_checked, 0, 1)) {
+        if (macoblox_graphics_first_draw()) {
             unsigned int (*error)(void) = MACOBLOX_NEXT(unsigned int (*)(void), "glGetError");
             if (error) error();
         }
@@ -1430,7 +1476,7 @@ int my_NSApplicationMain(int argc, const char *argv[]) {
 
     void* (*open_display)(const char*) = (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
     int (*close_display)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XCloseDisplay");
-    if (open_display) {
+    if (open_display && !macoblox_wayland_enabled()) {
         void* test_dpy = open_display(0);
         if (!test_dpy) {
             write_str("[MacOBlox] FATAL: Cannot connect to X11 display! XOpenDisplay returned NULL.\n");
@@ -1996,6 +2042,8 @@ static unsigned long macoblox_native_window_handle(id window) {
 }
 
 static void macoblox_set_window_icon(id window) {
+    if (macoblox_wayland_enabled())
+        return;
     if (!getenv("MACOBLOX_ICON_ARGB") || macoblox_icon_window)
         return;
     macoblox_icon_window = macoblox_native_window_handle(window);
@@ -2315,6 +2363,23 @@ static id web_preferences_standard_preferences(id cls, SEL cmd) {
     }
     __sync_lock_release(&macoblox_web_preferences_lock);
     return macoblox_standard_web_preferences;
+}
+
+/* The generic WebKit forwarding stub advertises a zero-argument signature
+ * for this BOOL setter, which raises NSForwardSignatureError in Roblox. */
+static char web_plugins_enabled_key;
+static void web_preferences_set_plugins_enabled(id self, SEL cmd, MacOBloxBool enabled) {
+    (void)cmd;
+    extern void objc_setAssociatedObject(id, const void*, id, unsigned long);
+    id value = ((id (*)(id, SEL, MacOBloxBool))objc_msgSend)(
+        (id)objc_getClass("NSNumber"), sel_registerName("numberWithBool:"), enabled);
+    objc_setAssociatedObject(self, &web_plugins_enabled_key, value, 1);
+}
+static MacOBloxBool web_preferences_plugins_enabled(id self, SEL cmd) {
+    (void)cmd;
+    extern id objc_getAssociatedObject(id, const void*);
+    id value = objc_getAssociatedObject(self, &web_plugins_enabled_key);
+    return value ? ((MacOBloxBool (*)(id, SEL))objc_msgSend)(value, sel_registerName("boolValue")) : 0;
 }
 
 // Darling's AVFoundation class shell does not implement device discovery.
@@ -2682,11 +2747,51 @@ static volatile long macoblox_layer_context_restores;
 static void hooked_layer_context_render_layer(id self, SEL cmd, id layer) {
     void* previous = CGLGetCurrentContext();
     orig_layer_context_render_layer(self, cmd, layer);
-    if (previous && CGLGetCurrentContext() != previous) {
-        CGLSetCurrentContext(previous);
-        if (__sync_add_and_fetch(&macoblox_layer_context_restores, 1) == 1)
+    if (CGLGetCurrentContext() != previous) {
+        int error = macoblox_CGLSetCurrentContext(previous);
+        if (!error && __sync_add_and_fetch(&macoblox_layer_context_restores, 1) == 1)
             write_str("[MacOBlox GL] Restored app GL context after CALayerContext render\n");
     }
+}
+
+/* CARenderer calls its image uploader directly, so dyld interposition cannot
+ * replace that call. Populate a new texture before entering its recursive
+ * renderer; the original then preserves its animation and child transforms. */
+extern void macoblox_CATexImage2DCGImage(void*);
+extern void glGenTextures(int, unsigned int*);
+extern unsigned char glIsTexture(unsigned int);
+extern void glBindTexture(unsigned int, unsigned int);
+extern void glTexParameteri(unsigned int, unsigned int, int);
+static void (*orig_ca_renderer_render_layer)(id, SEL, id, double, double);
+static void hooked_ca_renderer_render_layer(id self, SEL cmd, id layer,
+                                           double z, double current_time) {
+    id number = ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("_textureId"));
+    unsigned int texture = number ? ((unsigned int (*)(id, SEL))objc_msgSend)(
+        number, sel_registerName("unsignedIntValue")) : 0;
+    if (!texture || !glIsTexture(texture)) {
+        if (!texture) {
+            glGenTextures(1, &texture);
+            if (!texture)
+                return;
+            id value = ((id (*)(id, SEL, unsigned int))objc_msgSend)(
+                (id)objc_getClass("NSNumber"), sel_registerName("numberWithUnsignedInt:"), texture);
+            ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("_setTextureId:"), value);
+        }
+        glBindTexture(0x0DE1 /* GL_TEXTURE_2D */, texture);
+        id contents = ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("contents"));
+        macoblox_CATexImage2DCGImage(contents);
+        const char* filter_names[] = {"minificationFilter", "magnificationFilter"};
+        const unsigned int parameters[] = {0x2801, 0x2800};
+        for (int i = 0; i < 2; ++i) {
+            id filter = ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName(filter_names[i]));
+            unsigned char nearest = ((unsigned char (*)(id, SEL, id))objc_msgSend)(
+                filter, sel_registerName("isEqualToString:"), @"nearest");
+            glTexParameteri(0x0DE1, parameters[i], nearest ? 0x2600 : 0x2601);
+        }
+        glTexParameteri(0x0DE1, 0x2802 /* GL_TEXTURE_WRAP_S */, 0x2901 /* GL_REPEAT */);
+        glTexParameteri(0x0DE1, 0x2803 /* GL_TEXTURE_WRAP_T */, 0x2901);
+    }
+    orig_ca_renderer_render_layer(self, cmd, layer, z, current_time);
 }
 
 // Mouse lock (in-game camera). On macOS CGAssociateMouseAndMouseCursorPosition
@@ -2709,6 +2814,7 @@ extern int CGAssociateMouseAndMouseCursorPosition(unsigned int connected);
 extern int CGWarpMouseCursorPosition(MacOBloxPoint position);
 #define MACOBLOX_LOCK_RADIUS 100.0
 static volatile int macoblox_pointer_grabbed;
+static volatile int macoblox_mouse_lock_requested;
 static volatile int macoblox_drop_next_motion; // first motion after re-entering mid-lock
 static volatile int macoblox_drop_warp_motion;
 static int macoblox_warp_wait_events; // motion events seen since the warp
@@ -2818,6 +2924,7 @@ static MacOBloxPoint macoblox_real_event_location(id event) {
 // when the app finishes launching, not at the first lock.
 extern int macoblox_raw_xfixes_open(void);
 extern int macoblox_raw_xfixes_set_hidden(int hidden);
+extern int macoblox_wayland_enabled(void);
 extern int pthread_create(void**, const void*, void* (*)(void*), void*);
 extern int pthread_detach(void*);
 extern int pipe(int[2]);
@@ -2827,15 +2934,28 @@ static volatile int macoblox_cursor_wanted_hidden;
 static volatile unsigned long macoblox_cursor_lock_window;
 static volatile int macoblox_cursor_hide_depth;
 static volatile int macoblox_cursor_worker_ready;
+static volatile int macoblox_cursor_worker_started;
+static volatile unsigned long long macoblox_cursor_retry_after;
 static volatile int macoblox_input_focused = 1;
 static int macoblox_cursor_wake[2] = {-1, -1};
 static volatile unsigned long macoblox_window_cursor;
 static volatile unsigned long macoblox_window_cursor_handle;
 static volatile int macoblox_window_cursor_dirty;
+static unsigned long long macoblox_input_now_ns(void) {
+    struct { long seconds, nanoseconds; } now = {0, 0};
+    long result;
+    __asm__ volatile("syscall" : "=a"(result)
+        : "a"(228L /* Linux clock_gettime */), "D"(1L /* CLOCK_MONOTONIC */), "S"(&now)
+        : "rcx", "r11", "memory");
+    return result == 0 ? (unsigned long long)now.seconds * 1000000000ULL + now.nanoseconds : 0;
+}
 static void* macoblox_xfixes_worker(void* unused) {
     (void)unused;
     if (!macoblox_raw_xfixes_open()) {
         write_str("[MacOBlox] XFixes unavailable, mouse lock may bounce\n");
+        __atomic_store_n(&macoblox_cursor_retry_after, macoblox_input_now_ns() + 1000000000ULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&macoblox_cursor_worker_ready, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&macoblox_cursor_worker_started, 0, __ATOMIC_RELEASE);
         return 0;
     }
     write_str("[MacOBlox] XFixes ready for cursor hiding\n");
@@ -2853,6 +2973,7 @@ static void* macoblox_xfixes_worker(void* unused) {
     void* xlib_display = open_display ? open_display(0) : 0;
     if (xlib_display && define_cursor)
         write_str("[MacOBlox] Window cursor worker ready\n");
+    __atomic_store_n(&macoblox_cursor_worker_ready, 1, __ATOMIC_RELEASE);
     int applied = 0;
     for (;;) {
         int wanted = __atomic_load_n(&macoblox_cursor_wanted_hidden, __ATOMIC_ACQUIRE);
@@ -2902,17 +3023,20 @@ static void* macoblox_xfixes_worker(void* unused) {
 }
 
 static void macoblox_start_xfixes_worker(void) {
-    static volatile int started;
-    if (!__sync_bool_compare_and_swap(&started, 0, 1))
+    if (macoblox_wayland_enabled())
         return;
-    macoblox_wake_pipe(macoblox_cursor_wake);
+    if (macoblox_input_now_ns() < __atomic_load_n(&macoblox_cursor_retry_after, __ATOMIC_ACQUIRE) ||
+        !__sync_bool_compare_and_swap(&macoblox_cursor_worker_started, 0, 1))
+        return;
+    if (macoblox_cursor_wake[0] < 0)
+        macoblox_wake_pipe(macoblox_cursor_wake);
     void* thread;
     if (pthread_create(&thread, 0, macoblox_xfixes_worker, 0) == 0) {
         pthread_detach(thread);
-        __atomic_store_n(&macoblox_cursor_worker_ready, 1, __ATOMIC_RELEASE);
-        /* Cover state changes between the worker's first snapshot and
-         * publication of readiness. A full pipe already has a wakeup. */
         macoblox_wake_worker(macoblox_cursor_wake[1]);
+    } else {
+        __atomic_store_n(&macoblox_cursor_retry_after, macoblox_input_now_ns() + 1000000000ULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&macoblox_cursor_worker_started, 0, __ATOMIC_RELEASE);
     }
 }
 
@@ -2954,9 +3078,9 @@ static void hooked_cursor_unhide(id self, SEL cmd) {
 // come from the mouse itself: no pointer acceleration, no merged motion, and
 // the warps that keep the hidden pointer inside the window need no
 // recognising, since warps produce no raw events. While it is active the
-// game gets no pointer motion at all during the lock: every raw motion is
-// posted as a mouse event of its own with the deltas (merged with the last
-// queued one of the same kind, so a 1000 Hz mouse does not pile up events),
+// game gets no pointer motion at all during the lock: raw deltas are summed
+// within each bounded X event batch, then posted as one mouse event. Button,
+// keyboard and focus transitions flush the sum to preserve their ordering.
 // and the real MotionNotify events only serve to keep the pointer near its
 // anchor. The selection changes on the event loop's own thread and X
 // connection (the game thread only asks). MACOBLOX_RAW_MOUSE=0 keeps the
@@ -2982,6 +3106,20 @@ static int macoblox_raw_start_x, macoblox_raw_start_y;   // where the pointer wa
 static int macoblox_raw_last_x, macoblox_raw_last_y;     // the last position seen
 static long macoblox_raw_events, macoblox_raw_posted;
 static int macoblox_raw_motions_without_raw; // pointer motion seen while no raw event came
+static unsigned long macoblox_x_modifier_flags;
+static unsigned char macoblox_x_modifier_masks[256], macoblox_x_modifier_keys_down[256];
+static void* macoblox_x_modifier_display;
+static volatile unsigned int macoblox_x_event_draining;
+static id macoblox_raw_pending_window;
+static double macoblox_raw_pending_dx, macoblox_raw_pending_dy;
+static unsigned long macoblox_raw_pending_type, macoblox_raw_pending_flags;
+static unsigned int macoblox_raw_pending_button;
+static MacOBloxPoint macoblox_raw_pending_location;
+/* Darling classifies Button2 (middle) as right-drag. Correct the generated
+ * event at postEvent:, on the same thread, without changing its X state. */
+static __thread unsigned long macoblox_core_motion_type;
+static __thread unsigned int macoblox_core_motion_button;
+static __thread int macoblox_x_batch_last;
 
 static int macoblox_raw_mouse_enabled(void) {
     static int enabled = -1;
@@ -3019,43 +3157,145 @@ static void macoblox_warp_on_display(void* display, int dx, int dy) {
 // One mouse event with the raw deltas, on the lock window. Darling's deltaY
 // is computed upward and hooked_mouse_event_delta_y flips it for the game,
 // so the raw y (downward, as macOS reports it) is stored flipped.
-static void macoblox_post_raw_motion(id display, double dx, double dy) {
-    id window = macoblox_lock_window();
-    if (!window)
+static unsigned long macoblox_motion_type(unsigned int buttons, unsigned int* button) {
+    if (buttons & (1u << 1)) { *button = 1; return 6; }
+    if (buttons & (1u << 3)) { *button = 3; return 7; }
+    if (buttons & (1u << 2)) { *button = 2; return 27; }
+    *button = 0;
+    return 5;
+}
+
+static void macoblox_flush_raw_motion(id display) {
+    id window = macoblox_raw_pending_window;
+    if (!window) return;
+    double dx = macoblox_raw_pending_dx, dy = macoblox_raw_pending_dy;
+    macoblox_raw_pending_window = 0;
+    macoblox_raw_pending_dx = macoblox_raw_pending_dy = 0;
+    if (!macoblox_pointer_grabbed || (!dx && !dy)) {
+        ((void (*)(id, SEL))objc_msgSend)(window, sel_registerName("release"));
         return;
-    unsigned long type = (macoblox_raw_buttons & (1u << 1)) ? 6 : (macoblox_raw_buttons & (1u << 3)) ? 7 : 5;
-    id event_class = (id)objc_getClass("NSEvent");
-    unsigned long flags = ((unsigned long (*)(id, SEL))objc_msgSend)(event_class, sel_registerName("modifierFlags"));
-    double event_dx = dx, event_dy = -dy;
-    SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
-    id queue = macoblox_event_queue(display);
-    if (queue) {
-        // Merge with the last queued event of the same kind: every count of
-        // the mouse is kept, the game handles one event per frame or so.
-        macoblox_lock_event_queue();
-        unsigned long total = ((unsigned long (*)(id, SEL))objc_msgSend)(queue, sel_registerName("count"));
-        if (total) {
-            id last = ((id (*)(id, SEL, unsigned long))objc_msgSend)(queue, sel_registerName("objectAtIndex:"), total - 1);
-            if (macoblox_event_type(last) == type &&
-                ((id (*)(id, SEL))objc_msgSend)(last, sel_registerName("window")) == window &&
-                ((unsigned long (*)(id, SEL))objc_msgSend)(last, sel_registerName("modifierFlags")) == flags) {
-                event_dx += orig_mouse_event_delta_x ? orig_mouse_event_delta_x(last, delta_x)
-                    : ((double (*)(id, SEL))objc_msgSend)(last, delta_x);
-                event_dy += orig_mouse_event_delta_y ? orig_mouse_event_delta_y(last, delta_y)
-                    : ((double (*)(id, SEL))objc_msgSend)(last, delta_y);
-                ((void (*)(id, SEL, unsigned long))objc_msgSend)(queue, sel_registerName("removeObjectAtIndex:"), total - 1);
-                macoblox_raw_posted--;
-            }
-        }
-        macoblox_unlock_event_queue();
     }
+    id event_class = (id)objc_getClass("NSEvent");
     id event = ((id (*)(id, SEL, unsigned long, MacOBloxPoint, unsigned long, id, long, double, double))objc_msgSend)(
         event_class, sel_registerName("mouseEventWithType:location:modifierFlags:window:clickCount:deltaX:deltaY:"),
-        type, macoblox_frozen_window_location, flags, window, 1, event_dx, event_dy);
-    if (!event)
-        return;
-    ((void (*)(id, SEL, id, signed char))objc_msgSend)(display, sel_registerName("postEvent:atStart:"), event, 0);
-    macoblox_raw_posted++;
+        macoblox_raw_pending_type, macoblox_raw_pending_location, macoblox_raw_pending_flags,
+        window, 1, dx, -dy);
+    if (event) {
+        ((void (*)(id, SEL, long))objc_msgSend)(event, sel_registerName("_setButtonNumber:"),
+                                               (long)macoblox_raw_pending_button);
+        ((void (*)(id, SEL, id, signed char))objc_msgSend)(display, sel_registerName("postEvent:atStart:"), event, 0);
+        macoblox_raw_posted++;
+    }
+    ((void (*)(id, SEL))objc_msgSend)(window, sel_registerName("release"));
+}
+
+static void macoblox_accumulate_raw_motion(id display, double dx, double dy) {
+    id window = macoblox_lock_window();
+    if (!window) return;
+    unsigned int button;
+    unsigned long type = macoblox_motion_type(macoblox_raw_buttons, &button);
+    if (macoblox_raw_pending_window &&
+        (macoblox_raw_pending_window != window || macoblox_raw_pending_type != type ||
+         macoblox_raw_pending_flags != macoblox_x_modifier_flags || macoblox_raw_pending_button != button))
+        macoblox_flush_raw_motion(display);
+    if (!macoblox_raw_pending_window) {
+        macoblox_raw_pending_window = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("retain"));
+        macoblox_raw_pending_type = type;
+        macoblox_raw_pending_button = button;
+        macoblox_raw_pending_flags = macoblox_x_modifier_flags;
+        macoblox_raw_pending_location = macoblox_frozen_window_location;
+    }
+    macoblox_raw_pending_dx += dx;
+    macoblox_raw_pending_dy += dy;
+    /* Direct postXEvent: callers also get their event without needing a drain. */
+    if (!__atomic_load_n(&macoblox_x_event_draining, __ATOMIC_ACQUIRE))
+        macoblox_flush_raw_motion(display);
+}
+
+static unsigned long macoblox_modifiers_for_x_state(unsigned int state) {
+    unsigned long flags = 0;
+    if (state & 1u) flags |= 1UL << 17;       // Shift
+    if (state & 2u) flags |= 1UL << 16;       // Caps Lock
+    if (state & 4u) flags |= 1UL << 18;       // Control
+    if (state & 8u) flags |= 1UL << 19;       // Alt
+    if (state & 64u) flags |= 1UL << 20;      // Super/Command
+    if (state & 128u) flags |= 1UL << 23;     // AltGr/Function
+    return flags;
+}
+
+static unsigned int macoblox_buttons_for_x_state(unsigned int state) {
+    return ((state & (1u << 8)) ? 1u << 1 : 0) |
+           ((state & (1u << 9)) ? 1u << 2 : 0) |
+           ((state & (1u << 10)) ? 1u << 3 : 0);
+}
+
+static void macoblox_refresh_x_modifier_mapping(id self, int seed_keys) {
+    struct modifier_map { int keys_per_modifier; unsigned char* keycodes; };
+    static struct modifier_map* (*get_mapping)(void*);
+    static int (*free_mapping)(struct modifier_map*);
+    static int (*query_keys)(void*, char*);
+    if (!get_mapping) {
+        get_mapping = (struct modifier_map* (*)(void*))dlsym(RTLD_DEFAULT, "XGetModifierMapping");
+        free_mapping = (int (*)(struct modifier_map*))dlsym(RTLD_DEFAULT, "XFreeModifiermap");
+        query_keys = (int (*)(void*, char*))dlsym(RTLD_DEFAULT, "XQueryKeymap");
+    }
+    void* display = macoblox_x11_display_connection(self);
+    if (!display || !get_mapping || !free_mapping) return;
+    struct modifier_map* map = get_mapping(display);
+    if (map && map->keycodes && map->keys_per_modifier >= 0 && map->keys_per_modifier <= 256) {
+        for (int key = 0; key < 256; key++) macoblox_x_modifier_masks[key] = 0;
+        for (int modifier = 0; modifier < 8; modifier++)
+            for (int index = 0; index < map->keys_per_modifier; index++) {
+                unsigned int key = map->keycodes[modifier * map->keys_per_modifier + index];
+                if (key) macoblox_x_modifier_masks[key] |= 1u << modifier;
+            }
+        macoblox_x_modifier_display = display;
+    }
+    if (map) free_mapping(map);
+    if (seed_keys && query_keys) {
+        char down[32] = {0};
+        if (query_keys(display, down))
+            for (int key = 0; key < 256; key++)
+                macoblox_x_modifier_keys_down[key] = ((unsigned char)down[key / 8] >> (key % 8)) & 1;
+    }
+}
+
+static void macoblox_update_x_input_state(id display, void* event) {
+    int type = *(int*)event;
+    if (type < 2 || type > 6) return;
+    unsigned int state = *(unsigned int*)((char*)event + 80);
+    if (type == 2 || type == 3) {
+        if (macoblox_x_modifier_display != macoblox_x11_display_connection(display))
+            macoblox_refresh_x_modifier_mapping(display, 1);
+        state = macoblox_x_modifier_transition(state,
+            *(unsigned int*)((char*)event + 84), type == 2,
+            macoblox_x_modifier_masks, macoblox_x_modifier_keys_down);
+    }
+    unsigned long flags = macoblox_modifiers_for_x_state(state);
+    unsigned int buttons = macoblox_buttons_for_x_state(state);
+    if (type == 4 || type == 5) {
+        unsigned int button = *(unsigned int*)((char*)event + 84);
+        if (button >= 1 && button <= 3) {
+            if (type == 4) buttons |= 1u << button;
+            else buttons &= ~(1u << button);
+        }
+    }
+    if (flags != macoblox_x_modifier_flags || buttons != macoblox_raw_buttons)
+        macoblox_flush_raw_motion(display);
+    macoblox_x_modifier_flags = flags;
+    macoblox_raw_buttons = buttons;
+}
+
+static void macoblox_update_pointer_baseline(id display, void* event) {
+    id platform = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
+        display, sel_registerName("windowForID:"), *(unsigned long*)((char*)event + 32));
+    if (platform) {
+        MacOBloxPoint point = {*(int*)((char*)event + 64), *(int*)((char*)event + 68)};
+        point = ((MacOBloxPoint (*)(id, SEL, MacOBloxPoint))objc_msgSend)(
+            platform, sel_registerName("transformPoint:"), point);
+        ((void (*)(id, SEL, MacOBloxPoint))objc_msgSend)(
+            platform, sel_registerName("setLastKnownCursorPosition:"), point);
+    }
 }
 
 // X events of the event loop, before Darling sees them. Returns 1 when the
@@ -3081,6 +3321,8 @@ static int macoblox_raw_mouse_x_event(id self, void* event) {
         int selected = macoblox_raw_mouse_select(display, wanted);
         macoblox_raw_mouse_selected = wanted;
         macoblox_raw_mouse_active = wanted && selected;
+        if (macoblox_raw_mouse_active)
+            macoblox_drop_next_motion = 0;
         macoblox_raw_have_anchor = 0;
         macoblox_raw_events = macoblox_raw_posted = 0;
         macoblox_raw_motions_without_raw = 0;
@@ -3097,7 +3339,7 @@ static int macoblox_raw_mouse_x_event(id self, void* event) {
         if (macoblox_raw_mouse_active && macoblox_pointer_grabbed && (dx != 0 || dy != 0)) {
             macoblox_raw_events++;
             macoblox_raw_motions_without_raw = 0;
-            macoblox_post_raw_motion(self, dx, dy);
+            macoblox_accumulate_raw_motion(self, dx, dy);
             static volatile int trace = -1;
             if (macoblox_env_cached("MACOBLOX_TRACE_LOCK", &trace) && macoblox_raw_events <= 200) {
                 write_str("[MacOBlox Lock] raw dx=");
@@ -3109,23 +3351,16 @@ static int macoblox_raw_mouse_x_event(id self, void* event) {
         }
         return 1;
     }
-    if (type == 4 || type == 5) { /* XButtonEvent: button at 84 */
-        unsigned int button = *(unsigned int*)((char*)event + 84);
-        if (button >= 1 && button <= 3) {
-            if (type == 4) macoblox_raw_buttons |= 1u << button;
-            else macoblox_raw_buttons &= ~(1u << button);
-        }
-        return 0;
-    }
     if (type == 6 && macoblox_raw_mouse_active && macoblox_pointer_grabbed) {
         /* XMotionEvent: x/y at 64/68. The pointer stays near its anchor;
          * the game gets no pointer motion during the lock. */
         int x = *(int*)((char*)event + 64), y = *(int*)((char*)event + 68);
-        // The pointer moves but no raw event ever came (a server that
-        // selected fine but does not deliver them): back to pointer deltas
+        // The pointer moves but raw events stopped: back to pointer deltas
         // for this lock, so the camera keeps working.
-        if (!macoblox_raw_events && ++macoblox_raw_motions_without_raw > 25) {
+        if (++macoblox_raw_motions_without_raw > 25) {
+            macoblox_flush_raw_motion(self);
             macoblox_raw_mouse_active = 0;
+            macoblox_raw_mouse_select(display, 0);
             write_str("[MacOBlox Input] no raw motion arrived, mouse lock uses pointer deltas\n");
             return 0;
         }
@@ -3166,15 +3401,20 @@ static int macoblox_raw_mouse_x_event(id self, void* event) {
             macoblox_raw_last_x = macoblox_raw_anchor_x;
             macoblox_raw_last_y = macoblox_raw_anchor_y;
         }
+        /* Keep Darling's previous position current even when its NSEvent is
+         * suppressed, so releasing lock or falling back cannot jump. */
+        macoblox_update_pointer_baseline(self, event);
         return 1;
     }
     return 0;
 }
 
-static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connected) {
-    int grab = !connected && __atomic_load_n(&macoblox_input_focused, __ATOMIC_ACQUIRE);
-    if (grab == macoblox_pointer_grabbed)
+static int macoblox_apply_mouse_capture(int grab) {
+    if (grab == macoblox_pointer_grabbed) {
+        if (grab && !__atomic_load_n(&macoblox_cursor_worker_ready, __ATOMIC_ACQUIRE))
+            macoblox_start_xfixes_worker();
         return 0;
+    }
     if (__sync_add_and_fetch(&macoblox_associate_mouse_count, 1) <= 20)
         write_str(grab ? "[MacOBlox Input] mouse lock on\n"
                        : "[MacOBlox Input] mouse lock off\n");
@@ -3243,10 +3483,22 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
     }
     return 0;
 }
+static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connected) {
+    if (macoblox_wayland_enabled())
+        return macoblox_wayland_associate(connected);
+    /* Capture intent survives focus loss. An explicit unlock while suspended
+     * still cancels it, even though capture is already inactive. */
+    __atomic_store_n(&macoblox_mouse_lock_requested, !connected, __ATOMIC_RELEASE);
+    return macoblox_apply_mouse_capture(!connected &&
+        __atomic_load_n(&macoblox_input_focused, __ATOMIC_ACQUIRE));
+}
 DYLD_INTERPOSE(macoblox_CGAssociateMouseAndMouseCursorPosition,
                CGAssociateMouseAndMouseCursorPosition);
 
 static int macoblox_CGWarpMouseCursorPosition(MacOBloxPoint position) {
+    extern int macoblox_wayland_warp(MacOBloxPoint);
+    if (macoblox_wayland_enabled())
+        return macoblox_wayland_warp(position);
     if (macoblox_pointer_grabbed)
         return 0; // Roblox warps every frame during the lock
     return CGWarpMouseCursorPosition(position);
@@ -3389,7 +3641,7 @@ static int macoblox_is_scroll_type(id event) {
 static double (*orig_mouse_event_delta_x)(id, SEL) = 0;
 static double hooked_mouse_event_delta_x(id self, SEL cmd) {
     double delta = orig_mouse_event_delta_x(self, cmd);
-    if (macoblox_pointer_grabbed && macoblox_is_motion_type(self))
+    if ((macoblox_pointer_grabbed || macoblox_wayland_captured()) && macoblox_is_motion_type(self))
         return delta * macoblox_mouse_sensitivity();
     if (macoblox_is_scroll_type(self))
         return delta * macoblox_scroll_sensitivity();
@@ -3403,7 +3655,7 @@ static double hooked_mouse_event_delta_y(id self, SEL cmd) {
     if (!macoblox_is_motion_type(self))
         return delta;
     delta = -delta;
-    return macoblox_pointer_grabbed ? delta * macoblox_mouse_sensitivity() : delta;
+    return (macoblox_pointer_grabbed || macoblox_wayland_captured()) ? delta * macoblox_mouse_sensitivity() : delta;
 }
 
 // Scroll wheel APIs missing from Darling's NSEvent. X11 wheels report coarse
@@ -3422,12 +3674,12 @@ static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
 static double event_scrolling_delta_x(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaX"));
-    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
+    return d * MACOBLOX_SCROLL_LINE_PIXELS;
 }
 static double event_scrolling_delta_y(id self, SEL cmd) {
     (void)cmd;
     double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaY"));
-    return d * MACOBLOX_SCROLL_LINE_PIXELS * macoblox_scroll_sensitivity();
+    return d * MACOBLOX_SCROLL_LINE_PIXELS;
 }
 
 // Darling's -[X11Cursor initWithImage:hotPoint:] copies each pixel row with a
@@ -3510,7 +3762,8 @@ static unsigned int* macoblox_cursor_pixels_from_image(
         (bits_per_pixel != 32 && bits_per_pixel != 24) ||
         (byte_order != 0 && byte_order != 0x2000U && byte_order != 0x4000U))
         return 0;
-    void* data = CGDataProviderCopyData(CGImageGetDataProvider(cg_image));
+    void* provider = CGImageGetDataProvider(cg_image);
+    void* data = provider ? CGDataProviderCopyData(provider) : 0;
     if (!data)
         return 0;
     const unsigned char* bytes = CFDataGetBytePtr(data);
@@ -4267,6 +4520,49 @@ static id hooked_pixel_format_init(id self, SEL cmd, const unsigned int* attribu
 // event's. The queue (an NSMutableArray) is also shared with the rendering
 // thread (shared_current_display), so all three take a lock.
 static volatile unsigned int macoblox_event_queue_lock;
+extern const void *CFRunLoopGetMain(void);
+extern const void *kCFRunLoopCommonModes;
+extern const void *CFRunLoopSourceCreate(const void *, long, void *);
+extern void CFRunLoopAddSource(const void *, const void *, const void *);
+extern void CFRunLoopSourceSignal(const void *);
+extern void CFRunLoopWakeUp(const void *);
+extern int pthread_main_np(void);
+static const void *macoblox_event_queue_source;
+static volatile unsigned int macoblox_event_queue_wake_pending;
+static void macoblox_event_queue_source_perform(void *info) {
+    (void)info;
+    __atomic_store_n(&macoblox_event_queue_wake_pending, 0, __ATOMIC_RELEASE);
+}
+static void macoblox_install_event_queue_source(void) {
+    struct {
+        long version; void *info;
+        const void *(*retain)(const void *); void (*release)(const void *);
+        const void *(*description)(const void *);
+        unsigned char (*equal)(const void *, const void *); unsigned long (*hash)(const void *);
+        void (*schedule)(void *, const void *, const void *);
+        void (*cancel)(void *, const void *, const void *); void (*perform)(void *);
+    } context = {.perform = macoblox_event_queue_source_perform};
+    const void *source = CFRunLoopSourceCreate(0, 0, &context);
+    if (!source) {
+        write_str("[MacOBlox] Could not create event queue wake source\n");
+        return;
+    }
+    /* Retained for the installed hooks' lifetime. AppKit adds its modal and
+     * tracking modes to the main loop's common modes during initialization. */
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    __atomic_store_n(&macoblox_event_queue_source, source, __ATOMIC_RELEASE);
+}
+static void macoblox_wake_event_queue(void) {
+    const void *source = __atomic_load_n(&macoblox_event_queue_source, __ATOMIC_ACQUIRE);
+    if (!source || __atomic_exchange_n(&macoblox_event_queue_wake_pending, 1, __ATOMIC_ACQ_REL))
+        return;
+    /* NSRunLoop returns after a handled source. A wake by itself can resume
+     * waiting with an NSEvent still queued, including when a timer posts it.
+     * Collapse repeated posts into one signal; main-thread input needs no IPC. */
+    CFRunLoopSourceSignal(source);
+    if (!pthread_main_np())
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+}
 static void macoblox_lock_event_queue(void) {
     macoblox_lock(&macoblox_event_queue_lock);
 }
@@ -4350,6 +4646,15 @@ static void hooked_display_post_event(id self, SEL cmd, id event, signed char at
     id queue = macoblox_event_queue(self);
     if (!queue || !event)
         return;
+    if (macoblox_core_motion_type && macoblox_is_motion_type(event)) {
+        static Ivar type_ivar;
+        if (!type_ivar)
+            type_ivar = class_getInstanceVariable(objc_getClass("NSEvent"), "_type");
+        if (type_ivar)
+            *(unsigned long*)((char*)event + ivar_getOffset(type_ivar)) = macoblox_core_motion_type;
+        ((void (*)(id, SEL, long))objc_msgSend)(event, sel_registerName("_setButtonNumber:"),
+                                              (long)macoblox_core_motion_button);
+    }
     macoblox_lock_event_queue();
     if (at_start) {
         ((void (*)(id, SEL, id, unsigned long))objc_msgSend)(queue, sel_registerName("insertObject:atIndex:"),
@@ -4364,7 +4669,13 @@ static void hooked_display_post_event(id self, SEL cmd, id event, signed char at
             if (total > 0) {
                 id last = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
                     queue, sel_registerName("objectAtIndex:"), total - 1);
-                if (macoblox_event_type(last) == type) {
+                if (macoblox_event_type(last) == type &&
+                    ((long (*)(id, SEL))objc_msgSend)(last, sel_registerName("windowNumber")) ==
+                        ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("windowNumber")) &&
+                    ((unsigned long (*)(id, SEL))objc_msgSend)(last, sel_registerName("modifierFlags")) ==
+                        ((unsigned long (*)(id, SEL))objc_msgSend)(event, sel_registerName("modifierFlags")) &&
+                    ((long (*)(id, SEL))objc_msgSend)(last, sel_registerName("buttonNumber")) ==
+                        ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("buttonNumber"))) {
                     static Ivar dx_ivar, dy_ivar;
                     if (!dx_ivar) {
                         Class mouse_cls = objc_getClass("NSEvent_mouse");
@@ -4376,9 +4687,14 @@ static void hooked_display_post_event(id self, SEL cmd, id event, signed char at
                     if (dx_ivar && dy_ivar) {
                         long off_x = (long)ivar_getOffset(dx_ivar);
                         long off_y = (long)ivar_getOffset(dy_ivar);
-                        *(double*)((char*)last + off_x) += *(double*)((char*)event + off_x);
-                        *(double*)((char*)last + off_y) += *(double*)((char*)event + off_y);
+                        /* A dequeued=NO caller may still hold the old event:
+                         * replace it rather than changing its deltas in place. */
+                        *(double*)((char*)event + off_x) += *(double*)((char*)last + off_x);
+                        *(double*)((char*)event + off_y) += *(double*)((char*)last + off_y);
+                        ((void (*)(id, SEL, unsigned long, id))objc_msgSend)(
+                            queue, sel_registerName("replaceObjectAtIndex:withObject:"), total - 1, event);
                         macoblox_unlock_event_queue();
+                        macoblox_wake_event_queue();
                         return;
                     }
                 }
@@ -4387,6 +4703,7 @@ static void hooked_display_post_event(id self, SEL cmd, id event, signed char at
         ((void (*)(id, SEL, id))objc_msgSend)(queue, sel_registerName("addObject:"), event);
     }
     macoblox_unlock_event_queue();
+    macoblox_wake_event_queue();
 }
 
 static void hooked_display_discard_events(id self, SEL cmd, unsigned long long mask, id before) {
@@ -4430,8 +4747,40 @@ static int macoblox_trace_keys_enabled(void) {
     static volatile int enabled = -1;
     return macoblox_env_cached("MACOBLOX_TRACE_KEYS", &enabled);
 }
+static int macoblox_game_focus_event(id self, void* event) {
+    unsigned long xid = *(unsigned long*)((char*)event + 24);
+    unsigned long capture = __atomic_load_n(&macoblox_cursor_lock_window, __ATOMIC_ACQUIRE);
+    id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"),
+                                             sel_registerName("sharedApplication"));
+    id main = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("mainWindow"));
+    unsigned long main_handle = macoblox_native_window_handle(main);
+    if (capture || main_handle)
+        return xid == capture || xid == main_handle;
+    (void)self;
+    return 1; // first activation, before a main window has been established
+}
+static void macoblox_refresh_pointer_state(id self) {
+    static int (*query)(void*, unsigned long, unsigned long*, unsigned long*, int*, int*, int*, int*, unsigned int*);
+    if (!query)
+        query = (int (*)(void*, unsigned long, unsigned long*, unsigned long*, int*, int*, int*, int*, unsigned int*))
+            dlsym(RTLD_DEFAULT, "XQueryPointer");
+    void* display = macoblox_x11_display_connection(self);
+    unsigned long window = macoblox_native_window_handle(macoblox_lock_window());
+    unsigned long root, child;
+    int rx, ry, x, y;
+    unsigned int state;
+    if (query && display && window && query(display, window, &root, &child, &rx, &ry, &x, &y, &state)) {
+        macoblox_x_modifier_flags = macoblox_modifiers_for_x_state(state);
+        macoblox_raw_buttons = macoblox_buttons_for_x_state(state);
+    }
+}
 static void hooked_post_x_event(id self, SEL cmd, void* event) {
     int type = *(int*)event;
+    if (type != 35 /* raw events */ && type != 6 /* their core motion companions */)
+        macoblox_flush_raw_motion(self);
+    macoblox_update_x_input_state(self, event);
+    if (type == 34 /* MappingNotify */)
+        macoblox_refresh_x_modifier_mapping(self, 1);
     {
         static volatile int trace_x = -1;
         static long traced_x;
@@ -4452,7 +4801,7 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
     }
     if (macoblox_raw_mouse_x_event(self, event))
         return;
-    if (type == 7 /* EnterNotify */ && macoblox_pointer_grabbed)
+    if (type == 7 /* EnterNotify */ && macoblox_pointer_grabbed && !macoblox_raw_mouse_active)
         /* The pointer drifted out of the window during a mouse lock and came
          * back. The first motion after it reports the whole distance from the
          * exit point, which would fling the game camera: drop that one. */
@@ -4463,28 +4812,38 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
         return;
     }
     if (type == 33 /* ClientMessage */) {
-        /* The window manager's WM_DELETE_WINDOW (the X button): the user is
-         * quitting. Roblox's own teardown can take a while (telemetry with
-         * 5 s timeouts), and Darling's Cocoa close path no longer reaches
-         * terminate:, so tell the launcher directly. XClientMessageEvent,
-         * LP64: window at 24, message_type atom at 32. */
-        static int (*atom_name)(void*, unsigned long, char**) = 0;
-        static int (*free_data)(void*) = 0;
-        if (!atom_name) {
-            atom_name = (int (*)(void*, unsigned long, char**))
-                dlsym(RTLD_DEFAULT, "XGetAtomName");
-            free_data = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
-        }
+        /* XClientMessageEvent LP64: window=32, message_type=40, format=48,
+         * data.l[0]=56. WM_DELETE_WINDOW is the payload of WM_PROTOCOLS.
+         * Only closing the game window should stop the entire client. */
+        static unsigned long (*intern_atom)(void*, const char*, int);
+        static void* atom_display;
+        static unsigned long wm_protocols, wm_delete;
+        if (!intern_atom)
+            intern_atom = (unsigned long (*)(void*, const char*, int))
+                dlsym(RTLD_DEFAULT, "XInternAtom");
         void* display = macoblox_x11_display_connection(self);
-        char* name = 0;
-        if (display && atom_name &&
-            atom_name(display, *(unsigned long*)((char*)event + 32), &name) && name) {
-            int is_delete = ascii_strings_equal(name, "WM_DELETE_WINDOW");
-            if (free_data)
-                free_data(name);
-            if (is_delete) {
+        if (display && intern_atom && display != atom_display) {
+            wm_protocols = intern_atom(display, "WM_PROTOCOLS", 1);
+            wm_delete = intern_atom(display, "WM_DELETE_WINDOW", 1);
+            atom_display = display;
+        }
+        if (display && wm_protocols && wm_delete &&
+            *(unsigned long*)((char*)event + 40) == wm_protocols &&
+            *(int*)((char*)event + 48) == 32 &&
+            *(unsigned long*)((char*)event + 56) == wm_delete) {
+            id app = ((id (*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+            id windows = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("windows"));
+            unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(windows, sel_registerName("count"));
+            for (unsigned long i = 0; i < count; i++) {
+                id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
+                const char* name = object_getClassName(window);
+                if (!name || !ascii_strings_equal(name, "RBXWindow") ||
+                    macoblox_native_window_handle(window) != *(unsigned long*)((char*)event + 32))
+                    continue;
                 write_str("[MacOBlox] Window close requested (WM_DELETE_WINDOW)\n");
                 macoblox_write_quit_sentinel();
+                break;
             }
         }
     }
@@ -4503,7 +4862,8 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
             compression = !macoblox_env_on("MACOBLOX_NO_MOTION_COMPRESSION") && queued && peek &&
                           display_offset >= 0;
         }
-        void* display = compression && !macoblox_drop_warp_motion ? *(void**)((char*)self + display_offset) : 0;
+        void* display = compression && !macoblox_drop_warp_motion && !macoblox_x_batch_last
+            ? *(void**)((char*)self + display_offset) : 0;
         if (display && queued(display, 0 /* QueuedAlready */) > 0) {
             unsigned char next[192];
             peek(display, next);
@@ -4519,17 +4879,28 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
     } else if (type == 10 /* FocusOut */) {
         /* XFocusChangeEvent: detail at 44. Focus moving into a child window
          * of ours (NotifyInferior) keeps the keyboard with us. */
-        if (*(int*)((char*)event + 44) != 2 /* NotifyInferior */) {
+        int mode = *(int*)((char*)event + 40);
+        if (mode == 1 /* NotifyGrab */ || mode == 2 /* NotifyUngrab */ ||
+            *(int*)((char*)event + 44) == 2 /* NotifyInferior */)
+            return;
+        if (macoblox_game_focus_event(self, event)) {
             for (int key = 0; key < 128; key++)
                 macoblox_key_down[key] = 0;
+            for (int key = 0; key < 256; key++)
+                macoblox_x_modifier_keys_down[key] = 0;
             __atomic_store_n(&macoblox_input_focused, 0, __ATOMIC_RELEASE);
             macoblox_pointer_grabbed = macoblox_raw_mouse_wanted = 0;
+            macoblox_raw_mouse_active = 0;
             macoblox_drop_warp_motion = macoblox_drop_next_motion = 0;
             macoblox_raw_buttons = 0;
+            macoblox_x_modifier_flags = 0;
             macoblox_set_x_cursor_hidden(0);
         }
     } else if (type == 9 /* FocusIn */) {
-        __atomic_store_n(&macoblox_input_focused, 1, __ATOMIC_RELEASE);
+        int mode = *(int*)((char*)event + 40);
+        if (mode == 1 /* NotifyGrab */ || mode == 2 /* NotifyUngrab */ ||
+            *(int*)((char*)event + 44) == 2 /* NotifyInferior */)
+            return;
     } else if ((type == 2 || type == 3) && macoblox_trace_keys_enabled()) {
         /* XKeyEvent: time at 56, keycode at 84 */
         write_str(type == 2 ? "[MacOBlox Keys] X press   keycode=" : "[MacOBlox Keys] X release keycode=");
@@ -4542,7 +4913,74 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
         print_num((long long)(mach_absolute_time() / 1000000ULL));
         write_str("\n");
     }
-    orig_post_x_event(self, cmd, event);
+    if (type == 6 /* MotionNotify */)
+        macoblox_core_motion_type = macoblox_motion_type(macoblox_raw_buttons, &macoblox_core_motion_button);
+    @try {
+        orig_post_x_event(self, cmd, event);
+    } @finally {
+        macoblox_core_motion_type = macoblox_core_motion_button = 0;
+    }
+    if (type == 9 /* FocusIn */ && macoblox_game_focus_event(self, event)) {
+        /* Darling must activate the Cocoa window before we resolve its lock
+         * anchor. State is queried once on activation, never per raw report. */
+        macoblox_refresh_pointer_state(self);
+        macoblox_refresh_x_modifier_mapping(self, 1);
+        __atomic_store_n(&macoblox_input_focused, 1, __ATOMIC_RELEASE);
+        macoblox_apply_mouse_capture(__atomic_load_n(&macoblox_mouse_lock_requested, __ATOMIC_ACQUIRE));
+    }
+}
+
+static void (*orig_process_pending_events)(id, SEL);
+static void hooked_process_pending_events(id self, SEL cmd) {
+    /* XPending inside an unbounded drain can keep importing reports forever.
+     * Take one snapshot and give the app a turn after 128 events or 2 ms. */
+    unsigned int expected = 0;
+    if (!__atomic_compare_exchange_n(&macoblox_x_event_draining, &expected, 1, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    id pool = 0;
+    @try {
+        static int (*pending)(void*);
+        static int (*next)(void*, void*);
+        if (!pending) {
+            pending = (int (*)(void*))dlsym(RTLD_DEFAULT, "XPending");
+            next = (int (*)(void*, void*))dlsym(RTLD_DEFAULT, "XNextEvent");
+        }
+        void* display = macoblox_x11_display_connection(self);
+        if (!pending || !next || !display) {
+            orig_process_pending_events(self, cmd);
+        } else {
+            pool = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSAutoreleasePool"),
+                                                   sel_registerName("new"));
+            int total = pending(display);
+            if (total > 128) total = 128;
+            unsigned long long deadline = macoblox_input_now_ns() + 2000000ULL;
+            for (int index = 0; index < total; index++) {
+                /* Deliver the final core motion even when more arrive. A
+                 * compressor waiting for an empty queue could otherwise
+                 * suppress every batch of a continuous stream. */
+                macoblox_x_batch_last = index + 1 == total || macoblox_input_now_ns() >= deadline;
+                unsigned long event[24]; // XEvent, 192 bytes on x86_64
+                if (!next(display, event))
+                    ((void (*)(id, SEL, void*))objc_msgSend)(self, sel_registerName("postXEvent:"), event);
+                if (macoblox_x_batch_last)
+                    break;
+            }
+            macoblox_x_batch_last = 0;
+            macoblox_flush_raw_motion(self);
+        }
+    } @finally {
+        macoblox_core_motion_type = macoblox_core_motion_button = 0;
+        macoblox_x_batch_last = 0;
+        if (macoblox_raw_pending_window) {
+            ((void (*)(id, SEL))objc_msgSend)(macoblox_raw_pending_window, sel_registerName("release"));
+            macoblox_raw_pending_window = 0;
+            macoblox_raw_pending_dx = macoblox_raw_pending_dy = 0;
+        }
+        if (pool)
+            ((void (*)(id, SEL))objc_msgSend)(pool, sel_registerName("release"));
+        __atomic_store_n(&macoblox_x_event_draining, 0, __ATOMIC_RELEASE);
+    }
 }
 
 // OpenGL subwindows get the screen's visual (gl_profile.c explains why).
@@ -4570,7 +5008,7 @@ static id hooked_x11_subwindow_init(id self, SEL cmd, id parent, MacOBloxRect fr
 static void macoblox_install_late_hooks(void) {
     static volatile int visibility_hooked;
     Class cursor_class = objc_getClass("NSCursor");
-    if (cursor_class && __sync_bool_compare_and_swap(&visibility_hooked, 0, 1)) {
+    if (cursor_class && !macoblox_wayland_enabled() && __sync_bool_compare_and_swap(&visibility_hooked, 0, 1)) {
         Method set = class_getInstanceMethod(cursor_class, sel_registerName("set"));
         Method hide = class_getClassMethod(cursor_class, sel_registerName("hide"));
         Method unhide = class_getClassMethod(cursor_class, sel_registerName("unhide"));
@@ -4594,6 +5032,7 @@ static void macoblox_install_late_hooks(void) {
         Method discard = class_getInstanceMethod(display_class,
             sel_registerName("discardEventsMatchingMask:beforeEvent:"));
         if (next && post && discard && class_getInstanceVariable(display_class, "_eventQueue")) {
+            macoblox_install_event_queue_source();
             method_setImplementation(next, (IMP)hooked_display_next_event);
             method_setImplementation(post, (IMP)hooked_display_post_event);
             method_setImplementation(discard, (IMP)hooked_display_discard_events);
@@ -4608,6 +5047,12 @@ static void macoblox_install_late_hooks(void) {
             orig_post_x_event = (void (*)(id, SEL, void*))method_getImplementation(method);
             method_setImplementation(method, (IMP)hooked_post_x_event);
             write_str("[MacOBlox] Hooked X11Display postXEvent: (motion compression)\n");
+        }
+        method = class_getInstanceMethod(x11_display_class, sel_registerName("processPendingEvents"));
+        if (method) {
+            orig_process_pending_events = (void (*)(id, SEL))method_getImplementation(method);
+            method_setImplementation(method, (IMP)hooked_process_pending_events);
+            write_str("[MacOBlox] X11 input drains bounded to 128 events / 2 ms\n");
         }
     }
     static volatile int subwindow_hooked;
@@ -5397,7 +5842,8 @@ static id shared_current_display(id cls, SEL cmd) {
     while (__sync_lock_test_and_set(&macoblox_display_lock, 1))
         macoblox_sleep_us(1000);
     if (!macoblox_shared_display) {
-        id display = orig_current_display(cls, cmd);
+        id display = macoblox_wayland_enabled() ? macoblox_wayland_display()
+                                                : orig_current_display(cls, cmd);
         if (display)
             macoblox_shared_display = ((id (*)(id, SEL))objc_msgSend)(
                 display, sel_registerName("retain"));
@@ -5515,6 +5961,18 @@ static void install_swizzles(void) {
         }
     }
 
+    Class ca_renderer_class = objc_getClass("CARenderer");
+    if (ca_renderer_class) {
+        Method method = class_getInstanceMethod(
+            ca_renderer_class, sel_registerName("_renderLayer:z:currentTime:"));
+        if (method) {
+            orig_ca_renderer_render_layer =
+                (void (*)(id, SEL, id, double, double))method_getImplementation(method);
+            method_setImplementation(method, (IMP)hooked_ca_renderer_render_layer);
+            write_str("[MacOBlox] Hooked CARenderer image upload (empty layers remain transparent)\n");
+        }
+    }
+
     Class scroll_event_class = objc_getClass("NSEvent");
     if (scroll_event_class) {
         struct { const char* name; IMP imp; const char* types; } event_methods[] = {
@@ -5612,6 +6070,12 @@ static void install_swizzles(void) {
     }
 
     Class web_preferences_class = objc_getClass("WebPreferences");
+    if (web_preferences_class) {
+        class_addMethod(web_preferences_class, sel_registerName("setPlugInsEnabled:"),
+                        (IMP)web_preferences_set_plugins_enabled, "v@:c");
+        class_addMethod(web_preferences_class, sel_registerName("plugInsEnabled"),
+                        (IMP)web_preferences_plugins_enabled, "c@:");
+    }
     SEL standard_preferences = sel_registerName("standardPreferences");
     if (web_preferences_class &&
         !class_getClassMethod(web_preferences_class, standard_preferences)) {

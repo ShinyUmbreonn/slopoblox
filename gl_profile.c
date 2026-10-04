@@ -1,4 +1,5 @@
 #include "shim_lock.h"
+#include "graphics_context.h"
 /* OpenGL Core Profile for Roblox's context.
  *
  * Roblox asks NSOpenGLPixelFormat for NSOpenGLPFAOpenGLProfile = 3.2 Core
@@ -84,6 +85,8 @@ void macoblox_finish_context(void) {
 }
 
 static void *macoblox_eglCreateContext(void *display, void *config, void *share, const int *attributes) {
+    if (!macoblox_bind_desktop_gl())
+        return 0;
     unsigned int profile = wanted_profile;
     if (profile >= 0x3200 && !attributes) {
         wanted_profile = 0;
@@ -96,6 +99,7 @@ static void *macoblox_eglCreateContext(void *display, void *config, void *share,
                           EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
             void *context = eglCreateContext(display, config, share, core);
             if (context) {
+                macoblox_register_egl_context(context);
                 char line[120];
                 int length = snprintf(line, sizeof line, "[MacOBlox GL] Core Profile %d.%d context for Roblox: created\n",
                                       versions[i][0], versions[i][1]);
@@ -105,7 +109,10 @@ static void *macoblox_eglCreateContext(void *display, void *config, void *share,
         }
         write(2, "[MacOBlox GL] Core Profile context failed, using Compatibility\n", 63);
     }
-    return eglCreateContext(display, config, share, attributes);
+    void *context = eglCreateContext(display, config, share, attributes);
+    if (context)
+        macoblox_register_egl_context(context);
+    return context;
 }
 DYLD_INTERPOSE(macoblox_eglCreateContext, eglCreateContext)
 
@@ -116,15 +123,40 @@ DYLD_INTERPOSE(macoblox_eglCreateContext, eglCreateContext)
 extern const unsigned char *glGetString(unsigned int);
 
 extern char *strstr(const char *, const char *);
+extern void *eglGetCurrentContext(void);
+extern void *malloc(unsigned long);
+extern void free(void *);
+
+struct renderer_name {
+    struct renderer_name *next;
+    void *context;
+    const unsigned char *original;
+    char text[];
+};
+static struct renderer_name *renderer_names;
+static volatile unsigned int renderer_lock;
+
+void macoblox_forget_gl_context(void *context) {
+    macoblox_lock(&renderer_lock);
+    struct renderer_name **link = &renderer_names;
+    while (*link) {
+        struct renderer_name *name = *link;
+        if (name->context == context) {
+            *link = name->next;
+            free(name);
+        } else {
+            link = &name->next;
+        }
+    }
+    macoblox_unlock(&renderer_lock);
+}
 
 static const unsigned char *macoblox_glGetString(unsigned int name) {
-    static char renderer[256];
     static int reported;
     const unsigned char *value = glGetString(name);
-    if (name == 0x1F01 && value && !reported) {
+    if (name == 0x1F01 && value && __sync_bool_compare_and_swap(&reported, 0, 1)) {
         /* Once in the log: which driver draws. llvmpipe means no GPU driver
          * reached Darling, the game then crawls at a few frames per second. */
-        reported = 1;
         const unsigned char *version = glGetString(0x1F02);
         const char *text = (const char *)value;
         int software = strstr(text, "llvmpipe") || strstr(text, "softpipe") || strstr(text, "SWR");
@@ -132,21 +164,42 @@ static const unsigned char *macoblox_glGetString(unsigned int name) {
         int length = snprintf(line, sizeof line, "[MacOBlox GL] renderer: %s (OpenGL %s)%s\n", text,
                               version ? (const char *)version : "?",
                               software ? " -- SOFTWARE RENDERING: the GPU driver is not in use" : "");
-        if (length > 0) write(2, line, (unsigned long)length);
+        if (length > 0) write(2, line, (unsigned long)length < sizeof line ? (unsigned long)length : sizeof line - 1);
     }
     if (name != 0x1F01 || !value || !core_enabled())
         return value;
     const char *text = (const char *)value;
-    int out = 0;
-    for (int in = 0; text[in] && out < (int)sizeof renderer - 1; in++) {
+    if (!strstr(text, "AMD"))
+        return value;
+    void *context = eglGetCurrentContext();
+    macoblox_lock(&renderer_lock);
+    for (struct renderer_name *cached = renderer_names; cached; cached = cached->next)
+        if (cached->context == context && cached->original == value) {
+            macoblox_unlock(&renderer_lock);
+            return (const unsigned char *)cached->text;
+        }
+    unsigned long length = 0;
+    while (text[length]) length++;
+    struct renderer_name *cached = malloc(sizeof(*cached) + length + 1);
+    if (!cached) {
+        macoblox_unlock(&renderer_lock);
+        return value;
+    }
+    unsigned long out = 0;
+    for (unsigned long in = 0; text[in]; in++) {
         if (text[in] == 'A' && text[in + 1] == 'M' && text[in + 2] == 'D') {
             in += text[in + 3] == ' ' ? 3 : 2;
             continue;
         }
-        renderer[out++] = text[in];
+        cached->text[out++] = text[in];
     }
-    renderer[out] = 0;
-    return (const unsigned char *)renderer;
+    cached->text[out] = 0;
+    cached->context = context;
+    cached->original = value;
+    cached->next = renderer_names;
+    renderer_names = cached;
+    macoblox_unlock(&renderer_lock);
+    return (const unsigned char *)cached->text;
 }
 DYLD_INTERPOSE(macoblox_glGetString, glGetString)
 
@@ -210,6 +263,13 @@ static void log_line(const char *text) {
 
 static unsigned int macoblox_eglChooseConfig(void *display, const int *attributes, void **configs,
                                              int size, int *count) {
+    extern int macoblox_wayland_enabled(void);
+    if (macoblox_wayland_enabled() && darling_default_attributes(attributes)) {
+        static const int wanted[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE};
+        return eglChooseConfig(display, wanted, configs, size, count);
+    }
     unsigned int ok = eglChooseConfig(display, attributes, configs, size, count);
     if (!ok || !configs || size < 1 || !count || *count < 1 || !darling_default_attributes(attributes))
         return ok;
@@ -245,7 +305,14 @@ static void *macoblox_eglCreateWindowSurface(void *display, void *config, unsign
         }
         return surface;
     }
-    int error = eglGetError();
+    int error = macoblox_capture_egl_error();
+    extern int macoblox_wayland_enabled(void);
+    if (macoblox_wayland_enabled()) {
+        char line[160];
+        snprintf(line, sizeof line, "[MacOBlox Wayland] EGL surface failed: error 0x%x, native %p\n", error, (void *)window);
+        log_line(line);
+        return 0;
+    }
     unsigned int root_visual = 0, window_visual = 0;
     macoblox_raw_x_visuals((unsigned int)window, &root_visual, &window_visual);
     void *matching = window_visual ? config_for_visual(display, window_visual) : 0;
@@ -289,12 +356,13 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
     int (*default_screen)(void *) = dlsym(X_DEFAULT_HANDLE, "XDefaultScreen");
     int (*default_depth)(void *, int) = dlsym(X_DEFAULT_HANDLE, "XDefaultDepth");
     void *(*default_visual)(void *, int) = dlsym(X_DEFAULT_HANDLE, "XDefaultVisual");
-    XID (*create_colormap)(void *, XID, void *, int) = dlsym(X_DEFAULT_HANDLE, "XCreateColormap");
+    XID (*default_colormap)(void *, int) = dlsym(X_DEFAULT_HANDLE, "XDefaultColormap");
+    int (*screen_number)(void *) = dlsym(X_DEFAULT_HANDLE, "XScreenNumberOfScreen");
     XID (*create_window)(void *, XID, int, int, unsigned int, unsigned int, unsigned int, int,
                          unsigned int, void *, unsigned long, void *) = dlsym(X_DEFAULT_HANDLE, "XCreateWindow");
     int (*map_window)(void *, XID) = dlsym(X_DEFAULT_HANDLE, "XMapWindow");
     int (*destroy_window)(void *, XID) = dlsym(X_DEFAULT_HANDLE, "XDestroyWindow");
-    if (!get_attributes || !default_screen || !default_depth || !default_visual || !create_colormap ||
+    if (!get_attributes || !default_screen || !default_depth || !default_visual || !default_colormap ||
         !create_window || !map_window || !destroy_window)
         return old;
 
@@ -303,7 +371,7 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
     unsigned char parent_attributes[256], old_attributes[256];
     if (!get_attributes(display, parent, parent_attributes) || !get_attributes(display, old, old_attributes))
         return old;
-    int screen = default_screen(display);
+    int screen = screen_number ? screen_number(*(void **)(parent_attributes + 128)) : default_screen(display);
     void *visual = default_visual(display, screen);
     const char *force = getenv("MACOBLOX_FORCE_SUBWINDOW_VISUAL");  /* for testing */
     if (!(force && force[0] == '1') && *(void **)(parent_attributes + 24) == visual)
@@ -312,7 +380,9 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
     /* XSetWindowAttributes, LP64: background_pixel at 8, border_pixel at 24,
      * colormap at 96. */
     unsigned char set[112] = {0};
-    *(XID *)(set + 96) = create_colormap(display, parent, visual, 0 /* AllocNone */);
+    /* The default visual already has a server-owned colormap. Allocating
+     * another one here leaked an X resource every time a drawable changed. */
+    *(XID *)(set + 96) = default_colormap(display, screen);
     int *geometry = (int *)old_attributes;
     XID window = create_window(display, parent, geometry[0], geometry[1],
                                geometry[2] > 0 ? (unsigned int)geometry[2] : 1,
@@ -321,9 +391,11 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
                                (1UL << 1) | (1UL << 3) | (1UL << 13), set);
     if (!window)
         return old;
-    map_window(display, window);
+    if (*(int *)(old_attributes + 92) != 0 /* IsUnmapped */)
+        map_window(display, window);
     destroy_window(display, old);
-    write(2, "[MacOBlox GL] GL subwindow uses the screen visual\n", 51);
+    static const char message[] = "[MacOBlox GL] GL subwindow uses the screen visual\n";
+    write(2, message, sizeof message - 1);
     return window;
 }
 
@@ -343,44 +415,80 @@ extern unsigned int eglSwapInterval(void *, int);
 extern void *eglGetCurrentDisplay(void);
 extern void *eglGetCurrentSurface(int);
 extern unsigned long long mach_absolute_time(void);
+typedef struct { unsigned int numer, denom; } macoblox_timebase;
+extern int mach_timebase_info(macoblox_timebase *);
 
 #define EGL_DRAW 0x3059
 #define CONFIGURED_SURFACES 16
 /* Surfaces whose swap interval is 0 already; a full table overwrites its
  * oldest entry, which then only costs one more eglSwapInterval. */
-static void *configured_surfaces[CONFIGURED_SURFACES];
+static struct { void *display, *surface; } configured_surfaces[CONFIGURED_SURFACES];
 static int configured_next;
 static volatile unsigned int configured_lock;
+static struct {
+    void *display, *surface;
+    unsigned long long start, frames;
+} frame_windows[CONFIGURED_SURFACES];
+static unsigned int frame_next;
+static volatile unsigned int frame_lock;
+static macoblox_timebase frame_timebase;
 
 static void lock_configured(void) {
     macoblox_lock(&configured_lock);
 }
 
+/* A client can change CGLCPSwapInterval after our first presentation. Darling
+ * forwards that setter to EGL for the current draw surface. Forget only the
+ * successful nonzero change, so the next presentation reapplies our configured
+ * vsync policy without resetting frame statistics or other drawables. */
+static unsigned int macoblox_eglSwapInterval(void *display, int interval) {
+    unsigned int succeeded = eglSwapInterval(display, interval);
+    if (succeeded && interval != 0) {
+        void *surface = eglGetCurrentSurface(EGL_DRAW);
+        if (surface) {
+            lock_configured();
+            for (int i = 0; i < CONFIGURED_SURFACES; i++)
+                if (configured_surfaces[i].display == display &&
+                    configured_surfaces[i].surface == surface)
+                    configured_surfaces[i].surface = 0;
+            macoblox_unlock(&configured_lock);
+        }
+    }
+    return succeeded;
+}
+DYLD_INTERPOSE(macoblox_eglSwapInterval, eglSwapInterval)
+
 static void forget_configured_surface(void *surface) {
     lock_configured();
     for (int i = 0; i < CONFIGURED_SURFACES; i++)
-        if (configured_surfaces[i] == surface)
-            configured_surfaces[i] = 0;
+        if (configured_surfaces[i].surface == surface)
+            configured_surfaces[i].surface = 0;
     macoblox_unlock(&configured_lock);
+    macoblox_lock(&frame_lock);
+    for (int i = 0; i < CONFIGURED_SURFACES; i++)
+        if (frame_windows[i].surface == surface)
+            frame_windows[i].surface = 0;
+    macoblox_unlock(&frame_lock);
 }
 
 static void swap_interval_zero(void) {
     static volatile long logged;
     void *surface = eglGetCurrentSurface(EGL_DRAW);
-    if (!surface)
+    void *display = eglGetCurrentDisplay();
+    if (!surface || !display)
         return;
     int known = 0;
     lock_configured();
     for (int i = 0; i < CONFIGURED_SURFACES && !known; i++)
-        known = configured_surfaces[i] == surface;
+        known = configured_surfaces[i].surface == surface && configured_surfaces[i].display == display;
     macoblox_unlock(&configured_lock);
     if (known)
         return;
-    void *display = eglGetCurrentDisplay();
-    if (!display || !eglSwapInterval(display, 0))
+    if (!eglSwapInterval(display, 0))
         return; /* tried again next frame */
     lock_configured();
-    configured_surfaces[configured_next] = surface;
+    configured_surfaces[configured_next].surface = surface;
+    configured_surfaces[configured_next].display = display;
     configured_next = (configured_next + 1) % CONFIGURED_SURFACES;
     macoblox_unlock(&configured_lock);
     long count = __sync_add_and_fetch(&logged, 1);
@@ -388,31 +496,59 @@ static void swap_interval_zero(void) {
         write(2, "[MacOBlox GL] vsync off (swap interval 0)\n", 42);
 }
 
+static int environment_flag(const char *name, int *cache) {
+    int cached = __atomic_load_n(cache, __ATOMIC_ACQUIRE);
+    if (cached >= 0)
+        return cached;
+    const char *value = getenv(name);
+    int enabled = value && value[0] == '1';
+    int expected = -1;
+    __atomic_compare_exchange_n(cache, &expected, enabled, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    return enabled;
+}
+
 void macoblox_frame_presenting(void *cgl_context) {
-    static int vsync = -1, fps_log = -1;
+    static int vsync = -1;
     (void)cgl_context; /* the interval goes with the current draw surface */
-    if (vsync < 0) {
-        const char *value = getenv("MACOBLOX_VSYNC");
-        vsync = value && value[0] == '1';
-        value = getenv("MACOBLOX_FPS_LOG");
-        fps_log = value && value[0] == '1';
-    }
-    if (!vsync)
+    if (!environment_flag("MACOBLOX_VSYNC", &vsync))
         swap_interval_zero();
-    if (fps_log) {
-        static unsigned long long window_start;
-        static long frames;
-        unsigned long long now = mach_absolute_time();
-        if (!window_start)
-            window_start = now;
-        frames++;
-        if (now - window_start >= 5000000000ULL) {
-            char line[64];
-            int length = snprintf(line, sizeof line, "[MacOBlox FPS] %.1f\n",
-                                  frames * 1e9 / (double)(now - window_start));
-            if (length > 0) write(2, line, (unsigned long)length);
-            frames = 0;
-            window_start = now;
+}
+
+void macoblox_frame_presented(void *display, void *surface, unsigned int succeeded) {
+    static int fps_log = -1;
+    if (!succeeded || !surface || !environment_flag("MACOBLOX_FPS_LOG", &fps_log))
+        return;
+    unsigned long long now = mach_absolute_time();
+    double fps = 0;
+    int report = 0;
+    macoblox_lock(&frame_lock);
+    if (!frame_timebase.denom && (mach_timebase_info(&frame_timebase) || !frame_timebase.denom))
+        frame_timebase.numer = frame_timebase.denom = 1;
+    unsigned int slot;
+    for (slot = 0; slot < CONFIGURED_SURFACES; slot++)
+        if (frame_windows[slot].display == display && frame_windows[slot].surface == surface)
+            break;
+    if (slot == CONFIGURED_SURFACES) {
+        slot = frame_next;
+        frame_next = (frame_next + 1) % CONFIGURED_SURFACES;
+        frame_windows[slot].display = display;
+        frame_windows[slot].surface = surface;
+        frame_windows[slot].start = now;
+        frame_windows[slot].frames = 0;
+    } else {
+        frame_windows[slot].frames++;
+        double nanoseconds = (double)(now - frame_windows[slot].start) * frame_timebase.numer / frame_timebase.denom;
+        if (nanoseconds >= 5000000000.0) {
+            fps = frame_windows[slot].frames * 1e9 / nanoseconds;
+            frame_windows[slot].start = now;
+            frame_windows[slot].frames = 0;
+            report = 1;
         }
+    }
+    macoblox_unlock(&frame_lock);
+    if (report) {
+        char line[96];
+        int length = snprintf(line, sizeof line, "[MacOBlox FPS] %.1f surface=%p\n", fps, surface);
+        if (length > 0) write(2, line, (unsigned long)length < sizeof line ? (unsigned long)length : sizeof line - 1);
     }
 }

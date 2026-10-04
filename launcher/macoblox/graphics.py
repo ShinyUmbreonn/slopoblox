@@ -197,64 +197,182 @@ def hardware_zink(renderer):
 
 
 def _probe():
-    """Check the X11 EGL path and both kinds of context Darling requires."""
-    egl = ctypes.CDLL("libEGL.so.1")
-    ptr, integer = ctypes.c_void_p, ctypes.c_int
+    """Exercise a real screen-visual window, core/compat and shared threads.
 
-    def function(name, result, *arguments):
-        fn = getattr(egl, name)
+    Pbuffers can succeed when an EGL config cannot present to the X11 visual
+    Darling uses. The worker also starts with EGL's default ES API, as a new
+    Roblox render thread does; bind desktop GL separately on each thread.
+    """
+    egl, xlib = ctypes.CDLL("libEGL.so.1"), ctypes.CDLL("libX11.so.6")
+    ptr, integer, uint = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint
+
+    def function(library, name, result, *arguments):
+        fn = getattr(library, name)
         fn.restype, fn.argtypes = result, arguments
         return fn
 
-    get_display = function("eglGetDisplay", ptr, ptr)
-    initialize = function("eglInitialize", integer, ptr, ptr, ptr)
-    bind = function("eglBindAPI", integer, ctypes.c_uint)
-    choose = function("eglChooseConfig", integer, ptr, ptr, ptr, integer, ptr)
-    create_surface = function("eglCreatePbufferSurface", ptr, ptr, ptr, ptr)
-    create_context = function("eglCreateContext", ptr, ptr, ptr, ptr, ptr)
-    make_current = function("eglMakeCurrent", integer, ptr, ptr, ptr, ptr)
-    get_proc = function("eglGetProcAddress", ptr, ctypes.c_char_p)
-    destroy_context = function("eglDestroyContext", integer, ptr, ptr)
-    destroy_surface = function("eglDestroySurface", integer, ptr, ptr)
-    terminate = function("eglTerminate", integer, ptr)
-    display = get_display(None)
-    if not display or not initialize(display, None, None):
-        raise RuntimeError("EGL could not initialize the X11 display")
-    surface = context = None
+    open_display = function(xlib, "XOpenDisplay", ptr, ctypes.c_char_p)
+    close_display = function(xlib, "XCloseDisplay", integer, ptr)
+    default_screen = function(xlib, "XDefaultScreen", integer, ptr)
+    default_visual = function(xlib, "XDefaultVisual", ptr, ptr, integer)
+    visual_id = function(xlib, "XVisualIDFromVisual", ctypes.c_ulong, ptr)
+    root_window = function(xlib, "XRootWindow", ctypes.c_ulong, ptr, integer)
+    create_window = function(xlib, "XCreateSimpleWindow", ctypes.c_ulong,
+                             ptr, ctypes.c_ulong, integer, integer, uint, uint,
+                             uint, ctypes.c_ulong, ctypes.c_ulong)
+    map_window = function(xlib, "XMapWindow", integer, ptr, ctypes.c_ulong)
+    destroy_window = function(xlib, "XDestroyWindow", integer, ptr, ctypes.c_ulong)
+    sync = function(xlib, "XSync", integer, ptr, integer)
+    get_display = function(egl, "eglGetDisplay", ptr, ptr)
+    initialize = function(egl, "eglInitialize", integer, ptr, ptr, ptr)
+    bind = function(egl, "eglBindAPI", integer, uint)
+    choose = function(egl, "eglChooseConfig", integer, ptr, ptr, ptr, integer, ptr)
+    config_attr = function(egl, "eglGetConfigAttrib", integer, ptr, ptr, integer, ptr)
+    create_surface = function(egl, "eglCreateWindowSurface", ptr, ptr, ptr, ctypes.c_ulong, ptr)
+    create_context = function(egl, "eglCreateContext", ptr, ptr, ptr, ptr, ptr)
+    make_current = function(egl, "eglMakeCurrent", integer, ptr, ptr, ptr, ptr)
+    swap = function(egl, "eglSwapBuffers", integer, ptr, ptr)
+    get_proc = function(egl, "eglGetProcAddress", ptr, ctypes.c_char_p)
+    destroy_context = function(egl, "eglDestroyContext", integer, ptr, ptr)
+    destroy_surface = function(egl, "eglDestroySurface", integer, ptr, ptr)
+    terminate = function(egl, "eglTerminate", integer, ptr)
+    wayland_window = None
+    if os.environ.get("MACOBLOX_WAYLAND") == "1":
+        try:
+            from .display import WaylandProbeWindow
+        except ImportError:  # this file runs directly in the probe subprocess
+            from display import WaylandProbeWindow
+        wayland_window = WaylandProbeWindow()
+    native = wayland_window.native if wayland_window else open_display(None)
+    if not native:
+        raise RuntimeError("X11 display is unavailable")
+    display = surface = context = None
+    window = 0
+    initialized = False
     try:
+        display = get_display(native)
+        if not display or not initialize(display, None, None):
+            raise RuntimeError("EGL could not initialize the selected window backend")
+        initialized = True
         if not bind(0x30A2):  # EGL_OPENGL_API
             raise RuntimeError("desktop OpenGL is unavailable")
-        attrs = (integer * 9)(0x3033, 1, 0x3040, 8, 0x3024, 8, 0x3025, 0, 0x3038)
-        config, count = ptr(), integer()
-        if not choose(display, attrs, ctypes.byref(config), 1, ctypes.byref(count)) or not count.value:
-            raise RuntimeError("no desktop OpenGL EGL configuration")
-        size = (integer * 5)(0x3057, 16, 0x3056, 16, 0x3038)
-        surface = create_surface(display, config, size)
+        # Match the real default visual, which the guest GL subwindow uses.
+        screen = default_screen(native) if not wayland_window else 0
+        required_visual = visual_id(default_visual(native, screen)) if not wayland_window else None
+        attrs = (integer * 9)(0x3033, 5, 0x3040, 8, 0x3024, 8, 0x3025, 0, 0x3038)
+        configs, count = (ptr * 256)(), integer()
+        if not choose(display, attrs, configs, len(configs), ctypes.byref(count)) or not count.value:
+            raise RuntimeError("no desktop OpenGL window EGL configuration")
+        config = None
+        for candidate in configs[:min(count.value, len(configs))]:
+            if wayland_window:
+                config = candidate
+                break
+            value = integer()
+            if config_attr(display, candidate, 0x302E, ctypes.byref(value)) and value.value == required_visual:
+                config = candidate
+                break
+        if not config:
+            raise RuntimeError("no EGL window config matches the X11 screen visual")
+        window = wayland_window.surface if wayland_window else create_window(
+            native, root_window(native, screen), 0, 0, 16, 16, 0, 0, 0)
+        if not window:
+            raise RuntimeError("could not create an X11 test window")
+        if not wayland_window:
+            map_window(native, window)
+            sync(native, 0)
+        surface = create_surface(display, config, window, None)
         if not surface:
-            raise RuntimeError("could not create an EGL test surface")
-        address = get_proc(b"glGetString")
-        if not address:
-            raise RuntimeError("glGetString is unavailable")
-        get_string = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_uint)(address)
+            raise RuntimeError("could not create an EGL window surface for the screen visual")
+
+        def gl_function(name, result, *arguments):
+            address = get_proc(name.encode())
+            if not address:
+                raise RuntimeError(f"{name} is unavailable")
+            return ctypes.CFUNCTYPE(result, *arguments)(address)
+
+        get_string = gl_function("glGetString", ctypes.c_char_p, uint)
+        clear_color = gl_function("glClearColor", None, ctypes.c_float, ctypes.c_float,
+                                  ctypes.c_float, ctypes.c_float)
+        clear = gl_function("glClear", None, uint)
+        read_pixels = gl_function("glReadPixels", None, integer, integer, integer, integer, uint, uint, ptr)
+        get_error = gl_function("glGetError", uint)
+        gen_textures = gl_function("glGenTextures", None, integer, ptr)
+        bind_texture = gl_function("glBindTexture", None, uint, uint)
+        is_texture = gl_function("glIsTexture", ctypes.c_ubyte, uint)
+        delete_textures = gl_function("glDeleteTextures", None, integer, ptr)
+        core_attrs = (integer * 7)(0x3098, 4, 0x30FB, 1, 0x30FD, 1, 0x3038)
         renderer = ""
-        for attrs in (None, (integer * 7)(0x3098, 4, 0x30FB, 1, 0x30FD, 1, 0x3038)):
-            context = create_context(display, config, None, attrs)
+
+        def present():
+            clear_color(0.25, 0.5, 0.75, 1.0)
+            clear(0x4000)  # GL_COLOR_BUFFER_BIT
+            pixel = (ctypes.c_ubyte * 4)()
+            read_pixels(0, 0, 1, 1, 0x1908, 0x1401, pixel)  # RGBA/UNSIGNED_BYTE
+            if get_error() or any(abs(pixel[i] - expected) > 2 for i, expected in enumerate((64, 128, 191))):
+                raise RuntimeError("EGL window rendering/readback failed")
+            if not swap(display, surface):
+                raise RuntimeError("EGL window presentation failed")
+
+        for attributes in (None, core_attrs):
+            context = create_context(display, config, None, attributes)
             if not context or not make_current(display, surface, surface, context):
-                raise RuntimeError("Darling needs both compatibility and OpenGL 4.1 core contexts")
+                raise RuntimeError("Darling needs compatibility and OpenGL 4.1 core window contexts")
             renderer = (get_string(0x1F01) or b"").decode(errors="replace")
             if not hardware_zink(renderer):
                 raise RuntimeError(f"expected hardware Zink, got {renderer or 'no renderer'}")
-            make_current(display, None, None, None)
-            destroy_context(display, context)
-            context = None
-        return {"renderer": renderer}
-    finally:
+            present()
+            if attributes is None:
+                make_current(display, None, None, None)
+                destroy_context(display, context)
+                context = None
+        texture = uint()
+        gen_textures(1, ctypes.byref(texture))
+        bind_texture(0x0DE1, texture.value)
         make_current(display, None, None, None)
-        if context:
-            destroy_context(display, context)
-        if surface:
-            destroy_surface(display, surface)
-        terminate(display)
+        failures = []
+
+        def worker():
+            shared = None
+            try:
+                if not bind(0x30A2):
+                    raise RuntimeError("desktop OpenGL API could not be bound on the render thread")
+                shared = create_context(display, config, context, core_attrs)
+                if not shared or not make_current(display, surface, surface, shared):
+                    raise RuntimeError("shared core context could not become current on the render thread")
+                if not is_texture(texture.value):
+                    raise RuntimeError("OpenGL objects were not shared with the render thread")
+                present()
+            except Exception as error:
+                failures.append(error)
+            finally:
+                make_current(display, None, None, None)
+                if shared:
+                    destroy_context(display, shared)
+
+        thread = threading.Thread(target=worker, name="MacOBlox EGL probe")
+        thread.start()
+        thread.join()  # the parent subprocess timeout covers driver hangs
+        if failures:
+            raise failures[0]
+        if not bind(0x30A2) or not make_current(display, surface, surface, context):
+            raise RuntimeError("main-thread core context could not be restored")
+        delete_textures(1, ctypes.byref(texture))
+        return {"renderer": renderer, "window_presentation": True, "shared_thread_context": True}
+    finally:
+        if initialized:
+            make_current(display, None, None, None)
+            if context:
+                destroy_context(display, context)
+            if surface:
+                destroy_surface(display, surface)
+            terminate(display)
+        if wayland_window:
+            wayland_window.close()
+        else:
+            if window:
+                destroy_window(native, window)
+            close_display(native)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ static int compile(const char *source) {
     glCompileShader(shader);
     GLint ok;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[8192];
+        glGetShaderInfoLog(shader, sizeof(log), 0, log);
+        fprintf(stderr, "%s\n", log);
+    }
     glDeleteShader(shader);
     return ok;
 }

@@ -8,6 +8,21 @@ from macoblox import core, graphics
 
 
 class GraphicsTests(unittest.TestCase):
+    def test_gpu_budget_uses_selected_adapter_and_current_free_memory(self):
+        output = "NVIDIA GeForce RTX 3060 Ti, 8192, 4096\nNVIDIA Other, 24576, 20000\n"
+        with patch.object(core.Path, "glob", return_value=[]), \
+                patch.object(core.subprocess, "check_output", return_value=output):
+            self.assertEqual(core.host_vram_bytes("zink (NVIDIA GeForce RTX 3060 Ti)"),
+                             (4096 - 256) * 1024 * 1024)
+            self.assertEqual(core.host_vram_bytes(), (4096 - 256) * 1024 * 1024)
+            self.assertEqual(core.host_vram_bytes("NVIDIA Other"), 24576 * 1024 * 1024 * 3 // 4)
+
+    def test_gpu_budget_fallback_is_conservative_and_bad_reports_are_ignored(self):
+        for output in ("", "bad driver output", "GPU, 8192, 9000", "GPU, 8192, -1"):
+            with self.subTest(output=output), patch.object(core.Path, "glob", return_value=[]), \
+                    patch.object(core.subprocess, "check_output", return_value=output):
+                self.assertEqual(core.host_vram_bytes(), 512 * 1024 * 1024)
+
     def test_vulkan_dependency_check_identifies_each_missing_component(self):
         with patch.object(graphics, "mesa_egl_manifest", return_value=None), \
                 patch.object(graphics.Path, "is_file", return_value=False):

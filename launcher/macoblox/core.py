@@ -78,11 +78,13 @@ VERSION_URL = "https://clientsettingscdn.roblox.com/v2/client-version/MacPlayer"
 DOWNLOAD_URL = "https://setup.rbxcdn.com/mac/{upload}-RobloxPlayer.zip"
 
 DEFAULT_SETTINGS = {
+    "setup_complete": False,
     "language": "en",
     "mouse_sensitivity": 1.0,
     "scroll_sensitivity": 1.5,
     "auto_patch_throttle": True,
     "raw_mouse": True,
+    "display_backend": "x11",
     "renderer": "opengl",
     "mangohud": False,
     "hide_menu_bar": False,
@@ -357,6 +359,7 @@ def update_roblox(upload, progress=None):
         save_fast_flags(flags)
     apply_throttle_patch()
     ensure_raknet_transport()
+    ensure_shader_compatibility()
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
@@ -479,101 +482,30 @@ def ensure_raknet_transport():
 
         binary = APP_BUNDLE / "Contents" / "MacOS" / "RobloxPlayer"
         if binary.is_file():
-            with open(binary, "r+b") as f:
-                data = f.read()
-                str_pos = data.find(b"useRbxTransportEnabled\x00")
-                if str_pos != -1:
-                    pattern = re.compile(rb"\x48\x8d[\x00-\xff]")
-                    for m in pattern.finditer(data):
-                        i = m.start()
-                        modrm = data[i + 2]
-                        if (modrm & 0xC7) != 0x05:
-                            continue
-                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
-                        if i + 7 + disp == str_pos:
-                            prefix = data[max(0, i-17):i]
-                            call_idx = prefix.find(b"\xe8")
-                            if call_idx != -1:
-                                call_file_pos = max(0, i-17) + call_idx
-                                call_disp = int.from_bytes(data[call_file_pos+1:call_file_pos+5], "little", signed=True)
-                                fn_pos = call_file_pos + 5 + call_disp
-                                if 0 <= fn_pos < len(data) - 4 and data[fn_pos:fn_pos+4] == b"\x55\x48\x89\xe5":
-                                    f.seek(fn_pos)
-                                    f.write(b"\x31\xc0\xc3\x90")
-                            break
-                # The RakNet fallback setup ("Setting up fallback to
-                # RbxTransport") starts a shadow RbxTransport connection that
-                # can never connect under Darling; closing a session then
-                # waits for its 10 s timeout, freezing the return to the
-                # menu. D-flag overrides from ClientAppSettings are ignored
-                # by the client, so gate the setup off in binary: the check
-                # `cmp byte [flag], 1; jne skip` becomes never-true.
-                fb_str = data.find(b"Setting up fallback to RbxTransport")
-                if fb_str != -1:
-                    for m in pattern.finditer(data):
-                        i = m.start()
-                        modrm = data[i + 2]
-                        if (modrm & 0xC7) != 0x05:
-                            continue
-                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
-                        target = i + 7 + disp
-                        if fb_str - 0x80 <= target <= fb_str:
-                            window = data[i:i+0x100]
-                            gate = re.compile(rb"\x80\x3d.{4}\x01\x0f\x85", re.DOTALL)
-                            g = gate.search(window)
-                            if g:
-                                imm_pos = i + g.start() + 6
-                                if data[imm_pos] == 1:
-                                    f.seek(imm_pos)
-                                    f.write(b"\xff")
-                            break
-                # The DummyClient also starts from a runtime path ("DummyClient
-                # will connect to server"): its start function is called from
-                # two sites, each gated by a compare of the same flag global
-                # (opposite polarity: ==1 at one, ==0 at the other). Patch
-                # each caller's guard so the connect call is always skipped:
-                # a short `jne` becomes `jmp`, a near `jne rel32` gets the
-                # compare's immediate set to 0xFF (never equal).
-                dc_str = data.find(b"DummyClient will connect to server")
-                if dc_str != -1:
-                    starts = []
-                    for m in pattern.finditer(data):
-                        i = m.start()
-                        modrm = data[i + 2]
-                        if (modrm & 0xC7) != 0x05:
-                            continue
-                        disp = int.from_bytes(data[i+3:i+7], "little", signed=True)
-                        target = i + 7 + disp
-                        if dc_str - 0x80 <= target <= dc_str:
-                            starts.append(i)
-                    for start in starts:
-                        prologue = data.rfind(b"\x55\x48\x89\xe5", start - 0x800, start)
-                        if prologue == -1:
-                            continue
-                        for m in re.finditer(rb"\xe8", data):
-                            i = m.start()
-                            if i + 5 + int.from_bytes(data[i+1:i+5], "little", signed=True) != prologue:
-                                continue
-                            # Guard candidate sits within 0x60 bytes before the call:
-                            # cmp byte ptr [rip+disp32], imm8; (a move or two;) jne.
-                            window_start = max(0, i - 0x60)
-                            window = data[window_start:i]
-                            for g in re.finditer(rb"\x80\x3d", window):
-                                cmp_pos = window_start + g.start()
-                                imm_pos = cmp_pos + 6
-                                if data[imm_pos] not in (0, 1):
-                                    continue
-                                gap = data[imm_pos + 1:imm_pos + 9]
-                                jne = gap.find(b"\x75")
-                                if jne != -1:
-                                    f.seek(imm_pos + 1 + jne)
-                                    f.write(b"\xeb")  # jne -> jmp: always skip
-                                elif gap[:2] == b"\x0f\x85":
-                                    f.seek(imm_pos)
-                                    f.write(b"\xff")  # never equal: always skip
-                                break
+            from .transport_patches import apply_transport_patch
+            status = apply_transport_patch(binary)
+            if status.startswith("unsupported"):
+                logging.getLogger("macoblox").warning("RakNet compatibility: %s", status)
+            elif status == "patched":
+                logging.getLogger("macoblox").info("Verified RakNet compatibility patches applied")
     except Exception as e:
         logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)
+
+
+def ensure_shader_compatibility():
+    """Repair the verified GLSL pack's HeightmapDebugPS parser failure."""
+    pack = APP_BUNDLE / "Contents" / "Resources" / "shaders" / "shaders_glsl3.pack"
+    if not pack.is_file():
+        return
+    try:
+        from .shader_patches import apply_shader_patch
+        status = apply_shader_patch(pack)
+        if status.startswith("unsupported"):
+            logging.getLogger("macoblox").warning("GLSL compatibility: %s", status)
+        elif status == "patched":
+            logging.getLogger("macoblox").info("Verified HeightmapDebugPS shader compatibility repair applied")
+    except Exception as e:
+        logging.getLogger("macoblox").warning("Failed to ensure GLSL compatibility: %s", e)
 
 
 def delete_roblox():
@@ -612,17 +544,81 @@ def _user_processes():
 
 
 def roblox_pids(names=("RobloxPlayer", "RobloxCrashHandler")):
-    """Host PIDs of running RobloxPlayer / RobloxCrashHandler processes: the
-    macOS executables themselves (Studio's RobloxCrashHandler.exe under Wine,
-    or any program that merely mentions these names, does not count)."""
+    """Host PIDs of Roblox executables in the selected Darling prefix."""
+    namespaces = _prefix_namespaces()
     return [pid for pid, argv in _user_commands()
-            if argv and argv[0].rsplit("/", 1)[-1] in names]
+            if argv and Path(argv[0]).name in names and _process_in_prefix(pid, namespaces)]
 
 
 def _darlingservers():
     """darlingserver processes of our prefix."""
-    return [pid for pid, args in _user_processes()
-            if args.startswith(f"darlingserver {DARLING_PREFIX} ")]
+    return [pid for pid, argv in _user_commands() if _server_for_prefix(pid, argv)]
+
+
+def _server_for_prefix(pid, argv):
+    if len(argv) < 2 or Path(argv[0]).name != "darlingserver":
+        return False
+    try:
+        prefix = Path(argv[1])
+        if not prefix.is_absolute():
+            prefix = Path(os.readlink(f"/proc/{pid}/cwd")) / prefix
+        return prefix.resolve() == DARLING_PREFIX.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _mountinfo_prefix(text):
+    """Identify Darling's prefix overlay; ambiguous/missing evidence is None.
+
+    Darling mounts upperdir=prefix,workdir=prefix.workdir on prefix itself.
+    A rootless copy has no such evidence, so its orphan scope stays unknown.
+    """
+    def decode(value):
+        return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+    prefixes = set()
+    for line in text.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 6 or len(filesystem) < 3 or filesystem[0] != "overlay":
+            continue
+        options = dict(option.split("=", 1) for option in filesystem[2].split(",") if "=" in option)
+        upper, work = options.get("upperdir"), options.get("workdir")
+        if upper is None or work is None:
+            continue
+        upper, work, mounted = decode(upper), decode(work), decode(fields[4])
+        if not Path(upper).is_absolute() or work != upper + ".workdir":
+            continue
+        try:
+            prefix = Path(upper).resolve()
+            if Path(mounted).resolve() == prefix:
+                prefixes.add(prefix)
+        except (OSError, RuntimeError):
+            pass
+    return next(iter(prefixes)) if len(prefixes) == 1 else None
+
+
+def _process_prefix(pid):
+    try:
+        return _mountinfo_prefix(Path(f"/proc/{pid}/mountinfo").read_text(errors="surrogateescape"))
+    except OSError:
+        return None
+
+
+def _process_in_prefix(pid, namespaces=()):
+    try:
+        if Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+            return False
+        namespace = _mount_namespace(pid)
+        if namespace is None:
+            return False
+        if namespace in namespaces:
+            return True
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        argv = [argument.decode(errors="replace") for argument in argv if argument]
+        return _server_for_prefix(pid, argv) or _process_prefix(pid) == DARLING_PREFIX.resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _mount_namespace(pid):
@@ -630,6 +626,38 @@ def _mount_namespace(pid):
         return os.readlink(f"/proc/{pid}/ns/mnt")
     except OSError:
         return None
+
+
+def _prefix_namespaces(servers=None):
+    """Private mount namespaces of freshly verified selected-prefix servers."""
+    host = _mount_namespace(os.getpid())
+    if host is None:
+        return set()
+    namespaces = set()
+    for pid in _darlingservers() if servers is None else servers:
+        namespace = _mount_namespace(pid)
+        if namespace is None or namespace == host:
+            continue
+        try:
+            if Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+                continue
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            argv = [argument.decode(errors="replace") for argument in argv if argument]
+            if _server_for_prefix(pid, argv) and _mount_namespace(pid) == namespace:
+                namespaces.add(namespace)
+        except OSError:
+            pass
+    return namespaces
+
+
+def _roblox_process_in_prefix(pid, namespaces=(), names=("RobloxPlayer", "RobloxCrashHandler")):
+    """Recheck executable name and prefix immediately before a scoped signal."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        name = Path(argv[0].decode(errors="replace")).name if argv[0] else ""
+        return name in names and _process_in_prefix(pid, namespaces)
+    except OSError:
+        return False
 
 
 def _darling_processes():
@@ -649,42 +677,117 @@ def _container_processes(servers):
     """Darling processes in the containers of the darlingservers `servers`
     (a container is a mount namespace; launchd and the daemons are not
     darlingserver's children)."""
-    namespaces = {_mount_namespace(pid) for pid in servers} - {None}
+    namespaces = _prefix_namespaces(servers)
     return [pid for pid, namespace in _darling_processes() if namespace in namespaces]
 
 
 def _orphaned_darling_processes():
-    """Darling processes whose darlingserver is gone, of any prefix: launchd
-    and the daemons of a server that was stopped or died stay behind, a few
-    hundred MB each time, and a game still running there is dead anyway."""
-    servers = [pid for pid, argv in _user_commands() if argv and argv[0] == "darlingserver"]
+    """Orphaned Darling processes proven to belong to the selected prefix."""
+    servers = [pid for pid, argv in _user_commands() if argv and Path(argv[0]).name == "darlingserver"]
     alive = {_mount_namespace(pid) for pid in servers} - {None}
-    return [pid for pid, namespace in _darling_processes() if namespace not in alive]
+    try:
+        selected = DARLING_PREFIX.resolve()
+    except (OSError, RuntimeError):
+        return []
+    return [pid for pid, namespace in _darling_processes()
+            if namespace is not None and namespace not in alive and _process_prefix(pid) == selected]
 
 
-def _terminate(pids, wait=5.0):
-    """SIGTERM `pids`, and SIGKILL those still there after `wait` seconds."""
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline and any(_process_state(pid) not in (None, "Z") for pid in pids):
-        time.sleep(0.1)
-    for pid in pids:
-        if _process_state(pid) not in (None, "Z"):
+def _terminate(pids, wait=5.0, *, scope=None):
+    """Terminate only verified targets, using stable handles through escalation."""
+    return _terminate_scoped(pids, wait, scope if scope is not None else _process_in_prefix)
+
+
+def _terminate_scoped(pids, wait, scope):
+    """Use stable pidfds and verify scope before signaling; unknowns stay."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return
+    targets = {}
+    try:
+        for pid in dict.fromkeys(pids):
             try:
-                os.kill(pid, signal.SIGKILL)
+                descriptor = os.pidfd_open(pid)
+            except OSError:
+                continue
+            try:
+                accepted = scope(pid)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            if not accepted:
+                os.close(descriptor)
+                continue
+            targets[pid] = descriptor
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
             except OSError:
                 pass
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and any(_process_state(pid) not in (None, "Z") for pid in targets):
+            time.sleep(0.1)
+        for pid, descriptor in targets.items():
+            if _process_state(pid) not in (None, "Z"):
+                try:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                except OSError:
+                    pass
+    finally:
+        for descriptor in targets.values():
+            os.close(descriptor)
+
+
+def _signal_scoped(pids, sig, scope):
+    """Send one signal through a pidfd after checking the current scope."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return
+    for pid in dict.fromkeys(pids):
+        try:
+            descriptor = os.pidfd_open(pid)
+        except OSError:
+            continue
+        try:
+            if scope(pid):
+                try:
+                    signal.pidfd_send_signal(descriptor, sig)
+                except OSError:
+                    pass
+        finally:
+            os.close(descriptor)
+
+
+def _terminate_roblox(pids, wait=3):
+    namespaces = _prefix_namespaces()
+    _terminate(pids, wait, scope=lambda pid: _roblox_process_in_prefix(pid, namespaces))
+
+
+def _kill_crash_handlers():
+    namespaces = _prefix_namespaces()
+    _signal_scoped(roblox_pids(("RobloxCrashHandler",)), signal.SIGKILL,
+                   lambda pid: _roblox_process_in_prefix(pid, namespaces, ("RobloxCrashHandler",)))
+
+
+def _terminate_frontend(process):
+    """End this session's owned frontend and proven prefix descendants."""
+    if process.poll() is not None:
+        return
+    namespaces = _prefix_namespaces()
+    descendants = [pid for pid in _with_descendants([process.pid]) if pid != process.pid]
+    _terminate(descendants, wait=1, scope=lambda pid: _process_in_prefix(pid, namespaces))
+    # An unreaped Popen child cannot have its PID reused. Recheck ownership
+    # after opening the pidfd; descendants are checked individually above.
+    _terminate([process.pid], wait=2,
+               scope=lambda pid: pid == process.pid and process.poll() is None)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def clear_orphaned_darling():
-    """End Darling processes left over from a darlingserver that is gone."""
+    """End proven selected-prefix leftovers; preserve other/unknown scopes."""
     orphans = _orphaned_darling_processes()
     if orphans:
-        _terminate(orphans)
+        _terminate(orphans, scope=_process_in_prefix)
     return len(orphans)
 
 
@@ -862,7 +965,7 @@ def ensure_x11(env: dict[str, str]) -> None:
 
 
 def stop_roblox():
-    _terminate(roblox_pids(), wait=3)
+    _terminate_roblox(roblox_pids(), wait=3)
 
 
 def _darling_path(path):
@@ -942,7 +1045,7 @@ SHIM_STAMP = BUILD_DIR / "sources.sha256"
 def _shim_sources_hash():
     """Hash of everything the shim build uses, and of the launcher version."""
     digest = hashlib.sha256(__version__.encode())
-    for path in sorted([*PROJECT.glob("*.c"), *PROJECT.glob("*.m"), *PROJECT.glob("*.h"),
+    for path in sorted([*PROJECT.glob("*.c"), *PROJECT.glob("*.cpp"), *PROJECT.glob("*.m"), *PROJECT.glob("*.h"),
                         *(PROJECT / "frameworks").glob("*"), BUILD_SCRIPT]):
         try:
             digest.update(path.name.encode() + b"\0" + path.read_bytes())
@@ -1028,14 +1131,15 @@ def _install_framework(name):
 
 
 def prepare_prefix(env):
-    """Puts the stub frameworks and the patched ffmpeg bridges into the
+    """Puts the stub frameworks and repaired runtime libraries into the
     Darling prefix. Its system folders belong to root, so programs inside
     Darling cannot write there; the files go straight into the prefix's
     upper layer (~/.darling) while Darling is stopped, then Darling sees them
     on its next start."""
     frameworks = _missing_frameworks()
     bridges = _patched_ffmpeg_bridges()
-    if not frameworks and not bridges:
+    kqueue_libraries = _patched_kqueue_runtime()
+    if not frameworks and not bridges and not kqueue_libraries:
         return
     if not DARLING_PREFIX.is_dir():
         # Let Darling create the prefix first.
@@ -1054,6 +1158,51 @@ def prepare_prefix(env):
         target = DARLING_PREFIX / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
+    from . import darling_patches
+    for relative, path in kqueue_libraries:
+        status = darling_patches.install_sparse_map_copy(path, DARLING_PREFIX / relative,
+                                                       library=relative.as_posix())
+        logging.getLogger("macoblox").info("Darling kqueue map: %s", status)
+
+
+def _patched_kqueue_runtime():
+    """Stage a known library repair for this prefix; preserve custom overrides."""
+    from . import darling_patches
+    libraries = []
+    # Darling builds contain independent copies of libkqueue. Its active
+    # close path lives in libSystem.B; libc also has a private copy.
+    for relative in (Path("usr/lib/libSystem.B.dylib"),
+                     Path("usr/lib/system/libsystem_c.dylib")):
+        installed = DARLING_PREFIX / relative
+        if (installed.is_symlink()
+                or not installed.resolve().is_relative_to(DARLING_PREFIX.resolve())):
+            continue
+        stock = installed if installed.exists() else DARLING_SYSROOT / relative
+        if not stock.exists():
+            continue
+        try:
+            stock_data = stock.read_bytes()
+            status, expected = darling_patches.plan_sparse_map_patch(stock_data,
+                                                                     library=relative.as_posix())
+            if status == "already patched" and installed.exists():
+                continue
+            if status not in ("patched", "already patched"):
+                logging.getLogger("macoblox").debug("Darling kqueue map: %s", status)
+                continue
+            staged = NATIVE_BUILD / relative.name
+            staged_status = darling_patches.install_sparse_map_copy(stock, staged,
+                                                                   library=relative.as_posix())
+            if staged_status not in ("patched", "already patched"):
+                continue
+            staged_data = staged.read_bytes()
+            if (staged_data != (stock_data if expected is None else expected)
+                    or darling_patches.plan_sparse_map_patch(staged_data,
+                        library=relative.as_posix())[0] != "already patched"):
+                continue
+            libraries.append((relative, staged))
+        except OSError as error:
+            logging.getLogger("macoblox").warning("Could not stage Darling kqueue repair: %s", error)
+    return libraries
 
 
 def _initializer_offset(data):
@@ -1166,17 +1315,19 @@ def clear_stale_darling():
 
 def restart_darling():
     """Stops the prefix's darlingserver and everything in its container
-    (launchd, Darling's daemons, a game still closing), and whatever earlier
-    servers left behind; the next darling command starts them again. The
+    (launchd, Darling's daemons, a game still closing), and proven selected-
+    prefix leftovers; the next darling command starts them again. The
     daemons are not darlingserver's children: stopping only its descendants
     left them running without a server. Blocks for up to a few seconds: call
     it off the GTK thread."""
     servers = _darlingservers()
+    namespaces = _prefix_namespaces(servers)
     processes = set(_with_descendants(servers)) | set(_container_processes(servers))
     processes |= set(_orphaned_darling_processes())
     # The container's programs first, so none of them runs on without its server.
-    _terminate(sorted(processes - set(servers)))
-    _terminate(servers)
+    belongs = lambda pid: _process_in_prefix(pid, namespaces)
+    _terminate(sorted(processes - set(servers)), scope=belongs)
+    _terminate(servers, scope=belongs)
     clear_stale_darling()
 
 
@@ -1255,27 +1406,46 @@ exec ./RobloxPlayer
 '''
 
 
-def host_vram_bytes():
-    """Largest dedicated VRAM among the host GPUs (amdgpu sysfs, nvidia-smi)."""
-    best = 0
+def host_vram_bytes(renderer=None):
+    """Conservative graphics budget for the selected GPU, never the largest.
+
+    Reserve memory for the compositor/driver and account for current use. If
+    the renderer does not identify one GPU, use the smallest measured budget
+    rather than claiming the memory of a different adapter. Unknown adapters
+    get 512 MiB instead of the former invented 8 GiB.
+    """
+    candidates = []
+
+    def budget(total, free):
+        if total < 64 * 1024 * 1024 or free < 0 or free > total:
+            return None
+        reserve = min(256 * 1024 * 1024, total // 4)
+        return max(64 * 1024 * 1024, min(total * 3 // 4, max(0, free - reserve)))
+
     for path in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
         try:
-            best = max(best, int(path.read_text().strip()))
+            total = int(path.read_text().strip())
+            used_file = path.with_name("mem_info_vram_used")
+            used = int(used_file.read_text().strip()) if used_file.is_file() else total // 4
+            value = budget(total, total - used)
+            if value is not None:
+                candidates.append(("", value))
         except (OSError, ValueError):
             pass
-    if best:
-        return best
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL, text=True, timeout=1
-        )
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, text=True, timeout=1)
         for line in out.strip().splitlines():
-            mb = int(line.strip())
-            best = max(best, mb * 1024 * 1024)
-    except Exception:
+            name, total, free = (part.strip() for part in line.split(","))
+            value = budget(int(total) * 1024 * 1024, int(free) * 1024 * 1024)
+            if value is not None:
+                candidates.append((name, value))
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    return best if best else 8 * 1024 * 1024 * 1024
+    selected = [value for name, value in candidates if name and renderer and name.lower() in renderer.lower()]
+    values = selected or [value for _name, value in candidates]
+    return min(values) if values else 512 * 1024 * 1024
 
 
 class HostAudio:
@@ -1455,11 +1625,14 @@ class RobloxSession:
         QUIT_SENTINEL.unlink(missing_ok=True)
 
     def environment(self):
-        from . import graphics
+        from . import graphics, display
         env = darling_environment()
         env.update(graphics.renderer_environment(self.settings.get("renderer", "opengl")))
         env.update(graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
                                                self.settings.get("mangohud", False)))
+        env.update(display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so"))
+        if env["MACOBLOX_WAYLAND"] == "1":
+            env.pop("DISPLAY", None)
         return env
 
     def shim_variables(self):
@@ -1486,11 +1659,14 @@ class RobloxSession:
         from . import graphics
         variables.extend(f"{name}={value}" for name, value in
                          graphics.renderer_environment(self.settings.get("renderer", "opengl")).items())
+        from . import display
+        variables.extend(f"{name}={value}" for name, value in
+                         display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so").items())
         # Host graphics libraries see the guest environment after exec.
         variables.extend(f"{name}={value}" for name, value in
                          graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
                                                        self.settings.get("mangohud", False)).items())
-        vram = host_vram_bytes()
+        vram = host_vram_bytes(getattr(self, "renderer_name", None))
         if vram:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")
         if self.settings.get("hide_menu_bar"):
@@ -1553,11 +1729,13 @@ class RobloxSession:
             from . import graphics
             graphics.ensure_vulkan_dependencies()
         env = self.environment()
-        ensure_x11(env)
+        if env.get("MACOBLOX_WAYLAND") != "1":
+            ensure_x11(env)
         renderer_name = "OpenGL"
         if self.settings.get("renderer", "opengl") == "vulkan":
             from . import graphics
             renderer_name = graphics.validate_vulkan(env)
+        self.renderer_name = renderer_name
         # A game closed a moment ago may still be shutting down. A new one next
         # to it shared its darlingserver, and when that went both died. Give it
         # time, then end it; crash handlers of earlier games are just ended.
@@ -1566,7 +1744,7 @@ class RobloxSession:
             time.sleep(0.25)
         leftover = roblox_pids()
         if leftover:
-            _terminate(leftover, wait=3)
+            _terminate_roblox(leftover, wait=3)
         orphans = clear_orphaned_darling()
         prepare_prefix(env)
         try:
@@ -1576,6 +1754,7 @@ class RobloxSession:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         apply_throttle_patch()
         ensure_raknet_transport()
+        ensure_shader_compatibility()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder
@@ -1600,9 +1779,9 @@ class RobloxSession:
             log.write(f"Darling: {darling_version(env)}\n".encode())
             log.write(f"Renderer requested: {renderer_name}\n".encode())
             if leftover:
-                log.write(f"Ended {len(leftover)} Roblox process(es) of an earlier game\n".encode())
+                log.write(f"Requested cleanup of {len(leftover)} selected-prefix Roblox process(es) of an earlier game\n".encode())
             if orphans:
-                log.write(f"Ended {orphans} Darling process(es) left without their darlingserver\n".encode())
+                log.write(f"Requested cleanup of {orphans} selected-prefix Darling process(es) left without their darlingserver\n".encode())
             changed = raise_darling_priority()
             if changed:
                 log.write(f"Priority: {changed} Darling processes raised to nice {_nice_target(SERVER_NICE)}\n".encode())
@@ -1626,11 +1805,7 @@ class RobloxSession:
             crash_pids = roblox_pids(("RobloxCrashHandler",))
             if crash_pids:
                 time.sleep(2)
-                for pid in roblox_pids(("RobloxCrashHandler",)):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except OSError:
-                        pass
+                _kill_crash_handlers()
                 break
 
     def poll(self):
@@ -1650,17 +1825,15 @@ class RobloxSession:
             return -1
         # Suppress any crash handler to prevent slow dumps and exit blockage
         if self.seen_roblox and time.time() - self.started_at > 3:
-            for pid in roblox_pids(("RobloxCrashHandler",)):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            _kill_crash_handlers()
 
         # darling shell can outlive a Roblox that was killed; watch the game
         # processes themselves as well. Known ones are checked each second,
         # the whole of /proc only when they are gone or every few seconds.
         now = time.time()
-        self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")]
+        namespaces = _prefix_namespaces()
+        self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")
+                          and _roblox_process_in_prefix(pid, namespaces, ("RobloxPlayer",))]
         if not self.game_pids or now - self.scanned_at > 1:
             self.game_pids = roblox_pids(("RobloxPlayer",))
             self.scanned_at = now
@@ -1677,17 +1850,9 @@ class RobloxSession:
     def finish(self):
         leftover = roblox_pids()
         if leftover:
-            _terminate(leftover, wait=1)
+            _terminate_roblox(leftover, wait=1)
         if self.process and self.process.poll() is None:
-            # Roblox is gone but `darling shell` stayed: end it (it leads its
-            # own process group) instead of leaving it behind.
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(self.process.pid, sig)
-                    self.process.wait(timeout=2)
-                    break
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
+            _terminate_frontend(self.process)
         if self.dns:
             self.dns.stop()
             self.dns = None

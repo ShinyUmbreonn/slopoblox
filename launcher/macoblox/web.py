@@ -41,8 +41,11 @@ def _web_url(url):
     """Only plain http(s) pages with a host and no credentials are shown."""
     if not isinstance(url, str) or len(url) > 16384 or any(ord(c) < 32 or ord(c) == 127 for c in url):
         return False
-    parts = urllib.parse.urlsplit(url)
-    return parts.scheme in ("http", "https") and bool(parts.hostname) and "@" not in parts.netloc
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme in ("http", "https") and bool(parts.hostname) and "@" not in parts.netloc
+    except ValueError:
+        return False
 
 
 def _client_url(url):
@@ -167,6 +170,7 @@ class WebBridge:
         if self.peer:
             self.peer.close()
             self.peer = None
+        self.received = b""
         self.outgoing = []
 
     def _incoming(self, _fd, condition):
@@ -198,13 +202,19 @@ class WebBridge:
                     self._handle(message)
                 except Exception as error:  # one bad request must not end the bridge
                     print("Embedded web page request failed:", error)
+                    self._reply_error(message.get("request"), "The embedded browser request failed")
         if closed:
             self._drop_peer()
             return False
         return True
 
     def send(self, message):
-        if not self.peer or len(self.outgoing) > 128:
+        if not self.peer:
+            return
+        if len(self.outgoing) >= 128:
+            # Closing the stream lets the guest finish pending callbacks with
+            # an error. Silently dropping a reply leaves them waiting forever.
+            self._drop_peer()
             return
         self.outgoing.append(json.dumps(message).encode() + b"\n")
         if not self.write_watch:
@@ -218,8 +228,11 @@ class WebBridge:
             except BlockingIOError:
                 return True
             except OSError:
-                self.outgoing = []
-                break
+                self._drop_peer()
+                return False
+            if sent == 0:
+                self._drop_peer()
+                return False
             self.outgoing[0] = self.outgoing[0][sent:]
             if not self.outgoing[0]:
                 self.outgoing.pop(0)
@@ -230,6 +243,10 @@ class WebBridge:
         message = {"view": page.id if page else 0, "event": kind}
         message.update(fields)
         self.send(message)
+
+    def _reply_error(self, number, reason, page_id=0):
+        if isinstance(number, int) and not isinstance(number, bool):
+            self.send({"view": page_id, "event": "reply", "request": number, "error": reason})
 
     # ---------------------------------------------------------------- window
     def _build_window(self):
@@ -395,14 +412,27 @@ class WebBridge:
                 self.stack.remove(page.view)
                 page.view = None
             return
-        if not isinstance(page_id, int) or page_id < 0 or page_id > 1000000:
+        if not isinstance(page_id, int) or isinstance(page_id, bool) or page_id < 0 or page_id > 1000000:
+            self._reply_error(message.get("request"), "Invalid embedded page")
+            return
+        if op == "cookies-get":
+            if not self.session:
+                self._build_window()
+            self._cookies_get(message.get("request"))
+            return
+        elif op == "cookie-set":
+            if not self.session:
+                self._build_window()
+            self._cookie_set(message.get("request"), message.get("cookie"))
+            return
+        if op not in ("load", "user-agent", "eval", "back", "forward", "reload", "stop", "handler", "script"):
+            self._reply_error(message.get("request"), "Unknown embedded browser operation")
+            return
+        if op in ("eval", "back", "forward", "reload", "stop") and page_id not in self.pages:
+            self._reply_error(message.get("request"), "The embedded page was closed", page_id)
             return
         page = self._page(page_id)
-        if op == "cookies-get":
-            self._cookies_get(message.get("request"))
-        elif op == "cookie-set":
-            self._cookie_set(message.get("request"), message.get("cookie"))
-        elif op == "load":
+        if op == "load":
             self._load(page, message)
         elif op == "user-agent":
             self._set_user_agent(page, message.get("agent"))
@@ -428,6 +458,7 @@ class WebBridge:
     def _load(self, page, message):
         url = message.get("url")
         if not _web_url(url):
+            self._event(page, "error", message="The embedded page URL is invalid.")
             return
         page.delegate = bool(message.get("delegate"))
         page.panel_title = message.get("panelTitle") if isinstance(message.get("panelTitle"), str) else ""
@@ -448,6 +479,7 @@ class WebBridge:
 
     def _eval(self, page, number, script):
         if not isinstance(script, str):
+            self._reply_error(number, "Invalid JavaScript request", page.id)
             return
 
         def done(view, result):
@@ -506,10 +538,12 @@ class WebBridge:
 
     def _cookie_set(self, number, cookie):
         if not isinstance(cookie, dict):
+            self._reply_error(number, "Invalid browser cookie")
             return
         name, value, domain = cookie.get("name"), cookie.get("value"), cookie.get("domain")
         path = cookie.get("path") or "/"
         if not all(isinstance(v, str) for v in (name, value, domain, path)) or not name or not domain:
+            self._reply_error(number, "Invalid browser cookie")
             return
         soup_cookie = self.Soup.Cookie.new(name, value, domain, path, -1)
         soup_cookie.set_secure(bool(cookie.get("secure")))

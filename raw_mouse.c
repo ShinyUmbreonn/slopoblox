@@ -105,9 +105,9 @@ int macoblox_raw_mouse_select(void *display, int enabled) {
     if (xi_opcode < 0) {
         int event, error, major = 2, minor = 1; /* 2.1: raw events also during grabs */
         if (!x_query_extension(display, "XInputExtension", &xi_opcode, &event, &error) ||
-            xi_query_version(display, &major, &minor) != 0 || major < 2) {
+            xi_query_version(display, &major, &minor) != 0 || major < 2 || (major == 2 && minor < 1)) {
             xi_opcode = -1;
-            log_line("[MacOBlox Input] the X server has no XInput 2, no raw mouse motion\n");
+            log_line("[MacOBlox Input] the X server has no XInput 2.1, no raw mouse motion\n");
             resolved = -1;
             return 0;
         }

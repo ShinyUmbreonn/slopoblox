@@ -67,6 +67,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.18" date="2026-10-04">
+      <description>
+        <p>Adds a welcome and first-time setup guide. Fixes raw mouse and camera freezes, restores mouse capture after focus changes, repairs Private Servers rendering crashes, and improves Zink context and shader compatibility. Reduces Darling file-close cleanup delays and keeps process cleanup within the selected app environment. A later pause after leaving games remains under investigation. Native Wayland and Zink remain experimental.</p>
+      </description>
+    </release>
     <release version="0.17" date="2026-10-03">
       <description>
         <p>Restores the standard GNOME interface. Adds an experimental Vulkan renderer through Mesa Zink and an optional MangoHud overlay for OpenGL and Vulkan. Improves cursor visibility during camera capture, contended locks, shader compatibility and persistent GPU caching. Fixes Linux builds failing because dsymutil is unavailable.</p>

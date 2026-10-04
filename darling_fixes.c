@@ -42,6 +42,10 @@ extern void macoblox_wait_end(int);
 struct darwin_timespec { long tv_sec; long tv_nsec; };
 extern int *__error(void);
 
+#include "ulock_compat.h"
+DYLD_INTERPOSE(macoblox_ulock_wait, __ulock_wait)
+DYLD_INTERPOSE(macoblox_ulock_wake, __ulock_wake)
+
 static long raw_nanosleep(const struct darwin_timespec *request, struct darwin_timespec *remaining) {
     long result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(35L /* Linux nanosleep */), "D"(request), "S"(remaining)
@@ -279,15 +283,10 @@ DYLD_INTERPOSE(macoblox_pthread_mutex_unlock, pthread_mutex_unlock)
  * that only reserves address space, pages are used as the stack grows.
  * Threads with a caller-provided stack are left alone: the stack is only as
  * large as the caller made it. */
-typedef struct { long opaque[8]; } darwin_pthread_attr_t; /* 64 bytes on x86_64 */
+#include "thread_stack.h" /* Darwin attributes are 64 bytes on x86_64. */
 extern int pthread_attr_init(darwin_pthread_attr_t *);
 extern int pthread_attr_destroy(darwin_pthread_attr_t *);
-extern int pthread_attr_setstacksize(darwin_pthread_attr_t *, unsigned long);
-extern int pthread_attr_getstacksize(const darwin_pthread_attr_t *, unsigned long *);
-extern int pthread_attr_getstackaddr(const darwin_pthread_attr_t *, void **);
 extern int pthread_create(void **, const darwin_pthread_attr_t *, void *(*)(void *), void *);
-
-#define MIN_THREAD_STACK (8UL << 20)
 
 static int macoblox_pthread_attr_setstacksize(darwin_pthread_attr_t *attr, unsigned long size) {
     void *address = 0;
@@ -309,11 +308,9 @@ static int macoblox_pthread_create(void **thread, const darwin_pthread_attr_t *a
         pthread_attr_destroy(&larger);
         return result;
     }
-    void *address = 0;
-    unsigned long size = 0;
-    if (pthread_attr_getstackaddr(attr, &address) == 0 && !address &&
-        pthread_attr_getstacksize(attr, &size) == 0 && size < MIN_THREAD_STACK)
-        pthread_attr_setstacksize((darwin_pthread_attr_t *)attr, MIN_THREAD_STACK);
+    darwin_pthread_attr_t larger;
+    if (macoblox_larger_stack_attributes(attr, &larger))
+        return pthread_create(thread, &larger, start, argument);
     return pthread_create(thread, attr, start, argument);
 }
 DYLD_INTERPOSE(macoblox_pthread_create, pthread_create)

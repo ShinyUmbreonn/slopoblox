@@ -3,7 +3,7 @@
  * Darling has no such entry, so Roblox assumed 64 MB of video memory, which
  * turned off MSAA (antialiasing) and other quality features whatever the
  * graphics level. Answer it with the host GPU's real VRAM, passed by the
- * launcher as MACOBLOX_VRAM_BYTES (read from sysfs), defaulting to 4 GB. */
+ * launcher as MACOBLOX_VRAM_BYTES, with a conservative fallback. */
 
 typedef const void *CFTypeRef;
 typedef const void *CFStringRef;
@@ -20,18 +20,32 @@ __attribute__((weak_import)) extern unsigned int CGDisplayIOServicePort(unsigned
 __attribute__((weak_import)) extern const void *IOServiceMatching(const char *);
 __attribute__((weak_import)) extern CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t, CFStringRef,
                                                                                CFAllocatorRef, IOOptionBits);
+__attribute__((weak_import)) extern int IOObjectRelease(unsigned int);
 
+#define FAKE_DISPLAY_SERVICE 0x4d4f4231u
+#define MACOBLOX_IO_BAD_ARGUMENT ((int)0xe00002c2u)
+#define MACOBLOX_IO_NO_MEMORY ((int)0xe00002bdu)
+
+#ifndef DYLD_INTERPOSE
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
     _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = \
         {(const void *)(unsigned long)&_replacement, (const void *)(unsigned long)&_replacee};
+#endif
 
 static long long vram_bytes(void) {
     const char *text = getenv("MACOBLOX_VRAM_BYTES");
+    const long long fallback = 512LL << 20;
+    if (!text || !text[0]) return fallback;
     long long value = 0;
-    for (const char *c = text; c && *c >= '0' && *c <= '9'; c++)
-        value = value * 10 + (*c - '0');
-    return value >= (64LL << 20) ? value : (4LL << 30);
+    unsigned int digits = 0;
+    for (const char *c = text; *c; c++) {
+        if (*c < '0' || *c > '9' || ++digits > 19) return fallback;
+        int digit = *c - '0';
+        if (value > (9223372036854775807LL - digit) / 10) return fallback;
+        value = value * 10 + digit;
+    }
+    return value >= (64LL << 20) ? value : fallback;
 }
 
 static int key_is(CFStringRef key, const char *expected) {
@@ -56,7 +70,7 @@ static void trace(const char *what, const char *detail, unsigned long value) {
         return;
     char line[200];
     int length = snprintf(line, sizeof line, "[MacOBlox IOKit] %s %s -> 0x%lx\n", what, detail ? detail : "", value);
-    if (length > 0) write(2, line, (unsigned long)length);
+    if (length > 0) write(2, line, (unsigned long)length < sizeof line ? (unsigned long)length : sizeof line - 1);
 }
 
 static CFTypeRef macoblox_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
@@ -70,6 +84,10 @@ static CFTypeRef macoblox_IORegistryEntryCreateCFProperty(io_registry_entry_t en
         long long bytes = vram_bytes();
         return CFNumberCreate(allocator, 4 /* kCFNumberSInt64Type */, &bytes);
     }
+    /* This is a stand-in identifier, not a Mach port. Passing it through to
+     * IOKit (including for an unknown key) starts another blocking MIG call. */
+    if (entry == FAKE_DISPLAY_SERVICE || !IORegistryEntryCreateCFProperty)
+        return 0;
     return IORegistryEntryCreateCFProperty(entry, key, allocator, options);
 }
 DYLD_INTERPOSE(macoblox_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty)
@@ -112,18 +130,22 @@ static macoblox_size macoblox_CGDisplayScreenSize(unsigned int display) {
 }
 DYLD_INTERPOSE(macoblox_CGDisplayScreenSize, CGDisplayScreenSize)
 
-/* Darling's CGDisplayIOServicePort returns 0, and Roblox then never asks for
- * IOFBMemorySize. Hand out a stand-in entry; the property hook above answers
- * IOFBMemorySize for it, other IOKit calls on it simply fail. */
-#define FAKE_DISPLAY_SERVICE 0x4d4f4231u
+/* The Linux display has no macOS framebuffer registry service. Darling's
+ * native lookup can wait indefinitely for an IOKit reply on Wayland (verified
+ * in the main thread's stack). Never issue that lookup for a host display. */
 static unsigned int macoblox_CGDisplayIOServicePort(unsigned int display) {
-    unsigned int port = CGDisplayIOServicePort(display);
-    if (!port)
-        port = FAKE_DISPLAY_SERVICE;
+    (void)display;
+    unsigned int port = FAKE_DISPLAY_SERVICE;
     trace("CGDisplayIOServicePort", 0, port);
     return port;
 }
 DYLD_INTERPOSE(macoblox_CGDisplayIOServicePort, CGDisplayIOServicePort)
+
+static int macoblox_IOObjectRelease(unsigned int object) {
+    if (object == FAKE_DISPLAY_SERVICE) return 0;
+    return IOObjectRelease ? IOObjectRelease(object) : MACOBLOX_IO_BAD_ARGUMENT;
+}
+DYLD_INTERPOSE(macoblox_IOObjectRelease, IOObjectRelease)
 
 static const void *macoblox_IOServiceMatching(const char *name) {
     const void *result = IOServiceMatching(name);
@@ -149,30 +171,42 @@ __attribute__((weak_import)) extern int IORegistryEntryGetParentEntry(io_registr
 static int macoblox_IORegistryEntryCreateCFProperties(io_registry_entry_t entry, CFMutableDictionaryRef *properties,
                                                       CFAllocatorRef allocator, IOOptionBits options) {
     trace("IORegistryEntryCreateCFProperties", 0, entry);
-    if (entry == FAKE_DISPLAY_SERVICE && properties) {
+    if (entry == FAKE_DISPLAY_SERVICE) {
+        if (!properties) return MACOBLOX_IO_BAD_ARGUMENT;
+        *properties = 0;
         CFMutableDictionaryRef dictionary = CFDictionaryCreateMutable(
             allocator, 0, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks);
+        if (!dictionary) return MACOBLOX_IO_NO_MEMORY;
         long long bytes = vram_bytes();
         CFTypeRef number = CFNumberCreate(allocator, 4 /* kCFNumberSInt64Type */, &bytes);
         CFStringRef key = CFStringCreateWithCString(allocator, "IOFBMemorySize", 0x08000100);
+        if (!number || !key) {
+            if (number) CFRelease(number);
+            if (key) CFRelease(key);
+            CFRelease(dictionary);
+            return MACOBLOX_IO_NO_MEMORY;
+        }
         CFDictionarySetValue(dictionary, key, number);
         CFRelease(key);
         CFRelease(number);
         *properties = dictionary;
         return 0;
     }
-    return IORegistryEntryCreateCFProperties(entry, properties, allocator, options);
+    return IORegistryEntryCreateCFProperties
+        ? IORegistryEntryCreateCFProperties(entry, properties, allocator, options) : MACOBLOX_IO_BAD_ARGUMENT;
 }
 DYLD_INTERPOSE(macoblox_IORegistryEntryCreateCFProperties, IORegistryEntryCreateCFProperties)
 
 static int macoblox_IORegistryEntryGetParentEntry(io_registry_entry_t entry, const char *plane,
                                                   io_registry_entry_t *parent) {
     trace("IORegistryEntryGetParentEntry", plane, entry);
-    if (entry == FAKE_DISPLAY_SERVICE && parent) {
+    if (entry == FAKE_DISPLAY_SERVICE) {
+        if (!parent) return MACOBLOX_IO_BAD_ARGUMENT;
         *parent = FAKE_DISPLAY_SERVICE;
         return 0;
     }
-    return IORegistryEntryGetParentEntry(entry, plane, parent);
+    return IORegistryEntryGetParentEntry
+        ? IORegistryEntryGetParentEntry(entry, plane, parent) : MACOBLOX_IO_BAD_ARGUMENT;
 }
 DYLD_INTERPOSE(macoblox_IORegistryEntryGetParentEntry, IORegistryEntryGetParentEntry)
 
