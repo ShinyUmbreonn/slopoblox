@@ -426,7 +426,7 @@ validate_tools() {
 import gi
 for namespace, version in [('Gtk', '4.0'), ('Adw', '1'), ('WebKit', '6.0')]:
     gi.require_version(namespace, version)
-    __import__('gi.repository', fromlist=[namespace]).__getattr__(namespace)
+from gi.repository import Gtk, Adw, WebKit
 PYTHON
 }
 
