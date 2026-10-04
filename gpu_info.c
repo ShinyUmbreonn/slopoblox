@@ -100,7 +100,9 @@ DYLD_INTERPOSE(macoblox_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCF
  * Fedora KDE user's client into an endless updateSurfaceLuaApp loop until
  * the stack overflowed. Answer the size at 96 DPI of the display's bounds,
  * of the main display for an unknown ID, or of 1920x1080 before AppKit has
- * screens. Unknown IDs get the main display's bounds too. */
+ * screens. MACOBLOX_DPI_SCALE multiplies the inferred DPI without changing
+ * rendering or input coordinates. Unknown IDs get the main display's bounds
+ * too. */
 typedef struct { double x, y, width, height; } macoblox_rect; /* CGRect */
 typedef struct { double width, height; } macoblox_size;       /* CGSize */
 __attribute__((weak_import)) extern macoblox_rect CGDisplayBounds(unsigned int);
@@ -121,11 +123,43 @@ static macoblox_rect macoblox_CGDisplayBounds(unsigned int display) {
 }
 DYLD_INTERPOSE(macoblox_CGDisplayBounds, CGDisplayBounds)
 
+double macoblox_dpi_scale(void) {
+    const char *text = getenv("MACOBLOX_DPI_SCALE");
+    if (!text || text[0] < '0' || text[0] > '9') return 1.0;
+    unsigned int count = 0, whole = 0;
+    while (*text >= '0' && *text <= '9') {
+        if (++count > 32) return 1.0;
+        whole = whole * 10 + (unsigned int)(*text++ - '0');
+        if (whole > 4) return 1.0;
+    }
+    if (whole < 1) return 1.0;
+    double fraction = 0.0, place = 0.1;
+    if (*text == '.') {
+        if (++count > 32) return 1.0;
+        ++text;
+        if (*text < '0' || *text > '9') return 1.0;
+        while (*text >= '0' && *text <= '9') {
+            if (++count > 32) return 1.0;
+            unsigned int digit = (unsigned int)(*text++ - '0');
+            // Reject even a fraction too small to affect a rounded double4.
+            if (whole == 4 && digit) return 1.0;
+            fraction += digit * place;
+            place *= 0.1;
+        }
+    }
+    if (*text) return 1.0;
+    // The launcher exports dot decimals regardless of the guest's locale.
+    return (double)whole + fraction;
+}
+
 static macoblox_size macoblox_CGDisplayScreenSize(unsigned int display) {
     macoblox_rect bounds = macoblox_CGDisplayBounds(display);
-    double width = bounds.width > 0 ? bounds.width : 1920;
-    double height = bounds.height > 0 ? bounds.height : 1080;
-    macoblox_size size = {width * 25.4 / 96.0, height * 25.4 / 96.0};
+    double width = __builtin_isfinite(bounds.width) && bounds.width > 0 ? bounds.width : 1920;
+    double height = __builtin_isfinite(bounds.height) && bounds.height > 0 ? bounds.height : 1080;
+    double millimetres_per_pixel = 25.4 / (96.0 * macoblox_dpi_scale());
+    macoblox_size size = {width * millimetres_per_pixel, height * millimetres_per_pixel};
+    if (!(size.width > 0)) size.width = 1920 * millimetres_per_pixel;
+    if (!(size.height > 0)) size.height = 1080 * millimetres_per_pixel;
     return size;
 }
 DYLD_INTERPOSE(macoblox_CGDisplayScreenSize, CGDisplayScreenSize)

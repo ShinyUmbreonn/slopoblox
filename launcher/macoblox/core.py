@@ -85,6 +85,7 @@ DEFAULT_SETTINGS = {
     "auto_patch_throttle": True,
     "raw_mouse": True,
     "display_backend": "x11",
+    "dpi_scale": 1.0,
     "renderer": "opengl",
     "mangohud": False,
     "hide_menu_bar": False,
@@ -142,6 +143,10 @@ def load_settings():
     if not isinstance(stored, dict):
         return settings
     for key, value in stored.items():
+        if key == "dpi_scale":
+            from .display import validated_dpi_scale
+            settings[key] = validated_dpi_scale(value)
+            continue
         default = DEFAULT_SETTINGS.get(key)
         if isinstance(default, bool):
             valid = isinstance(value, bool)
@@ -1660,6 +1665,7 @@ class RobloxSession:
         variables.extend(f"{name}={value}" for name, value in
                          graphics.renderer_environment(self.settings.get("renderer", "opengl")).items())
         from . import display
+        variables.append(f"MACOBLOX_DPI_SCALE={display.validated_dpi_scale(self.settings.get('dpi_scale', 1.0)):.3f}")
         variables.extend(f"{name}={value}" for name, value in
                          display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so").items())
         # Host graphics libraries see the guest environment after exec.

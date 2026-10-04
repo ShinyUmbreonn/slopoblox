@@ -1,7 +1,10 @@
 """Run: PYTHONPATH=launcher python3 -m unittest discover -s tests -p '*_test.py'."""
 import json
+import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from macoblox import core, graphics
@@ -149,6 +152,73 @@ class GraphicsTests(unittest.TestCase):
     def test_default_preserves_host_driver_selection(self):
         self.assertEqual(graphics.renderer_environment("opengl"), {})
         self.assertEqual(core.DEFAULT_SETTINGS["renderer"], "opengl")
+
+    def test_wayland_nvidia_adds_egl_icd_and_reuses_atomic_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "nvidia_icd.json"
+            egl = root / "libEGL_nvidia.so.0"
+            egl.touch()
+            original = {"file_format_version": "1.0.1", "ICD":
+                        {"library_path": str(root / "libGLX_nvidia.so.0"), "api_version": "1.4.351"}}
+            source.write_text(json.dumps(original))
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": str(root / "cache")}, clear=True), \
+                    patch.object(graphics.Path, "glob", autospec=True,
+                                 side_effect=lambda path, pattern: [source] if pattern == "*.json" else []):
+                first = graphics.wayland_vulkan_environment()
+                target = Path(first["VK_ADD_DRIVER_FILES"])
+                before = target.stat().st_mtime_ns
+                self.assertEqual(graphics.wayland_vulkan_environment(), first)
+                self.assertEqual(target.stat().st_mtime_ns, before)
+            self.assertEqual(json.loads(source.read_text()), original)
+            self.assertEqual(json.loads(target.read_text()),
+                             {**original, "ICD": {**original["ICD"], "library_path": str(egl.resolve())}})
+            self.assertTrue(target.is_absolute())
+            self.assertEqual(target.name, source.name)
+            self.assertEqual(list(target.parent.glob(".nvidia-egl-*")), [])
+            self.assertNotIn("VK_DRIVER_FILES", first)
+            self.assertNotIn("VK_ICD_FILENAMES", first)
+
+    def test_wayland_vulkan_keeps_all_explicit_driver_overrides(self):
+        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES"):
+            for value in ("/custom/driver.json", ""):
+                with self.subTest(name=name, value=value), \
+                        patch.dict(os.environ, {name: value}, clear=True), \
+                        patch.object(graphics.Path, "glob") as glob:
+                    self.assertEqual(graphics.wayland_vulkan_environment(), {name: value})
+                    glob.assert_not_called()
+
+    def test_wayland_nvidia_finds_xdg_manifest_and_preserves_driver_filters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "config/vulkan/icd.d/custom_nvidia.json"
+            source.parent.mkdir(parents=True)
+            egl = root / "libEGL_nvidia.so.0"
+            egl.touch()
+            source.write_text(json.dumps({"ICD": {"library_path": str(root / "libGLX_nvidia.so.0")}}))
+            original_glob = Path.glob
+            values = {"XDG_CONFIG_HOME": str(root / "config"), "XDG_CACHE_HOME": str(root / "cache"),
+                      "VK_LOADER_DRIVERS_SELECT": source.name, "VK_LOADER_DRIVERS_DISABLE": "*intel*"}
+            with patch.dict(os.environ, values, clear=True), \
+                    patch.object(graphics.Path, "glob", autospec=True,
+                                 side_effect=lambda path, pattern: original_glob(path, pattern) if path.is_relative_to(root) else []):
+                env = graphics.wayland_vulkan_environment()
+            self.assertEqual(Path(env["VK_ADD_DRIVER_FILES"]).name, source.name)
+            self.assertEqual(env["VK_LOADER_DRIVERS_SELECT"], source.name)
+            self.assertEqual(env["VK_LOADER_DRIVERS_DISABLE"], "*intel*")
+
+    def test_wayland_vulkan_ignores_non_glx_or_unusable_nvidia_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "nvidia_icd.json"
+            cases = ("bad json", '[]', '{"ICD": {"library_path": null}}',
+                     '{"ICD": {"library_path": "libEGL_nvidia.so.0"}}',
+                     json.dumps({"ICD": {"library_path": str(Path(directory) / "libGLX_nvidia.so.0")}}))
+            for contents in cases:
+                source.write_text(contents)
+                with self.subTest(contents=contents), patch.dict(os.environ, {}, clear=True), \
+                        patch.object(graphics.Path, "glob", autospec=True,
+                                     side_effect=lambda path, pattern: [source] if pattern == "*.json" else []):
+                    self.assertEqual(graphics.wayland_vulkan_environment(), {})
 
     def test_vulkan_selects_mesa_egl_and_keeps_metal_disabled(self):
         with patch.object(graphics.Path, "is_file", return_value=True):

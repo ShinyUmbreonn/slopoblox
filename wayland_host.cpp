@@ -33,8 +33,18 @@ struct Window {
     wl_buffer *shown_cursor=nullptr;
     int cursor_x=0,cursor_y=0;
     bool cursor_mapped=false;
+    std::vector<unsigned> drawable_stack;
+};
+struct Subwindow {
+    unsigned parent;
+    wl_surface *surface;
+    wl_subsurface *role;
+    wl_egl_window *egl_window;
+    int x,y,width,height;
 };
 std::unordered_map<unsigned, Window> windows;
+std::unordered_map<unsigned, Subwindow> subwindows;
+unsigned next_subwindow=1;
 std::mutex queue_mutex;
 std::deque<std::function<void()>> commands;
 std::deque<macoblox_wayland_event> events;
@@ -56,6 +66,15 @@ int cursor_hot_x,cursor_hot_y,cursor_width,cursor_height;
 struct OwnedBuffer {wl_buffer *buffer;bool released=false,submitted=false;};
 std::vector<std::unique_ptr<OwnedBuffer>> owned_buffers;
 
+void cursor_above_children(Window &window) {
+    if(!window.cursor_subsurface || window.drawable_stack.empty())return;
+    /* A newly created/re-shown child is initially above every sibling. Keep
+     * the locked pointer visible above the view's rendered surface. */
+    auto top=subwindows.find(window.drawable_stack.back());
+    if(top!=subwindows.end() && top->second.role)
+        wl_subsurface_place_above(window.cursor_subsurface,top->second.surface);
+}
+
 void update_cursor(Window &window) {
     bool visible=window.capture && window.focused && cursor_visible && cursor_buffer;
     if(!window.cursor_surface && visible && subcompositor && compositor) {
@@ -63,6 +82,7 @@ void update_cursor(Window &window) {
         window.cursor_subsurface=wl_subcompositor_get_subsurface(subcompositor,window.cursor_surface,window.wl_surface_handle);
         wl_subsurface_set_desync(window.cursor_subsurface);
         auto region=wl_compositor_create_region(compositor);wl_surface_set_input_region(window.cursor_surface,region);wl_region_destroy(region);
+        cursor_above_children(window);
     }
     if(!window.cursor_surface)return;
     int x=(int)window.anchor_x-cursor_hot_x,y=(int)window.anchor_y-cursor_hot_y;
@@ -268,7 +288,9 @@ unsigned create_window(int width,int height,bool bootstrap=false) {
     native_display=info.info.wl.display;
     auto egl_window=wl_egl_window_create(info.info.wl.surface,width,height);
     if(!egl_window){failure="wl_egl_window_create failed";SDL_DestroyWindow(window);return 0;}
-    unsigned id=SDL_GetWindowID(window);windows.emplace(id,Window{window,egl_window});
+    unsigned id=SDL_GetWindowID(window);Window native_window{};
+    native_window.window=window;native_window.surface=egl_window;
+    windows.emplace(id,std::move(native_window));
     windows.at(id).wl_surface_handle=info.info.wl.surface;
     if(!bootstrap)map_initial_frame(info.info.wl.surface,width,height);
     std::fprintf(stderr,"[MacOBlox Wayland] Created window %u (%dx%d)\n",id,width,height);
@@ -277,6 +299,102 @@ unsigned create_window(int width,int height,bool bootstrap=false) {
 void *display(){return native_display;}
 unsigned create(int width,int height){return sync([=]{return create_window(width,height);});}
 void *surface(unsigned id){return sync([=]() -> void * {auto found=windows.find(id);return found==windows.end()?nullptr:found->second.surface;});}
+bool valid_subwindow_frame(int x,int y,int width,int height) {
+    return x>=-32768 && x<=32768 && y>=-32768 && y<=32768 && width>0 && width<=16384 && height>0 && height<=16384;
+}
+bool show_subwindow(unsigned id,Subwindow &child) {
+    auto parent=windows.find(child.parent);
+    if(parent==windows.end())return false;
+    if(!child.role) {
+        child.role=wl_subcompositor_get_subsurface(subcompositor,child.surface,parent->second.wl_surface_handle);
+        if(!child.role){failure="wl_subcompositor_get_subsurface failed";return false;}
+        /* Render threads commit their own buffers without waiting for the
+         * AppKit/SDL parent to repaint on every frame. Position and stacking
+         * still need the parent commit below. */
+        wl_subsurface_set_desync(child.role);
+        wl_subsurface_set_position(child.role,child.x,child.y);
+        parent->second.drawable_stack.push_back(id);
+        cursor_above_children(parent->second);
+        wl_surface_commit(parent->second.wl_surface_handle);
+        wl_display_flush((wl_display *)native_display);
+    }
+    return true;
+}
+unsigned create_subwindow(unsigned parent_id,int x,int y,int width,int height) {
+    return sync([=]() -> unsigned {
+        if(!valid_subwindow_frame(x,y,width,height) || !windows.count(parent_id)) {failure="Invalid native Wayland view frame or parent";return 0;}
+        if(!compositor || !subcompositor){failure="The compositor does not provide Wayland sub-surfaces";return 0;}
+        auto child_surface=wl_compositor_create_surface(compositor);
+        if(!child_surface){failure="wl_compositor_create_surface failed";return 0;}
+        /* SDL owns input on the toplevel. Without an empty child input region
+         * the compositor routes pointer events to a surface SDL cannot map
+         * back to a window, dropping mouse movement and button presses. */
+        auto region=wl_compositor_create_region(compositor);
+        if(!region){wl_surface_destroy(child_surface);failure="wl_compositor_create_region failed";return 0;}
+        wl_surface_set_input_region(child_surface,region);wl_region_destroy(region);
+        wl_surface_set_buffer_scale(child_surface,1);
+        auto egl_window=wl_egl_window_create(child_surface,width,height);
+        if(!egl_window){wl_surface_destroy(child_surface);failure="wl_egl_window_create failed for native Wayland view";return 0;}
+        unsigned id=next_subwindow++;
+        if(!id || subwindows.count(id)){wl_egl_window_destroy(egl_window);wl_surface_destroy(child_surface);failure="Native Wayland view handles exhausted";return 0;}
+        auto inserted=subwindows.emplace(id,Subwindow{parent_id,child_surface,nullptr,egl_window,x,y,width,height});
+        if(!show_subwindow(id,inserted.first->second)) {
+            wl_egl_window_destroy(egl_window);wl_surface_destroy(child_surface);subwindows.erase(id);return 0;
+        }
+        return id;
+    });
+}
+void *subwindow_surface(unsigned id) {
+    return sync([=]() -> void * {auto found=subwindows.find(id);return found==subwindows.end()?nullptr:found->second.egl_window;});
+}
+void subwindow_frame(unsigned id,int x,int y,int width,int height) {
+    sync([=]{
+        auto found=subwindows.find(id);if(found==subwindows.end() || !valid_subwindow_frame(x,y,width,height))return;
+        auto &child=found->second;
+        if(child.width!=width || child.height!=height){wl_egl_window_resize(child.egl_window,width,height,0,0);child.width=width;child.height=height;}
+        if(child.x==x && child.y==y)return;
+        child.x=x;child.y=y;
+        auto parent=windows.find(child.parent);
+        if(child.role && parent!=windows.end()) {
+            wl_subsurface_set_position(child.role,x,y);wl_surface_commit(parent->second.wl_surface_handle);
+            wl_display_flush((wl_display *)native_display);
+        }
+    });
+}
+void subwindow_visible(unsigned id,int visible) {
+    sync([=]{
+        auto found=subwindows.find(id);if(found==subwindows.end())return;auto &child=found->second;
+        if(visible){show_subwindow(id,child);return;}
+        if(child.role) {
+            /* Destroying the role unmaps immediately and keeps the native
+             * drawable alive. A NULL attach alone would be undone by the next
+             * EGL swap from a render thread. Wayland permits giving this same
+             * sub-surface role again when the view is shown. */
+            wl_subsurface_destroy(child.role);child.role=nullptr;
+            auto parent=windows.find(child.parent);
+            if(parent!=windows.end()) {
+                auto &stack=parent->second.drawable_stack;
+                stack.erase(std::remove(stack.begin(),stack.end(),id),stack.end());
+            }
+            wl_display_flush((wl_display *)native_display);
+        }
+    });
+}
+void destroy_subwindow(unsigned id) {
+    sync([=]{
+        auto found=subwindows.find(id);if(found==subwindows.end())return;auto &child=found->second;
+        /* AppKit releases the CGSubWindow after CGLDestroyWindow has released
+         * its EGLSurface. Never reuse a parent's native EGL window. */
+        if(child.role)wl_subsurface_destroy(child.role);
+        auto parent=windows.find(child.parent);
+        if(parent!=windows.end()) {
+            auto &stack=parent->second.drawable_stack;
+            stack.erase(std::remove(stack.begin(),stack.end(),id),stack.end());
+        }
+        wl_egl_window_destroy(child.egl_window);wl_surface_destroy(child.surface);subwindows.erase(found);
+        wl_display_flush((wl_display *)native_display);
+    });
+}
 void action(unsigned id,int operation,double x,double y,const char *text) {
     std::string copy=text?text:"";
     enqueue([=]{
@@ -301,6 +419,9 @@ void action(unsigned id,int operation,double x,double y,const char *text) {
             if(window.capture)SDL_SetRelativeMouseMode(SDL_FALSE);
             if(window.cursor_subsurface)wl_subsurface_destroy(window.cursor_subsurface);
             if(window.cursor_surface)wl_surface_destroy(window.cursor_surface);
+            /* Closing the toplevel unmaps children, but their EGL drawables
+             * remain owned by AppKit until each CGSubWindow is released. */
+            for(auto &entry:subwindows)if(entry.second.parent==id)entry.second.parent=0;
             wl_egl_window_destroy(window.surface);SDL_DestroyWindow(window.window);windows.erase(found);break;
         }
     });
@@ -345,7 +466,8 @@ const char *clipboard(const char *text) {
     return result.c_str();
 }
 const char *error(){return failure.c_str();}
-const macoblox_wayland_api api={MACOBLOX_WAYLAND_ABI,display,create,surface,action,poll,screen,cursor,clipboard,error};
+const macoblox_wayland_api api={MACOBLOX_WAYLAND_ABI,display,create,surface,action,poll,screen,cursor,clipboard,error,
+                              create_subwindow,subwindow_surface,subwindow_frame,subwindow_visible,destroy_subwindow};
 void shutdown() {
     stopping.store(true);
     if(ui.joinable()) {
@@ -386,6 +508,11 @@ extern "C" const macoblox_wayland_api *macoblox_wayland_host_api() {
                 /* A release makes old cursor images safe to destroy. */
                 owned_buffers.erase(std::remove_if(owned_buffers.begin(),owned_buffers.end(),[](auto &buffer){if((buffer->released || !buffer->submitted) && buffer->buffer!=cursor_buffer){wl_buffer_destroy(buffer->buffer);return true;}return false;}),owned_buffers.end());
             }
+            for(auto &entry:subwindows) {
+                if(entry.second.role)wl_subsurface_destroy(entry.second.role);
+                wl_egl_window_destroy(entry.second.egl_window);wl_surface_destroy(entry.second.surface);
+            }
+            subwindows.clear();
             for(auto &entry:windows) {
                 if(entry.second.cursor_subsurface)wl_subsurface_destroy(entry.second.cursor_subsurface);
                 if(entry.second.cursor_surface)wl_surface_destroy(entry.second.cursor_surface);

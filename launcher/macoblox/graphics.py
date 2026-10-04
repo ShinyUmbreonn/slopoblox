@@ -4,12 +4,14 @@ Roblox still uses its macOS OpenGL renderer. Zink translates that renderer
 to Vulkan on Linux; Darling's incomplete Metal path stays disabled.
 """
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import subprocess
 import sys
+import tempfile
 import threading
 
 RENDERERS = ("opengl", "vulkan")
@@ -17,8 +19,10 @@ _dependency_lock = threading.Lock()
 
 
 def mesa_egl_manifest():
-    return next((Path(root) / "glvnd/egl_vendor.d/50_mesa.json"
-                 for root in ("/usr/share", "/usr/local/share", "/etc", "/app/share")
+    # Inside Flatpak, Mesa comes from the GL extension (GL/default), not /usr/share.
+    roots = ["/usr/share", "/usr/local/share", "/etc", "/app/share"]
+    roots += [str(path) for path in sorted(Path("/usr/lib/x86_64-linux-gnu/GL").glob("*/share"))]
+    return next((Path(root) / "glvnd/egl_vendor.d/50_mesa.json" for root in roots
                  if (Path(root) / "glvnd/egl_vendor.d/50_mesa.json").is_file()), None)
 
 
@@ -172,11 +176,94 @@ def renderer_environment(renderer):
     }
 
 
+def wayland_vulkan_environment():
+    """Add NVIDIA's X11-independent ICD without replacing other drivers."""
+    filters = {name: os.environ[name] for name in
+               ("VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE")
+               if name in os.environ}
+    overrides = {name: os.environ[name] for name in
+                 ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES")
+                 if name in os.environ}
+    if overrides:
+        return {**filters, **overrides}
+    # NVIDIA also exposes Vulkan through its EGL library. Its default GLX
+    # ICD can fail without DISPLAY, even when /dev/dri is fully accessible.
+    # Use an additional manifest: the loader keeps its ordinary ICD search,
+    # including AMD/Intel drivers on machines with more than one GPU.
+    roots = [Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))]
+    roots.extend(Path(root) for root in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":") if root)
+    roots.extend(Path(root) for root in ("/usr/local/etc", "/etc"))
+    roots.append(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")))
+    roots.extend(Path(root) for root in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if root)
+    roots.append(Path("/app/share"))
+    roots.extend(path / "share" for path in
+                 sorted(Path("/usr/lib/x86_64-linux-gnu/GL").glob("*")))
+    manifest = None
+    for root in roots:
+        for path in sorted((root / "vulkan/icd.d").glob("*.json")):
+            try:
+                candidate = json.loads(path.read_text())
+                library = candidate["ICD"]["library_path"]
+                if not isinstance(library, str) or Path(library).name != "libGLX_nvidia.so.0":
+                    continue
+                if candidate["ICD"].get("library_arch") == "32":
+                    continue
+                replacement = library.replace("libGLX_nvidia.so.0", "libEGL_nvidia.so.0")
+                if "/" in replacement:
+                    egl = Path(replacement)
+                    egl = egl if egl.is_absolute() else path.parent / egl
+                else:
+                    libraries = [Path(root) for root in os.environ.get("LD_LIBRARY_PATH", "").split(":") if root]
+                    libraries.extend(Path(root) for root in
+                                     ("/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu",
+                                      "/usr/lib/x86_64-linux-gnu/nvidia/current", "/usr/lib/nvidia/current",
+                                      "/usr/local/lib", "/app/lib", "/app/lib/x86_64-linux-gnu"))
+                    libraries.extend(root.parent / "lib" for root in roots if root.name == "share")
+                    egl = next((root / replacement for root in libraries
+                                if (root / replacement).is_file()), None)
+                if egl is None or not egl.is_file():
+                    continue
+                candidate["ICD"]["library_path"] = str(egl.resolve())
+                manifest = candidate
+                basename = path.name
+                break
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        if manifest is not None:
+            break
+    if manifest is None:
+        return filters
+    payload = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "macoblox/vulkan"
+    # Preserve the source basename: Vulkan loader select/disable filters
+    # match manifest names, so the extra ICD obeys the same user filters.
+    target = (cache / f"nvidia-egl-{digest}" / basename).absolute()
+    temporary = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or target.read_text() != payload:
+            with tempfile.NamedTemporaryFile(mode="w", dir=target.parent, prefix=".nvidia-egl-", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(payload)
+            temporary.replace(target)
+    except OSError as error:
+        raise RuntimeError("Native Wayland Vulkan could not prepare its NVIDIA driver cache. Select X11 in Settings.") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return {**filters, "VK_ADD_DRIVER_FILES": str(target)}
+
+
 def validate_vulkan(environment):
     """Keep driver initialization (and a possible driver crash) out of GTK."""
+    # LD_PRELOAD holds Darling's no-root library (Flatpak). It is meant for
+    # darling/darlingserver only and crashes this plain host process once
+    # Mesa and the GPU driver load, so the probe runs without it.
+    probe_environment = {name: value for name, value in environment.items() if name != "LD_PRELOAD"}
     try:
         result = subprocess.run([sys.executable, str(Path(__file__)), "--probe"],
-                                env=environment, capture_output=True, text=True, timeout=20)
+                                env=probe_environment, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError("Vulkan (Zink) could not initialize. Select OpenGL in Settings.") from error
     try:
@@ -185,7 +272,11 @@ def validate_vulkan(environment):
         data = {}
     renderer = data.get("renderer", "")
     if result.returncode or not hardware_zink(renderer):
-        reason = data.get("error") or renderer or "no working hardware Zink context"
+        reason = data.get("error") or renderer
+        if not reason:
+            # Show why the probe died instead of a generic message.
+            tail = "\n".join(part.strip() for part in (result.stderr or "", result.stdout or "") if part.strip())[-600:]
+            reason = f"probe exited with code {result.returncode} and no usable output" + (f":\n{tail}" if tail else "")
         raise RuntimeError(f"Vulkan (Zink) is unavailable: {reason}. Select OpenGL in Settings.")
     return renderer
 
@@ -235,6 +326,7 @@ def _probe():
     get_proc = function(egl, "eglGetProcAddress", ptr, ctypes.c_char_p)
     destroy_context = function(egl, "eglDestroyContext", integer, ptr, ptr)
     destroy_surface = function(egl, "eglDestroySurface", integer, ptr, ptr)
+    query_surface = function(egl, "eglQuerySurface", integer, ptr, ptr, integer, ptr)
     terminate = function(egl, "eglTerminate", integer, ptr)
     wayland_window = None
     if os.environ.get("MACOBLOX_WAYLAND") == "1":
@@ -246,7 +338,7 @@ def _probe():
     native = wayland_window.native if wayland_window else open_display(None)
     if not native:
         raise RuntimeError("X11 display is unavailable")
-    display = surface = context = None
+    display = surface = context = secondary_surface = None
     window = 0
     initialized = False
     try:
@@ -284,6 +376,17 @@ def _probe():
         surface = create_surface(display, config, window, None)
         if not surface:
             raise RuntimeError("could not create an EGL window surface for the screen visual")
+        secondary_drawable = None
+        if wayland_window:
+            # AppKit's main GL view and CALayer renderer own concurrent native
+            # drawables. A parent-only probe missed the old shared-window bug.
+            secondary_drawable = wayland_window.create_drawable(0, 0, 16, 16)
+            secondary_native = wayland_window.api.subwindow_surface(secondary_drawable)
+            if not secondary_native or secondary_native == window:
+                raise RuntimeError("Native Wayland views must have separate EGL drawables")
+            secondary_surface = create_surface(display, config, secondary_native, None)
+            if not secondary_surface:
+                raise RuntimeError("could not create concurrent Native Wayland EGL view surfaces")
 
         def gl_function(name, result, *arguments):
             address = get_proc(name.encode())
@@ -304,14 +407,14 @@ def _probe():
         core_attrs = (integer * 7)(0x3098, 4, 0x30FB, 1, 0x30FD, 1, 0x3038)
         renderer = ""
 
-        def present():
+        def present(drawable=None):
             clear_color(0.25, 0.5, 0.75, 1.0)
             clear(0x4000)  # GL_COLOR_BUFFER_BIT
             pixel = (ctypes.c_ubyte * 4)()
             read_pixels(0, 0, 1, 1, 0x1908, 0x1401, pixel)  # RGBA/UNSIGNED_BYTE
             if get_error() or any(abs(pixel[i] - expected) > 2 for i, expected in enumerate((64, 128, 191))):
                 raise RuntimeError("EGL window rendering/readback failed")
-            if not swap(display, surface):
+            if not swap(display, drawable or surface):
                 raise RuntimeError("EGL window presentation failed")
 
         for attributes in (None, core_attrs):
@@ -358,7 +461,32 @@ def _probe():
         if not bind(0x30A2) or not make_current(display, surface, surface, context):
             raise RuntimeError("main-thread core context could not be restored")
         delete_textures(1, ctypes.byref(texture))
-        return {"renderer": renderer, "window_presentation": True, "shared_thread_context": True}
+        if wayland_window:
+            if not make_current(display, secondary_surface, secondary_surface, context):
+                raise RuntimeError("core context could not switch to the second Native Wayland view")
+            present(secondary_surface)
+            wayland_window.api.subwindow_frame(secondary_drawable, 2, 3, 32, 24)
+            present(secondary_surface)
+            width, height = integer(), integer()
+            if (not query_surface(display, secondary_surface, 0x3057, ctypes.byref(width)) or
+                    not query_surface(display, secondary_surface, 0x3056, ctypes.byref(height)) or
+                    (width.value, height.value) != (32, 24)):
+                raise RuntimeError("Native Wayland EGL view resize failed")
+            wayland_window.api.subwindow_visible(secondary_drawable, 0)
+            wayland_window.api.subwindow_visible(secondary_drawable, 1)
+            present(secondary_surface)
+            if not make_current(display, surface, surface, context):
+                raise RuntimeError("main Native Wayland view could not be restored")
+            destroy_surface(display, secondary_surface)
+            secondary_surface = None
+            wayland_window.destroy_drawable(secondary_drawable)
+            secondary_drawable = wayland_window.create_drawable(1, 1, 16, 16)
+            secondary_surface = create_surface(display, config, wayland_window.api.subwindow_surface(secondary_drawable), None)
+            if not secondary_surface or not make_current(display, secondary_surface, secondary_surface, context):
+                raise RuntimeError("Native Wayland EGL view recreation failed")
+            present(secondary_surface)
+        return {"renderer": renderer, "window_presentation": True, "shared_thread_context": True,
+                "separate_view_drawables": bool(wayland_window)}
     finally:
         if initialized:
             make_current(display, None, None, None)
@@ -366,6 +494,8 @@ def _probe():
                 destroy_context(display, context)
             if surface:
                 destroy_surface(display, surface)
+            if secondary_surface:
+                destroy_surface(display, secondary_surface)
             terminate(display)
         if wayland_window:
             wayland_window.close()

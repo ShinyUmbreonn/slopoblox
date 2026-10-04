@@ -3,6 +3,8 @@
 #include "worker_wake.h"
 #include "graphics_context.h"
 #include "x_modifier_state.h"
+#include "dns_concurrency.h"
+#include "cursor_selection.h"
 typedef struct objc_class *Class;
 typedef struct objc_object { Class isa; } *id;
 typedef struct objc_selector *SEL;
@@ -1184,19 +1186,41 @@ struct macoblox_addrinfo_head {
     int ai_protocol;
 };
 //
-// Lookups through Darling's resolver go one at a time, and a lookup that
-// fails for a temporary reason (EAI_AGAIN, EAI_FAIL, EAI_SYSTEM) is tried up
-// to four times, 50 ms apart. Waiting threads nap with direct Linux sleeps
-// (macoblox_sleep_us): Darling's usleep costs two darlingserver requests, so
-// the old 1 ms polling kept darlingserver busy while a lookup was slow. A
-// name that does not exist (EAI_NONAME, e.g. a blocked telemetry host) is
-// not retried, and the lock is not held during the pause between attempts:
-// before, such a name held up every other lookup for 150 ms or more.
+// Preserve Darling's getaddrinfo validation and addrinfo allocation, but use
+// a caller-owned BIND state for its imported res_9_query transport. The legacy
+// query uses global _res storage; merely removing the old lookup lock races
+// query IDs, sockets and buffers. Reentrant APIs let independent lookups run
+// concurrently. A custom runtime without them keeps the protected fallback.
+// Temporary EAI_AGAIN/EAI_FAIL/EAI_SYSTEM errors still get four attempts with
+// direct Linux sleeps 50 ms apart; permanent errors are never retried.
 extern int getaddrinfo(const char*, const char*, const void*, void**);
+extern int res_9_query(const char*, int, int, unsigned char*, int);
+extern int *__error(void);
 extern void macoblox_sleep_us(unsigned int);
-static volatile int macoblox_dns_lock;
 extern int macoblox_dns_resolve(const char* node, const char* service,
                                 const void* hints, void** result);
+static const struct macoblox_resolver_api *macoblox_resolver_functions(void) {
+    static struct macoblox_resolver_api api;
+    static volatile unsigned int ready, initialization_lock;
+    if (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) {
+        macoblox_lock(&initialization_lock);
+        if (!ready) {
+            api.initialize = (int (*)(void*))dlsym(RTLD_NEXT, "res_9_ninit");
+            api.query = (int (*)(void*, const char*, int, int, unsigned char*, int))
+                dlsym(RTLD_NEXT, "res_9_nquery");
+            api.destroy = (void (*)(void*))dlsym(RTLD_NEXT, "res_9_ndestroy");
+            __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+        }
+        macoblox_unlock(&initialization_lock);
+    }
+    return &api;
+}
+static int macoblox_res_9_query(const char *name, int dns_class, int type,
+                               unsigned char *answer, int capacity) {
+    macoblox_query_function original = MACOBLOX_NEXT(macoblox_query_function, "res_9_query");
+    return macoblox_query_in_scope(original, name, dns_class, type, answer, capacity);
+}
+DYLD_INTERPOSE(macoblox_res_9_query, res_9_query)
 // Milliseconds on the Linux CLOCK_MONOTONIC, like macoblox_sleep_us: the
 // resolver work and its lock waits are what a startup stall is made of.
 struct macoblox_timespec { long sec; long nsec; };
@@ -1211,8 +1235,8 @@ static long macoblox_millis(void) {
     return now.sec * 1000 + now.nsec / 1000000;
 }
 // One line per lookup. Emitted for every failed lookup and for any lookup
-// (or lock wait) slower than 200 ms: a multi-second startup stall shows up
-// here as the slow node and who was holding the resolver lock.
+// slower than 200 ms. waited_ms is zero on the concurrent private-state path;
+// it remains useful when an older runtime needs the serialized fallback.
 static void macoblox_dns_trace(const char* node, const char* service,
                                const void* hints, int attempts, int status,
                                long waited_ms, long took_ms) {
@@ -1239,10 +1263,9 @@ static void macoblox_dns_trace(const char* node, const char* service,
 static int ascii_strings_equal(const char* left, const char* right);
 static int macoblox_getaddrinfo(const char* node, const char* service,
                                 const void* hints, void** result) {
-    // silver/pulsar/gold.roblox.com are 1x1 GIF tracking/telemetry beacons
-    // that are blocked/unreachable in some regions. Under curl they time out for 5000 ms
-    // each (stacking up to 15 s when exiting a place, completely freezing the home menu).
-    // Failing resolution instantly (EAI_NONAME = 8) drops them in 0 ms and unfreezes the menu.
+    // Preserve the existing optional-telemetry hostname policy. Regional
+    // beacon timeouts were observed, but an isolated redirect comparison
+    // did not eliminate the remaining leave-game rendering pause.
     if (macoblox_is_blocked_telemetry(node)) {
         if (result)
             *result = 0;
@@ -1260,24 +1283,11 @@ static int macoblox_getaddrinfo(const char* node, const char* service,
     int (*real_getaddrinfo)(const char*, const char*, const void*, void**) =
         MACOBLOX_NEXT(int (*)(const char*, const char*, const void*, void**), "getaddrinfo");
 
-    int status = -1;
     int attempts = 0;
     long waited_ms = 0;
-    while (real_getaddrinfo && attempts < 4) {
-        if (attempts)
-            macoblox_sleep_us(50000);
-        attempts++;
-        long wait_started = macoblox_millis();
-        while (__sync_lock_test_and_set(&macoblox_dns_lock, 1))
-            macoblox_sleep_us(1000);
-        waited_ms += macoblox_millis() - wait_started;
-        if (result)
-            *result = 0;
-        status = real_getaddrinfo(node, service, hints, result);
-        __sync_lock_release(&macoblox_dns_lock);
-        if (status != 2 /* EAI_AGAIN */ && status != 4 /* EAI_FAIL */ && status != 11 /* EAI_SYSTEM */)
-            break;
-    }
+    int status = macoblox_retry_addrinfo(real_getaddrinfo, macoblox_resolver_functions(),
+        node, service, hints, result, __error(), macoblox_millis, macoblox_sleep_us,
+        &attempts, &waited_ms);
 
     long took = macoblox_millis() - started;
     static volatile int trace = -1;
@@ -2278,6 +2288,9 @@ static MacOBloxSize backing_size_1x(id self, SEL cmd, MacOBloxSize size) {
     return size;
 }
 
+// Scale the client's UI contract without changing Cocoa drawable/input pixels.
+#include "ui_scale_hook.h"
+
 // Title bar options of macOS 10.10 that Roblox sets on its window
 // (setTitlebarAppearsTransparent:, setTitleVisibility:). The Darling release
 // this is tested with has them; an older or differently built Darling does
@@ -2938,9 +2951,8 @@ static volatile int macoblox_cursor_worker_started;
 static volatile unsigned long long macoblox_cursor_retry_after;
 static volatile int macoblox_input_focused = 1;
 static int macoblox_cursor_wake[2] = {-1, -1};
-static volatile unsigned long macoblox_window_cursor;
-static volatile unsigned long macoblox_window_cursor_handle;
-static volatile int macoblox_window_cursor_dirty;
+static MacOBloxCursorSelection macoblox_window_cursor_selection;
+static volatile unsigned int macoblox_window_cursor_lock;
 static unsigned long long macoblox_input_now_ns(void) {
     struct { long seconds, nanoseconds; } now = {0, 0};
     long result;
@@ -2961,9 +2973,8 @@ static void* macoblox_xfixes_worker(void* unused) {
     write_str("[MacOBlox] XFixes ready for cursor hiding\n");
     void* (*open_display)(const char*) =
         (void* (*)(const char*))dlsym(RTLD_DEFAULT, "XOpenDisplay");
-    unsigned long (*define_cursor)(void*, unsigned long, unsigned long) =
-        (unsigned long (*)(void*, unsigned long, unsigned long))
-            dlsym(RTLD_DEFAULT, "XDefineCursor");
+    int (*undefine_cursor)(void*, unsigned long) =
+        (int (*)(void*, unsigned long))dlsym(RTLD_DEFAULT, "XUndefineCursor");
     int (*query_tree)(void*, unsigned long, unsigned long*, unsigned long*,
                       unsigned long**, unsigned int*) =
         (int (*)(void*, unsigned long, unsigned long*, unsigned long*,
@@ -2971,34 +2982,22 @@ static void* macoblox_xfixes_worker(void* unused) {
     int (*free_data)(void*) = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFree");
     int (*sync_display)(void*, int) = (int (*)(void*, int))dlsym(RTLD_DEFAULT, "XSync");
     void* xlib_display = open_display ? open_display(0) : 0;
-    if (xlib_display && define_cursor)
+    MacOBloxCursorApplyAPI cursor_api = {undefine_cursor, query_tree, free_data, sync_display};
+    if (xlib_display && undefine_cursor && query_tree && free_data && sync_display)
         write_str("[MacOBlox] Window cursor worker ready\n");
     __atomic_store_n(&macoblox_cursor_worker_ready, 1, __ATOMIC_RELEASE);
     int applied = 0;
     for (;;) {
         int wanted = __atomic_load_n(&macoblox_cursor_wanted_hidden, __ATOMIC_ACQUIRE);
-        if (__atomic_exchange_n(&macoblox_window_cursor_dirty, 0, __ATOMIC_ACQUIRE)) {
-            unsigned long handle = macoblox_window_cursor_handle;
-            unsigned long cursor = macoblox_window_cursor;
-            if (handle && cursor && xlib_display && define_cursor && query_tree) {
-                define_cursor(xlib_display, handle, cursor);
-                unsigned long root, parent, *children = 0;
-                unsigned int count = 0;
-                if (query_tree(xlib_display, handle, &root, &parent,
-                               &children, &count) && children) {
-                    for (unsigned int index = 0; index < count; index++)
-                        define_cursor(xlib_display, children[index], cursor);
-                    if (free_data)
-                        free_data(children);
-                }
-                /* Our overlay uses another connection. Finish the cursor
-                 * definitions before it snapshots the image. This runs
-                 * only on image changes, on the worker. */
-                if (sync_display)
-                    sync_display(xlib_display, 0);
+        MacOBloxCursorSelection selected = {0};
+        macoblox_lock(&macoblox_window_cursor_lock);
+        int changed = macoblox_cursor_selection_take(&macoblox_window_cursor_selection, &selected);
+        macoblox_unlock(&macoblox_window_cursor_lock);
+        if (changed) {
+            if (macoblox_cursor_selection_apply(&cursor_api, xlib_display, selected.window)) {
                 static volatile long defined;
                 if (__sync_add_and_fetch(&defined, 1) <= 3) {
-                    write_str("[MacOBlox Cursor] Defined on the game window and its children\n");
+                    write_str("[MacOBlox Cursor] Applied selected cursor; rendering children inherit it\n");
                 }
             }
         }
@@ -3051,13 +3050,6 @@ static void macoblox_set_x_cursor_hidden(int hidden) {
 static void macoblox_cursor_changed(void) {
     if (__atomic_load_n(&macoblox_cursor_worker_ready, __ATOMIC_ACQUIRE))
         macoblox_wake_worker(macoblox_cursor_wake[1]);
-}
-static void (*orig_cursor_set)(id, SEL);
-static void hooked_cursor_set(id self, SEL cmd) {
-    static void *last;
-    orig_cursor_set(self, cmd);
-    if (__atomic_exchange_n(&last, self, __ATOMIC_ACQ_REL) != self)
-        macoblox_cursor_changed();
 }
 static void (*orig_cursor_hide)(id, SEL);
 static void hooked_cursor_hide(id self, SEL cmd) {
@@ -3965,32 +3957,39 @@ static id hooked_x11_cursor_init_image(id self, SEL cmd, id image,
         return orig_x11_cursor_init_image(self, cmd, image, hot);
     *(unsigned long*)((char*)self + ivar_getOffset(cursor_ivar)) = cursor;
 
-    unsigned long (*define_cursor_probe)(void*, unsigned long, unsigned long) =
-        (unsigned long (*)(void*, unsigned long, unsigned long))
-            dlsym(RTLD_DEFAULT, "XDefineCursor");
-    if (define_cursor_probe) {
-        id app = ((id (*)(id, SEL))objc_msgSend)(
-            (id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-        id window = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : 0;
-        if (!window && app)
-            window = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("mainWindow"));
-        unsigned long handle = macoblox_native_window_handle(window);
-        if (handle) {
-            macoblox_window_cursor = cursor;
-            macoblox_window_cursor_handle = handle;
-            __atomic_store_n(&macoblox_window_cursor_dirty, 1, __ATOMIC_RELEASE);
-            macoblox_start_xfixes_worker();
-            if (__atomic_load_n(&macoblox_cursor_worker_ready, __ATOMIC_ACQUIRE))
-                macoblox_wake_worker(macoblox_cursor_wake[1]);
-            static volatile long reported;
-            if (__sync_add_and_fetch(&reported, 1) <= 3) {
-                write_str("[MacOBlox Cursor] Queued for the game window (handle ");
-                print_hex(handle);
-                write_str(")\n");
-            }
-        }
-    }
     return self;
+}
+
+/* Creating a cursor does not select it. This backend setter is reached by
+ * NSCursor set/push/pop, hide/unhide and cursor-rectangle resets, so both
+ * image construction paths and named/blank cursors follow the same policy. */
+static void (*orig_x11_display_set_cursor)(id, SEL, id);
+static void hooked_x11_display_set_cursor(id self, SEL cmd, id cursor) {
+    unsigned long handle = macoblox_native_window_handle(macoblox_lock_window());
+    orig_x11_display_set_cursor(self, cmd, cursor);
+    if (!handle)
+        return;
+    Ivar cursor_ivar = cursor ? class_getInstanceVariable(object_getClass(cursor), "_cursor") : 0;
+    if (cursor && !cursor_ivar)
+        return;
+    unsigned long selected_cursor = cursor
+        ? *(unsigned long*)((char*)cursor + ivar_getOffset(cursor_ivar)) : 0;
+    if (cursor)
+        ((id (*)(id, SEL))objc_msgSend)(cursor, sel_registerName("retain"));
+    macoblox_lock(&macoblox_window_cursor_lock);
+    id previous = (id)macoblox_window_cursor_selection.owner;
+    int changed = macoblox_cursor_selection_set(&macoblox_window_cursor_selection,
+                                                handle, selected_cursor, cursor);
+    int pending = macoblox_window_cursor_selection.dirty;
+    macoblox_unlock(&macoblox_window_cursor_lock);
+    id release = changed ? previous : cursor;
+    if (release)
+        ((void (*)(id, SEL))objc_msgSend)(release, sel_registerName("release"));
+    if (pending) {
+        macoblox_start_xfixes_worker();
+        if (__atomic_load_n(&macoblox_cursor_worker_ready, __ATOMIC_ACQUIRE))
+            macoblox_wake_worker(macoblox_cursor_wake[1]);
+    }
 }
 
 // Darling stubs +[NSEvent addLocalMonitorForEventsMatchingMask:handler:].
@@ -5006,17 +5005,15 @@ static id hooked_x11_subwindow_init(id self, SEL cmd, id parent, MacOBloxRect fr
 // Classes from Darling's X11 backend load after this library initializes, so
 // hooks on them are installed again once NSApplication finishes launching.
 static void macoblox_install_late_hooks(void) {
+    macoblox_install_surface_scale_hook();
     static volatile int visibility_hooked;
     Class cursor_class = objc_getClass("NSCursor");
     if (cursor_class && !macoblox_wayland_enabled() && __sync_bool_compare_and_swap(&visibility_hooked, 0, 1)) {
-        Method set = class_getInstanceMethod(cursor_class, sel_registerName("set"));
         Method hide = class_getClassMethod(cursor_class, sel_registerName("hide"));
         Method unhide = class_getClassMethod(cursor_class, sel_registerName("unhide"));
-        if (set && hide && unhide) {
-            orig_cursor_set = (void (*)(id, SEL))method_getImplementation(set);
+        if (hide && unhide) {
             orig_cursor_hide = (void (*)(id, SEL))method_getImplementation(hide);
             orig_cursor_unhide = (void (*)(id, SEL))method_getImplementation(unhide);
-            method_setImplementation(set, (IMP)hooked_cursor_set);
             method_setImplementation(hide, (IMP)hooked_cursor_hide);
             method_setImplementation(unhide, (IMP)hooked_cursor_unhide);
         }
@@ -5042,6 +5039,12 @@ static void macoblox_install_late_hooks(void) {
     static volatile int x_events_hooked;
     Class x11_display_class = objc_getClass("X11Display");
     if (x11_display_class && __sync_bool_compare_and_swap(&x_events_hooked, 0, 1)) {
+        Method cursor = class_getInstanceMethod(x11_display_class, sel_registerName("setCursor:"));
+        if (cursor) {
+            orig_x11_display_set_cursor = (void (*)(id, SEL, id))method_getImplementation(cursor);
+            method_setImplementation(cursor, (IMP)hooked_x11_display_set_cursor);
+            write_str("[MacOBlox] X11 cursor selection follows set/hide/unhide and resets\n");
+        }
         Method method = class_getInstanceMethod(x11_display_class, sel_registerName("postXEvent:"));
         if (method) {
             orig_post_x_event = (void (*)(id, SEL, void*))method_getImplementation(method);
@@ -5834,22 +5837,31 @@ static void macoblox_load_cookies(void) {
 // a second display for Roblox's rendering worker, although the main thread's
 // display is already valid. Share the first successfully created display.
 static id (*orig_current_display)(id, SEL) = 0;
-static id macoblox_shared_display;
+static void *macoblox_shared_display;
 static volatile int macoblox_display_lock;
 static id shared_current_display(id cls, SEL cmd) {
-    if (macoblox_shared_display)
-        return macoblox_shared_display;
+    id shared = (id)__atomic_load_n(&macoblox_shared_display, __ATOMIC_ACQUIRE);
+    if (shared)
+        return shared;
     while (__sync_lock_test_and_set(&macoblox_display_lock, 1))
         macoblox_sleep_us(1000);
-    if (!macoblox_shared_display) {
-        id display = macoblox_wayland_enabled() ? macoblox_wayland_display()
-                                                : orig_current_display(cls, cmd);
-        if (display)
-            macoblox_shared_display = ((id (*)(id, SEL))objc_msgSend)(
-                display, sel_registerName("retain"));
+    @try {
+        shared = (id)__atomic_load_n(&macoblox_shared_display, __ATOMIC_RELAXED);
+        if (!shared) {
+            id display = macoblox_wayland_enabled() ? macoblox_wayland_display()
+                                                    : orig_current_display(cls, cmd);
+            if (display) {
+                shared = ((id (*)(id, SEL))objc_msgSend)(
+                    display, sel_registerName("retain"));
+                __atomic_store_n(&macoblox_shared_display, (void *)shared, __ATOMIC_RELEASE);
+            }
+        }
+    } @finally {
+        // Backend initialization may raise an exception. Let a caller retry
+        // without leaving every display request waiting on this lock.
+        __sync_lock_release(&macoblox_display_lock);
     }
-    __sync_lock_release(&macoblox_display_lock);
-    return macoblox_shared_display;
+    return shared;
 }
 
 __attribute__((constructor))

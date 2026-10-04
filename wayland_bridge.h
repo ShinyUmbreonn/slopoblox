@@ -1,7 +1,7 @@
 /* Private, versioned ABI between the Darwin shim and the Linux window helper. */
 #ifndef MACOBLOX_WAYLAND_BRIDGE_H
 #define MACOBLOX_WAYLAND_BRIDGE_H
-#define MACOBLOX_WAYLAND_ABI 2
+#define MACOBLOX_WAYLAND_ABI 3
 enum { MW_MOTION=1, MW_DOWN, MW_UP, MW_SCROLL, MW_KEY_DOWN, MW_KEY_UP,
        MW_TEXT, MW_RESIZE, MW_FOCUS, MW_BLUR, MW_CLOSE, MW_CAPTURE };
 enum { MW_SHOW=1, MW_HIDE, MW_TITLE, MW_RESIZE_WINDOW, MW_FULLSCREEN,
@@ -22,5 +22,12 @@ struct macoblox_wayland_api {
     void (*cursor)(const void *, int, int, int, int, int, const char *);
     const char *(*clipboard)(const char *);
     const char *(*error)(void);
+    /* Each AppKit GL view owns a distinct native drawable. Frames use the
+     * parent's top-left, logical coordinates; render buffers remain 1x. */
+    unsigned int (*create_subwindow)(unsigned int, int, int, int, int);
+    void *(*subwindow_surface)(unsigned int);
+    void (*subwindow_frame)(unsigned int, int, int, int, int);
+    void (*subwindow_visible)(unsigned int, int);
+    void (*destroy_subwindow)(unsigned int);
 };
 #endif

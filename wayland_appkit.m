@@ -25,6 +25,12 @@ extern const char *method_getTypeEncoding(Method);
 extern BOOL class_addMethod(Class,SEL,IMP,const char *);
 extern SEL sel_registerName(const char *);
 extern int CGLRegisterNativeDisplay(void *);
+extern void *eglGetDisplay(void *);
+extern unsigned int eglInitialize(void *,int *,int *);
+extern unsigned int eglChooseConfig(void *,const int *,void **,int,int *);
+extern unsigned int eglBindAPI(unsigned int);
+extern int eglGetError(void);
+extern const char *eglQueryString(void *,int);
 extern void *CGBitmapContextCreate(void *,unsigned long,unsigned long,unsigned long,unsigned long,const void *,unsigned int);
 extern const void *CGColorSpaceCreateDeviceRGB(void);
 extern void CGColorSpaceRelease(const void *);
@@ -122,6 +128,7 @@ extern unsigned long CGBitmapContextGetBytesPerRow(void *);
 @interface NSPasteboard:NSObject @end
 
 static const struct macoblox_wayland_api *api;
+static BOOL initialized;
 static NSMutableArray *windows;
 static unsigned modifiers;
 static NSPoint pointer;
@@ -132,34 +139,93 @@ int macoblox_wayland_enabled(void) {
     const char *value=getenv("MACOBLOX_WAYLAND");return value && !strcmp(value,"1");
 }
 int macoblox_wayland_captured(void){return __atomic_load_n(&captured,__ATOMIC_ACQUIRE)!=0;}
+static void validate_egl(void *native) {
+    void *display=eglGetDisplay(native),*config=0;
+    int major=0,minor=0,count=0;
+    const int attributes[]={0x3033,4,0x3040,8,0x3024,8,0x3023,8,0x3022,8,0x3038};
+    const char *stage=0;
+    if(!display)stage="display connection";
+    else if(!eglInitialize(display,&major,&minor))stage="driver initialization";
+    else if(!eglBindAPI(0x30A2))stage="desktop OpenGL binding";
+    else if(!eglChooseConfig(display,attributes,&config,1,&count) || count<1 || !config)stage="window configuration";
+    if(stage) {
+        int error=eglGetError();
+        if(getenv("MACOBLOX_TRACE_WAYLAND")) {
+            const char *platform=getenv("EGL_PLATFORM"),*driver=getenv("MESA_LOADER_DRIVER_OVERRIDE");
+            char line[320];
+            int length=snprintf(line,sizeof line,"[MacOBlox Wayland] EGL %s failed: error 0x%x, native %p, display %p, platform %s, driver %s\n",
+                stage,error,native,display,platform?platform:"auto",driver?driver:"auto");
+            if(length>0)write(2,line,(unsigned long)length<sizeof line?(unsigned long)length:sizeof line-1);
+        }
+        [NSException raise:@"NSWindowServerCommunicationException" format:@"Native Wayland EGL %s failed (0x%x). Select X11 / Xwayland until this graphics driver is supported.",stage,error];
+    }
+    if(getenv("MACOBLOX_TRACE_WAYLAND")) {
+        const char *vendor=eglQueryString(display,0x3053),*version=eglQueryString(display,0x3054);
+        const char *platform=getenv("EGL_PLATFORM"),*driver=getenv("MESA_LOADER_DRIVER_OVERRIDE");
+        char line[512];
+        int length=snprintf(line,sizeof line,"[MacOBlox Wayland] EGL initialized: native %p, display %p, version %d.%d (%s), vendor %s, platform %s, driver %s\n",
+            native,display,major,minor,version?version:"unknown",vendor?vendor:"unknown",platform?platform:"auto",driver?driver:"auto");
+        if(length>0)write(2,line,(unsigned long)length<sizeof line?(unsigned long)length:sizeof line-1);
+    }
+}
 static void initialize(void) {
-    if(api)return;
+    if(initialized)return;
     struct elf_head {void *(*open)(const char *,int);int (*close)(void *);void *(*symbol)(void *,const char *);};
     struct elf_head **elf=dlsym((void *)-2,"_elfcalls");
     const char *path=getenv("MACOBLOX_WAYLAND_HELPER");
     void *library=path && elf && *elf?(*elf)->open(path,2):0;
     const struct macoblox_wayland_api *(*get)(void)=library?(*elf)->symbol(library,"macoblox_wayland_host_api"):0;
-    if(!get || !(api=get()) || api->version!=MACOBLOX_WAYLAND_ABI)
+    if(!get || !(api=get()))
         [NSException raise:@"NSWindowServerCommunicationException" format:@"Native Wayland initialization failed. Check the Wayland session and SDL2 helper (%s).",path?path:"helper not set"];
+    if(api->version!=MACOBLOX_WAYLAND_ABI)
+        [NSException raise:@"NSWindowServerCommunicationException" format:@"Native Wayland helper is outdated or incompatible (ABI %u; expected %u). Rebuild MacOBlox before using Native Wayland.",api->version,MACOBLOX_WAYLAND_ABI];
+    /* Darling reports CGL success even when eglInitialize or config selection
+     * fails. Check those operations explicitly before caching its display. */
+    validate_egl(api->display());
     if(CGLRegisterNativeDisplay(api->display()))
         [NSException raise:@"NSWindowServerCommunicationException" format:@"Native Wayland EGL initialization failed"];
     windows=[NSMutableArray new];
+    initialized=YES;
 }
 @interface MacOBloxWaylandWindow:CGWindow {
 @public NSWindow *owner;NSRect frame;NSUInteger style;unsigned handle,buttons;void *bitmap;BOOL mapped;
 }
 - (id)initWithOwner:(NSWindow *)window;
 @end
-@interface MacOBloxWaylandSubwindow:CGSubWindow {MacOBloxWaylandWindow *parent;}
-- (id)initWithParent:(MacOBloxWaylandWindow *)window;
+@interface MacOBloxWaylandSubwindow:CGSubWindow {MacOBloxWaylandWindow *parent;unsigned handle;}
+- (id)initWithParent:(MacOBloxWaylandWindow *)window frame:(NSRect)value;
+- (void)setFrame:(NSRect)value;
 @end
+static BOOL subwindow_frame(MacOBloxWaylandWindow *parent,NSRect value,int *x,int *y,int *width,int *height) {
+    /* AppKit views use bottom-left coordinates. The helper's Wayland surface
+     * positions use the top-left of the logical, undecorated client area. */
+    double top=parent->frame.size.height-value.origin.y-value.size.height;
+    if(!__builtin_isfinite(value.origin.x) || !__builtin_isfinite(top) ||
+       !__builtin_isfinite(value.size.width) || !__builtin_isfinite(value.size.height) ||
+       value.origin.x < -32768 || value.origin.x > 32768 || top < -32768 || top > 32768 ||
+       value.size.width < 0 || value.size.height < 0 || value.size.width > 16384 || value.size.height > 16384)return NO;
+    *x=(int)value.origin.x;*y=(int)top;
+    *width=value.size.width<1?1:(int)value.size.width;*height=value.size.height<1?1:(int)value.size.height;
+    return YES;
+}
 @implementation MacOBloxWaylandSubwindow
-- (id)initWithParent:(MacOBloxWaylandWindow *)window{if((self=[super init]))parent=[window retain];return self;}
-- (void)dealloc{[parent release];[super dealloc];}
-- (void *)nativeWindow{return api->surface(parent->handle);}
-- (void)show{}
-- (void)hide{}
-- (void)setFrame:(NSRect)value{}
+- (id)initWithParent:(MacOBloxWaylandWindow *)window frame:(NSRect)value {
+    if(!(self=[super init]))return nil;
+    parent=[window retain];int x,y,width,height;
+    if(!parent || !parent->handle || !subwindow_frame(parent,value,&x,&y,&width,&height) ||
+       !(handle=api->create_subwindow(parent->handle,x,y,width,height)))
+        [NSException raise:@"NSWindowServerCommunicationException" format:@"Native Wayland view failed: %s",api->error()];
+    return self;
+}
+- (void)dealloc{if(handle)api->destroy_subwindow(handle);[parent release];[super dealloc];}
+- (void *)nativeWindow{return handle?api->subwindow_surface(handle):0;}
+- (void)show{if(handle && parent->handle)api->subwindow_visible(handle,1);}
+- (void)hide{if(handle)api->subwindow_visible(handle,0);}
+- (void)setFrame:(NSRect)value {
+    int x,y,width,height;
+    if(handle && parent->handle && subwindow_frame(parent,value,&x,&y,&width,&height))
+        api->subwindow_frame(handle,x,y,width,height);
+}
 @end
 @implementation MacOBloxWaylandWindow
 - (id)initWithOwner:(NSWindow *)window {
@@ -174,7 +240,8 @@ static void initialize(void) {
 - (void)setDelegate:(id)delegate{owner=delegate;}
 - (id)delegate{return owner;}
 - (NSUInteger)windowHandle{return handle;}
-- (NSInteger)windowNumber{return [owner windowNumber];}
+/* Inherit CGWindow's pointer identity. NSWindow.windowNumber delegates to
+ * its platformWindow, so forwarding back to owner would recurse forever. */
 - (NSRect)frame{return frame;}
 - (NSUInteger)styleMask{return style;}
 - (void)setStyleMask:(NSUInteger)value{style=value;api->action(handle,MW_FULLSCREEN,(style&(1UL<<14))!=0,0,0);}
@@ -207,7 +274,7 @@ static void initialize(void) {
 - (void)addEntriesToDeviceDictionary:(id)entries{}
 - (void *)cglContext{return 0;}
 - (NSPoint)mouseLocationOutsideOfEventStream{return (NSPoint){pointer.x,frame.size.height-pointer.y};}
-- (id)createSubWindowWithFrame:(NSRect)value{return [[[MacOBloxWaylandSubwindow alloc] initWithParent:self] autorelease];}
+- (id)createSubWindowWithFrame:(NSRect)value{return [[[MacOBloxWaylandSubwindow alloc] initWithParent:self frame:value] autorelease];}
 - (id)cgContext {
     if(!bitmap){const void *color=CGColorSpaceCreateDeviceRGB();bitmap=CGBitmapContextCreate(0,frame.size.width>0?frame.size.width:1,frame.size.height>0?frame.size.height:1,8,0,color,0x2002);CGColorSpaceRelease(color);}
     return (id)bitmap;

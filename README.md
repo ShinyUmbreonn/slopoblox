@@ -162,6 +162,28 @@ For the Flatpak, install the matching MangoHud extension with
 </details>
 
 <details>
+<summary>Roblox UI is too small on a high DPI monitor</summary>
+
+Set **Settings → Environment → Game → Roblox UI scale** to **200%** for a
+4K display, then restart Roblox. The control accepts 100–400% and keeps the
+display's rendering resolution. Adjust it to suit your monitor.
+
+For a manual settings edit, `"dpi_scale": 2.0` in
+`~/.config/macoblox/settings.json` selects 200%. The `resolution` key is not
+supported. If you previously added `DFFlagDisableDPIScale`, remove it from your
+custom fast flags before testing scaling.
+</details>
+
+<details>
+<summary>Native Wayland (experimental)</summary>
+
+**Settings → Environment → Game → Window backend** defaults to **X11 / Xwayland**.
+Native Wayland is available for experiments. Version 0.19 repairs separate EGL
+view surfaces, window lookup and NVIDIA driver discovery, but full Roblox
+presentation is still unfinished. Use X11 / Xwayland for normal gameplay.
+</details>
+
+<details>
 <summary>Roblox Studio</summary>
 
 Press **Roblox Studio** in the launcher. The first time it downloads Wine, DXVK
@@ -179,7 +201,7 @@ installed on the system. Download `MacOBlox-*.flatpak` from the
 [latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
 
 ```bash
-flatpak install --user MacOBlox-0.18-x86_64.flatpak
+flatpak install --user MacOBlox-0.19-x86_64.flatpak
 ```
 
 It keeps its own Darling prefix, so sign in to Roblox again there. Roblox Studio

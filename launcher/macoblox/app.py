@@ -43,7 +43,6 @@ PRESETS = [
          "DFIntTextureCompositorLowResFactor": 1,
          "DFFlagTextureCompositorHighQualityEnabled": True,
          "FIntDebugForceAnisotropy": 16,
-         "DFFlagDisableDPIScale": True,
      }},
     {"title": "Anisotropic filtering (16x)", "subtitle": "FIntDebugForceAnisotropy: 16 (sharp textures at angles)",
      "flag": "FIntDebugForceAnisotropy", "kind": "number", "default": 16, "min": 1, "max": 16},
@@ -1062,6 +1061,16 @@ class SettingsPage(Adw.Bin):
         backend.connect("notify::selected", lambda row, _pspec: window.set_setting(
             "display_backend", backend_codes[row.get_selected()]))
         game.add(backend)
+
+        from .display import validated_dpi_scale
+        ui_scale = Adw.SpinRow.new_with_range(100, 400, 25)
+        ui_scale.set_digits(0)
+        ui_scale.set_title(_("Roblox UI scale"))
+        ui_scale.set_subtitle(_("100–400%. Applies on next launch."))
+        ui_scale.set_value(validated_dpi_scale(settings.get("dpi_scale", 1.0)) * 100)
+        ui_scale.connect("notify::value", lambda row, _pspec: window.set_setting(
+            "dpi_scale", validated_dpi_scale(row.get_value() / 100)))
+        game.add(ui_scale)
 
         mangohud = Adw.SwitchRow(
             title=_("MangoHud overlay"),

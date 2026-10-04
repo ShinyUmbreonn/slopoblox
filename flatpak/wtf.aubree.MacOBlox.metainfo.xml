@@ -67,6 +67,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.19" date="2026-10-04">
+      <description>
+        <p>Fixes invisible X11 cursors with Vulkan (Zink), removes unnecessary serialization of independent DNS lookups, and adds adjustable Roblox UI scaling from 100–400%. Improves Flatpak graphics discovery and Vulkan error messages. Repairs experimental Wayland EGL drawables, window lookup and NVIDIA driver discovery. The leave-game pause remains unresolved; Native Wayland and Zink remain experimental. Direct client Vulkan and custom Darlingserver experiments are not included.</p>
+      </description>
+    </release>
     <release version="0.18" date="2026-10-04">
       <description>
         <p>Adds a welcome and first-time setup guide. Fixes raw mouse and camera freezes, restores mouse capture after focus changes, repairs Private Servers rendering crashes, and improves Zink context and shader compatibility. Reduces Darling file-close cleanup delays and keeps process cleanup within the selected app environment. A later pause after leaving games remains under investigation. Native Wayland and Zink remain experimental.</p>
