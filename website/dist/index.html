@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="Mac O’ Blox brings the macOS Roblox client to Linux through Darling. Free, open source, and made for your desktop.">
+  <meta property="og:title" content="Mac O’ Blox — Roblox on Linux">
+  <meta property="og:description" content="Your games. Your account. Your Linux desktop. Meet Mac O’ Blox.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://macoblox.aubree.wtf/">
+  <link rel="canonical" href="https://macoblox.aubree.wtf/">
+  <link rel="icon" href="assets/favicon.png" type="image/png">
+  <link rel="preload" href="assets/fonts/Archivo.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="stylesheet" href="style.css">
+  <title>Mac O’ Blox — Roblox on Linux</title>
+  <script src="assets/vendor/p5.min.js" defer></script>
+  <script src="assets/vendor/vanta.topology.min.js" defer></script>
+  <script src="background.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div id="wallpaper" aria-hidden="true"></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="desktop-bar">
+    <a href="https://aubree.wtf">aubree.wtf <span>/ projects / macoblox</span></a>
+    <div class="desktop-tools"><span>LINUX / X86_64</span><button id="motion-toggle" type="button" aria-pressed="false" hidden>Pause background</button></div>
+  </div>
+
+  <div class="site-shell">
+    <header class="masthead">
+      <a class="brand" href="#" aria-label="Mac O’ Blox home"><img src="assets/wordmark.png" width="1200" height="286" alt="Mac O’ Blox"></a>
+      <nav aria-label="Main navigation">
+        <a href="#about">About</a><a href="#install">Install</a><a href="#questions">Questions</a><a href="https://github.com/aubree-lat/MacOBlox">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="window hero-copy">
+          <div class="window-bar"><span>MACOBLOX / WELCOME</span><span class="window-corners" aria-hidden="true"><i></i><i></i><i></i></span></div>
+          <div class="hero-body">
+            <a class="release-label" href="https://github.com/aubree-lat/MacOBlox/releases/tag/v0.19"><span class="release-square" aria-hidden="true"></span>VERSION 0.19 IS HERE</a>
+            <h1 id="hero-title">Roblox.<br>On Linux.</h1>
+            <p class="hero-description">Your games. Your account. Your desktop.<br>Run the macOS Roblox client on Linux with Mac O’ Blox.</p>
+            <div class="hero-actions"><a class="button button-primary" href="#install">Get Mac O’ Blox</a><a class="button" href="https://github.com/aubree-lat/MacOBlox">Explore the source</a></div>
+            <div class="hero-notes"><span>FREE & OPEN SOURCE</span><span>POWERED BY DARLING</span></div>
+          </div>
+        </div>
+
+        <div class="hero-preview">
+          <div class="window preview-window">
+            <div class="window-bar"><span id="preview-title">ROBLOXPLAYER / LINUX</span><span aria-hidden="true">[ preview ]</span></div>
+            <div class="preview-tabs" role="tablist" aria-label="Project screenshots"><button class="preview-tab" id="tab-roblox" role="tab" aria-selected="true" aria-controls="preview-roblox" tabindex="0" type="button">Roblox</button><button class="preview-tab" id="tab-launcher" role="tab" aria-selected="false" aria-controls="preview-launcher" tabindex="-1" type="button">The launcher</button><span class="preview-note">PROJECT SCREENSHOTS</span></div>
+            <div class="preview-image" id="preview-roblox" role="tabpanel" aria-labelledby="tab-roblox" tabindex="0"><img src="assets/roblox.png" width="1920" height="1080" alt="The Roblox home screen running through Mac O’ Blox on Linux" fetchpriority="high"></div>
+            <div class="preview-image launcher-image" id="preview-launcher" role="tabpanel" aria-labelledby="tab-launcher" tabindex="0" hidden><img src="assets/launcher.png" width="1100" height="740" alt="The Mac O’ Blox launcher with install status and play controls" loading="lazy"></div>
+            <div class="preview-footer"><span>macOS client <b>/</b> Linux host</span><span>Darling + Mac O’ Blox</span></div>
+          </div>
+          <div class="preview-caption"><span class="caption-rule" aria-hidden="true"></span><p>A familiar client.<br><span>A different operating system.</span></p></div>
+        </div>
+      </section>
+
+      <div class="platform-strip" aria-label="Supported desktop distributions"><span>AT HOME ON</span><span>Arch / CachyOS</span><span>Ubuntu / Debian</span><span>Linux Mint</span><span>Fedora*</span><span class="platform-footnote">*Darling source build</span></div>
+
+      <section class="section" id="about" aria-labelledby="about-title">
+        <div class="section-heading"><div><span class="eyebrow">01 / THE PROJECT</span><h2 id="about-title">Keep your Linux desktop.<br>Bring your games.</h2></div><p>Mac O’ Blox runs Roblox’s macOS client through Darling, then fills in the missing pieces: graphics, mouse input, sound, networking, and a launcher to tie it together.</p></div>
+        <div class="feature-grid">
+          <article class="window feature"><div class="window-bar"><span>01 / PLAY</span><span aria-hidden="true">[ + ]</span></div><div class="feature-body"><h3>The Roblox you know.</h3><p>Sign in to your account, find your friends, and jump into your experiences with the real macOS client.</p><span class="feature-tag">SAME ACCOUNT. SAME GAMES.</span></div></article>
+          <article class="window feature"><div class="window-bar"><span>02 / INPUT</span><span aria-hidden="true">[ + ]</span></div><div class="feature-body"><h3>Make yourself at home.</h3><p>Mouse capture, camera controls, sound, and microphone support connect the client to your Linux desktop.</p><span class="feature-tag">BUILT AROUND YOUR DESKTOP</span></div></article>
+          <article class="window feature"><div class="window-bar"><span>03 / CUSTOMIZE</span><span aria-hidden="true">[ + ]</span></div><div class="feature-body"><h3>A little more control.</h3><p>Adjust UI scale, fast flags, DNS, cursor and sound mods, or turn on MangoHud to see how things run.</p><span class="feature-tag">YOUR SETUP. YOUR SETTINGS.</span></div></article>
+          <article class="window feature"><div class="window-bar"><span>04 / CREATE</span><span aria-hidden="true">[ + ]</span></div><div class="feature-body"><h3>Studio comes along.</h3><p>The source launcher can install the Windows version of Roblox Studio in its own Wine environment.</p><span class="feature-tag">PLAY SOMETHING. MAKE SOMETHING.</span></div></article>
+        </div>
+        <div class="project-status"><span class="eyebrow">WORK IN PROGRESS</span><p>OpenGL and X11 / Xwayland are the defaults. Vulkan through Zink and Native Wayland are experimental. The pause after leaving a game is still being worked on.</p><a href="https://github.com/aubree-lat/MacOBlox/blob/main/CHANGELOG.md">Read the release notes</a></div>
+      </section>
+
+      <section class="section install-section" id="install" aria-labelledby="install-title">
+        <div class="section-heading"><div><span class="eyebrow">02 / GET STARTED</span><h2 id="install-title">Your next session<br>starts here.</h2></div><p>Install Mac O’ Blox, open it from your app menu, and let the first-time setup guide prepare Roblox.</p></div>
+        <div class="install-grid">
+          <div class="window install-window"><div class="window-bar"><span>TERMINAL / INSTALL</span><span>RECOMMENDED</span></div><div class="install-body"><h3>One command. A guided setup.</h3><p>The installer explains the packages it needs and asks before installing them. Run it again to update; your settings and sign-in stay in place.</p><div class="command-box"><span class="prompt" aria-hidden="true">$</span><code id="install-command">curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash</code><button class="copy-button" id="copy-command" type="button" aria-label="Copy installation command" hidden>Copy</button></div><p class="copy-status" id="copy-status" role="status" aria-live="polite"></p><a class="text-link" href="https://github.com/aubree-lat/MacOBlox#install">Read the installation guide</a></div></div>
+          <div class="window alternative-window"><div class="window-bar"><span>FLATPAK / DOWNLOAD</span><span>TESTING BUILD</span></div><div class="install-body"><h3>Prefer a bundle?</h3><p>The Flatpak includes Darling and uses its own Roblox sign-in. Studio isn’t included in this package yet.</p><a class="button button-wide" href="https://github.com/aubree-lat/MacOBlox/releases/download/v0.19/MacOBlox-0.19-x86_64.flatpak">Download Flatpak · 0.19</a><div class="download-links"><a href="https://github.com/aubree-lat/MacOBlox/releases/download/v0.19/SHA256SUMS">SHA-256 checksum</a><a href="https://github.com/aubree-lat/MacOBlox/releases">All releases</a></div></div></div>
+        </div>
+        <ol class="setup-steps"><li><span>01</span><div><strong>Install the launcher</strong><p>Use the command above or the Flatpak bundle.</p></div></li><li><span>02</span><div><strong>Follow the setup guide</strong><p>Mac O’ Blox downloads and prepares Roblox.</p></div></li><li><span>03</span><div><strong>Sign in. Hit play.</strong><p>Quick Login is an easy way to bring your account over.</p></div></li></ol>
+      </section>
+
+      <section class="section faq-section" id="questions" aria-labelledby="faq-title">
+        <div class="faq-heading"><span class="eyebrow">03 / GOOD TO KNOW</span><h2 id="faq-title">A few questions.</h2><p>Need a hand getting started?<br>Find us in the <a href="https://discord.gg/jCjHYYNq48">community Discord</a>.</p></div>
+        <div class="faq-list">
+          <details><summary>What do I need to run it?<span aria-hidden="true">+</span></summary><div class="faq-answer"><p>An x86_64 Linux desktop with working graphics drivers. The source installer supports Arch and its relatives, Ubuntu 24.04+, Debian 13, and Linux Mint 22. Fedora needs Darling built from source. Check the <a href="https://github.com/aubree-lat/MacOBlox#install">installation guide</a> for the dependencies.</p></div></details>
+          <details><summary>Do I need a Mac or a Windows installation?<span aria-hidden="true">+</span></summary><div class="faq-answer"><p>No. Darling provides the environment for the macOS client on Linux. Mac O’ Blox downloads Roblox and prepares it for that environment.</p></div></details>
+          <details><summary>How do I sign in?<span aria-hidden="true">+</span></summary><div class="faq-answer"><p>Use Roblox’s Quick Login: enter the code from the client on a phone or browser where you’re already signed in. Password sign-in and captcha pages use the launcher’s browser window.</p></div></details>
+          <details><summary>Can I use Vulkan or Wayland?<span aria-hidden="true">+</span></summary><div class="faq-answer"><p>Wayland desktops can run the default X11 backend through Xwayland. Vulkan rendering currently uses Mesa Zink to translate OpenGL. Native Wayland is an opt-in experiment; full client presentation is unfinished. Direct client Vulkan is not available.</p></div></details>
+          <details><summary>Is the source open? Who makes it?<span aria-hidden="true">+</span></summary><div class="faq-answer"><p>Yes. Mac O’ Blox is MIT licensed. The original project was created by <a href="https://github.com/narezy">Narezany</a>; this version is maintained by <a href="https://aubree.wtf">aubree.wtf</a>. Browse the code, report issues, or contribute on <a href="https://github.com/aubree-lat/MacOBlox">GitHub</a>.</p></div></details>
+        </div>
+      </section>
+
+      <section class="window community" aria-labelledby="community-title"><div class="window-bar"><span>COMMUNITY / OPEN SOURCE</span><span>EVERY PATCH COUNTS</span></div><div class="community-body"><div><h2 id="community-title">Made by people who<br>want to play on Linux.</h2><p>Found a bug? Have an idea? There’s room for you here.</p></div><div class="community-actions"><a class="button button-primary" href="https://discord.gg/jCjHYYNq48">Join the community</a><a class="button" href="https://github.com/aubree-lat/MacOBlox/issues">Report an issue</a></div></div></section>
+    </main>
+
+    <footer class="site-footer"><div><a href="https://aubree.wtf">aubree.wtf</a><span>/ Mac O’ Blox</span></div><p>An independent project. Not affiliated with Roblox Corporation.</p><a href="https://github.com/aubree-lat/MacOBlox/blob/main/LICENSE">MIT licensed</a></footer>
+  </div>
+</body>
+</html>
